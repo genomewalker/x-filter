@@ -1,0 +1,2 @@
+include versioneer.py
+include x_filter/_version.py
