@@ -13,10 +13,12 @@ see <https://www.gnu.org/licenses/>.
 
 
 import logging
+from re import A
 import pandas as pd
-from x_filter.filter import process_bam, filter_reference_BAM
 import numpy as np
-from x_filter.utils import get_arguments, create_output_files
+from x_filter.utils import get_arguments, create_output_files, apply_parallel, concat_df
+from x_filter.filter import resolve_multimaps, read_and_filter_alns, get_stats
+import datatable as dt
 
 log = logging.getLogger("my_logger")
 
@@ -32,33 +34,104 @@ def main():
         logging.DEBUG if args.debug else logging.INFO
     )
 
-    out_files = create_output_files(prefix=args.prefix, bam=args.bam)
-
-    data = process_bam(
-        bam=args.bam, threads=args.threads, reference_lengths=args.reference_lengths
-    )
-
-    data_df = pd.DataFrame([x.to_summary() for x in data])
-
-    logging.info(f"Writing reference statistics to {out_files['stats']}")
-    data_df.to_csv(out_files["stats"], sep="\t", index=False, compression="gzip")
+    # Create output files
+    out_files = create_output_files(prefix=args.prefix, input=args.input)
 
     filter_conditions = {
-        "min_read_length": args.min_read_length,
-        "min_read_count": args.min_read_count,
-        "min_expected_breadth_ratio": args.min_expected_breadth_ratio,
-        "min_read_ani": args.min_read_ani,
-        "min_coverage_evenness": args.min_coverage_evenness,
+        "bitscore": args.bitscore,
+        "evalue": args.evalue,
+        "expected_breadth_ratio": args.expected_breadth_ratio,
+        "depth": args.depth,
+        "depth_evenness": args.depth_evenness,
     }
 
-    filter_reference_BAM(
-        bam=args.bam,
-        df=data_df,
-        filter_conditions=filter_conditions,
-        threads=args.threads,
-        out_files=out_files,
-        sort_memory=args.sort_memory,
+    col_names = (
+        [
+            "queryId",
+            "subjectId",
+            "percIdentity",
+            "alnLength",
+            "mismatchCount",
+            "gapOpenCount",
+            "queryStart",
+            "queryEnd",
+            "subjectStart",
+            "subjectEnd",
+            "eVal",
+            "bitScore",
+            "qlen",
+            "slen",
+        ],
     )
+
+    # Read in aln file and filter
+    logging.info(
+        f"Reading and filtering alignments [evalue: {str(args.evalue)}; bitscore: {str(args.bitscore)}]..."
+    )
+    alns = read_and_filter_alns(
+        aln=args.input,
+        bitscore=args.bitscore,
+        col_names=col_names,
+        evalue=args.evalue,
+        threads=args.threads,
+    )
+
+    logging.info(
+        f"Resolving multimapping alignments [iters: {str(args.iters)}; scale: {str(args.scale)}]..."
+    )
+    # Process multimapping reads
+    alns_filtered = resolve_multimaps(
+        df=alns,
+        threads=args.threads,
+        scale=args.scale,
+        iters=args.iters,
+    )
+
+    logging.info("Combining filtered alignments...")
+    queries = dt.unique(alns_filtered["queryId"]).to_pandas()
+    outer_join = alns.to_pandas().merge(queries, how="outer", indicator=True)
+    anti_join = outer_join[~(outer_join._merge == "both")].drop("_merge", axis=1)
+    alns = concat_df([anti_join, alns_filtered.to_pandas()])
+
+    df = (
+        dt.Frame(alns)[
+            :,
+            ["subjectId", "subjectStart", "subjectEnd", "slen"],
+        ][:, :, dt.sort("subjectId")]
+        .to_pandas()
+        .rename(
+            columns={
+                "subjectId": "Chromosome",
+                "subjectStart": "Start",
+                "subjectEnd": "End",
+                "slen": "len",
+            }
+        )
+    )
+
+    logging.info("Getting coverage statistics...")
+    results = apply_parallel(df.groupby("Chromosome"), get_stats, threads=args.threads)
+
+    logging.info("Filtering references...")
+    logging.info(
+        f"depth >= {filter_conditions['depth']} & depth_evenness <= {filter_conditions['depth_evenness']} & expected_breadth_ratio >= {filter_conditions['expected_breadth_ratio']}"
+    )
+
+    results_filtered = results.loc[
+        (results["depth_mean"] >= filter_conditions["depth"])
+        & (results["depth_evenness"] <= filter_conditions["depth_evenness"])
+        & (results["breadth_exp_ratio"] >= filter_conditions["expected_breadth_ratio"])
+    ]
+    # write stats to file
+    logging.info(f"Writing filtered alignments to {out_files['multimap']}")
+    alns = alns[col_names[0]]
+    alns.to_csv(out_files["multimap"], sep="\t", index=False, compression="gzip")
+
+    logging.info(f"Writing coverage statistics to {out_files['coverage']}")
+    results_filtered.to_csv(
+        out_files["coverage"], sep="\t", index=False, compression="gzip"
+    )
+
     logging.info(f"ALL DONE.")
 
 

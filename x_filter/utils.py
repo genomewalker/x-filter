@@ -6,13 +6,16 @@ import shutil
 import logging
 import pandas as pd
 from multiprocessing import Pool
-from functools import partial
+from functools import partial, reduce
 from contextlib import contextmanager, redirect_stderr, redirect_stdout
 from os import devnull
 import tqdm
 from x_filter import __version__
 import time
 from itertools import chain
+from pathlib import Path
+from operator import or_
+import datatable as dt
 
 log = logging.getLogger("my_logger")
 log.setLevel(logging.INFO)
@@ -106,11 +109,15 @@ def is_valid_file(parser, arg, var):
 defaults = {
     "bitscore": 60,
     "evalue": 1e-10,
-    "breadth": 0.5,
+    "expected_breadth_ratio": 0.5,
+    "depth": 0.1,
+    "depth_evenness": 1.0,
     "prefix": None,
     "sort_memory": "1G",
     "kegg_file_map": None,
     "kegg_file_lengths": None,
+    "iters": 10,
+    "scale": 0.9,
 }
 
 help_msg = {
@@ -119,9 +126,13 @@ help_msg = {
     "prefix": "Prefix used for the output files",
     "bitscore": "Bitscore where to filter the results",
     "evalue": "Minimum read count",
-    "breadth": "Breadth of the coverage",
+    "expected_breadth_ratio": "Expected breadth of the coverage",
+    "depth": "Depth to filter out",
+    "depth_evenness": "Reference with higher evenness will be removed",
     "kegg_file_map": "File with KO to genes mapping",
     "kegg_file_lengths": "File with avg KO lengths",
+    "iters": "Number of iterations for the FAMLI-like filtering",
+    "scale": "Scale to select the best weithing alignments",
     "help": "Help message",
     "debug": f"Print debug messages",
     "version": f"Print program version",
@@ -178,6 +189,16 @@ def get_arguments(argv=None):
         help=help_msg["evalue"],
     )
     parser.add_argument(
+        "-s",
+        "--scale",
+        type=lambda x: float(
+            check_values(x, minval=0, maxval=1, parser=parser, var="--scale")
+        ),
+        default=defaults["scale"],
+        dest="scale",
+        help=help_msg["scale"],
+    )
+    parser.add_argument(
         "-b",
         "--bitscore",
         type=lambda x: int(
@@ -188,22 +209,33 @@ def get_arguments(argv=None):
         help=help_msg["bitscore"],
     )
     parser.add_argument(
-        "-c",
-        "--breadth",
+        "--expected-breadth-ratio",
         type=lambda x: float(
-            check_values(x, minval=0, maxval=1, parser=parser, var="--breadth")
+            check_values(
+                x, minval=0, maxval=1, parser=parser, var="--expected-breadth-ratio"
+            )
         ),
-        default=defaults["breadth"],
-        dest="breadth",
-        help=help_msg["breadth"],
+        default=defaults["expected_breadth_ratio"],
+        dest="expected_breadth_ratio",
+        help=help_msg["expected_breadth_ratio"],
     )
     parser.add_argument(
-        "-n",
-        "--n-iters",
-        type=lambda x: check_suffix(x, parser=parser, var="--n-iters"),
-        default=defaults["sort_memory"],
-        dest="sort_memory",
-        help=help_msg["sort_memory"],
+        "--depth",
+        type=lambda x: float(
+            check_values(x, minval=0, maxval=1e6, parser=parser, var="--depth")
+        ),
+        default=defaults["depth"],
+        dest="depth",
+        help=help_msg["depth"],
+    )
+    parser.add_argument(
+        "--depth-evenness",
+        type=lambda x: float(
+            check_values(x, minval=0, maxval=1e6, parser=parser, var="--depth-evenness")
+        ),
+        default=defaults["depth_evenness"],
+        dest="depth_evenness",
+        help=help_msg["depth_evenness"],
     )
     # reference_lengths
     parser.add_argument(
@@ -243,16 +275,29 @@ def suppress_stdout():
             yield (err, out)
 
 
-def applyParallel(dfGrouped, func, threads, parms):
-    p = Pool(threads)
-    func = partial(func, parms=parms)
-    ret_list = tqdm.tqdm(
-        p.map(func, [group for name, group in dfGrouped]),
-        total=len([group for name, group in dfGrouped]),
+def apply_parallel(dfGrouped, func, threads):
+    p = Pool(threads, initializer=initializer, initargs=(dfGrouped,))
+    if len([group for name, group in dfGrouped]) > 1000:
+        c_size = calc_chunksize(
+            threads, len([group for name, group in dfGrouped]), factor=4
+        )
+    else:
+        c_size = 1
+
+    ret_list = list(
+        tqdm.tqdm(
+            p.imap_unordered(
+                func, [group for name, group in dfGrouped], chunksize=c_size
+            ),
+            total=len([group for name, group in dfGrouped]),
+            leave=True,
+            ncols=80,
+            desc=f"References processed",
+        )
     )
     p.close()
     p.join()
-    return pd.concat(ret_list)
+    return concat_df(ret_list)
 
 
 def fast_flatten(input_list):
@@ -354,14 +399,23 @@ def calc_chunksize(n_workers, len_iterable, factor=4):
     return chunksize
 
 
-def create_output_files(prefix, bam):
+def create_output_files(prefix, input):
     if prefix is None:
-        prefix = bam.replace(".bam", "")
+        prefix = Path(input).resolve().stem
     # create output files
     out_files = {
-        "stats": f"{prefix}_stats.tsv.gz",
-        "stats_filtered": f"{prefix}_stats-filtered.tsv.gz",
-        "x_filtered_tmp": f"{prefix}.filtered.tmp.bam",
-        "x_filtered": f"{prefix}.filtered.bam",
+        "multimap": f"{prefix}_multimap.tsv.gz",
+        "coverage": f"{prefix}_cov-stats.tsv.gz",
+        "kegg_coverage": f"{prefix}_kegg-cov-stats.tsv.gz",
     }
     return out_files
+
+
+def isin(column, iterable):
+    content = [dt.f[column] == entry for entry in iterable]
+    return reduce(or_, content)
+
+
+def isnotin(column, iterable):
+    content = [dt.f[column] != entry for entry in iterable]
+    return reduce(or_, content)

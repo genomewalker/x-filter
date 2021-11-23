@@ -9,6 +9,7 @@ requirements = [
     "numpy>=1.21.2",
     "pyrle>=0.0.31",
     "pyranges>=0.0.112",
+    "datatable>=0.11.1",
 ]
 
 setup(
