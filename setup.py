@@ -3,13 +3,15 @@ import versioneer
 
 requirements = [
     "Cython>=0.29.24",
-    "pandas>=1.3.3",
-    "scipy>=1.5.2",
-    "tqdm==4.50.0",
-    "numpy>=1.21.2",
-    "pyrle>=0.0.31",
+    "pandas>=1.3.4",
+    "scipy>=1.7.3",
+    "tqdm>=4.62.3",
+    "numpy>=1.21.4",
+    "pyrle>=0.0.33",
     "pyranges>=0.0.112",
-    "datatable>=0.11.1",
+    "datatable>=1.0.0",
+    "ray[default]==1.5.2",
+    "aiohttp==3.7",
 ]
 
 setup(

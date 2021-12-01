@@ -5,7 +5,7 @@ import os
 import shutil
 import logging
 import pandas as pd
-from multiprocessing import Pool
+from multiprocessing import Pool, Manager
 from functools import partial, reduce
 from contextlib import contextmanager, redirect_stderr, redirect_stdout
 from os import devnull
@@ -14,7 +14,7 @@ from x_filter import __version__
 import time
 from itertools import chain
 from pathlib import Path
-from operator import or_
+from operator import or_, and_
 import datatable as dt
 
 log = logging.getLogger("my_logger")
@@ -26,17 +26,33 @@ def is_debug():
     return logging.getLogger("my_logger").getEffectiveLevel() == logging.DEBUG
 
 
+filters = ["breadth", "depth", "depth_evenness", "breadth_expected_ratio"]
+
+# From https://stackoverflow.com/a/59617044/15704171
+def convert_list_to_str(lst):
+    n = len(lst)
+    if not n:
+        return ""
+    if n == 1:
+        return lst[0]
+    return ", ".join(lst[:-1]) + f" or {lst[-1]}"
+
+
+def check_filter_values(val, parser, var):
+    value = str(val)
+    if value in filters:
+        return value
+    else:
+        parser.error(
+            f"argument {var}: Invalid value {value}. Filter has to be one of {convert_list_to_str(filters)}"
+        )
+
+
 def check_values(val, minval, maxval, parser, var):
     value = float(val)
     if value < minval or value > maxval:
         parser.error(
-            "argument %s: Invalid value %s. Range has to be between %s and %s!"
-            % (
-                var,
-                value,
-                minval,
-                maxval,
-            )
+            f"argument {var}: Invalid value value. Range has to be between {minval} and {maxval}!"
         )
     return value
 
@@ -109,15 +125,16 @@ def is_valid_file(parser, arg, var):
 defaults = {
     "bitscore": 60,
     "evalue": 1e-10,
-    "expected_breadth_ratio": 0.5,
+    "breadth": 0.5,
+    "breadth_expected_ratio": 0.5,
     "depth": 0.1,
     "depth_evenness": 1.0,
     "prefix": None,
     "sort_memory": "1G",
-    "kegg_file_map": None,
-    "kegg_file_lengths": None,
-    "iters": 10,
+    "mapping_file": None,
+    "iters": 25,
     "scale": 0.9,
+    "filter": "breadth_expected_ratio",
 }
 
 help_msg = {
@@ -125,12 +142,13 @@ help_msg = {
     "threads": "Number of threads to use",
     "prefix": "Prefix used for the output files",
     "bitscore": "Bitscore where to filter the results",
-    "evalue": "Minimum read count",
-    "expected_breadth_ratio": "Expected breadth of the coverage",
+    "evalue": "Evalue where to filter the results",
+    "filter": "Which filter to use. Possible values are: breadth, depth, depth_evenness, breadth_expected_ratio",
+    "breadth": "Breadth of the coverage",
+    "breadth_expected_ratio": "Expected breath to observed breadth ratio (scaled)",
     "depth": "Depth to filter out",
     "depth_evenness": "Reference with higher evenness will be removed",
-    "kegg_file_map": "File with KO to genes mapping",
-    "kegg_file_lengths": "File with avg KO lengths",
+    "mapping_file": "File with mappings to genes for aggregation",
     "iters": "Number of iterations for the FAMLI-like filtering",
     "scale": "Scale to select the best weithing alignments",
     "help": "Help message",
@@ -209,15 +227,32 @@ def get_arguments(argv=None):
         help=help_msg["bitscore"],
     )
     parser.add_argument(
-        "--expected-breadth-ratio",
+        "-f",
+        "--filter",
+        type=lambda x: str(check_filter_values(x, parser=parser, var="--filter")),
+        default=defaults["filter"],
+        dest="filter",
+        help=help_msg["filter"],
+    )
+    parser.add_argument(
+        "--breadth",
+        type=lambda x: float(
+            check_values(x, minval=0, maxval=1, parser=parser, var="--breadth")
+        ),
+        default=defaults["breadth"],
+        dest="breadth",
+        help=help_msg["breadth"],
+    )
+    parser.add_argument(
+        "--breadth-expected-ratio",
         type=lambda x: float(
             check_values(
-                x, minval=0, maxval=1, parser=parser, var="--expected-breadth-ratio"
+                x, minval=0, maxval=1, parser=parser, var="--breadth-expected-ratio"
             )
         ),
-        default=defaults["expected_breadth_ratio"],
-        dest="expected_breadth_ratio",
-        help=help_msg["expected_breadth_ratio"],
+        default=defaults["breadth_expected_ratio"],
+        dest="breadth_expected_ratio",
+        help=help_msg["breadth_expected_ratio"],
     )
     parser.add_argument(
         "--depth",
@@ -240,19 +275,11 @@ def get_arguments(argv=None):
     # reference_lengths
     parser.add_argument(
         "-m",
-        "--kegg-mapping",
-        type=lambda x: is_valid_file(parser, x, "kegg_file_map"),
-        default=defaults["kegg_file_map"],
-        dest="kegg_file_map",
-        help=help_msg["kegg_file_map"],
-    )
-    parser.add_argument(
-        "-l",
-        "--kegg-lengths",
-        type=lambda x: is_valid_file(parser, x, "kegg_file_lengths"),
-        default=defaults["kegg_file_lengths"],
-        dest="kegg_file_lengths",
-        help=help_msg["kegg_file_lengths"],
+        "--mapping-file",
+        type=lambda x: is_valid_file(parser, x, "mapping_file"),
+        default=defaults["mapping_file"],
+        dest="mapping_file",
+        help=help_msg["mapping_file"],
     )
     parser.add_argument(
         "--debug", dest="debug", action="store_true", help=help_msg["debug"]
@@ -275,28 +302,28 @@ def suppress_stdout():
             yield (err, out)
 
 
-def apply_parallel(dfGrouped, func, threads):
-    p = Pool(threads, initializer=initializer, initargs=(dfGrouped,))
-    if len([group for name, group in dfGrouped]) > 1000:
-        c_size = calc_chunksize(
-            threads, len([group for name, group in dfGrouped]), factor=4
-        )
+def apply_parallel_1(lst, func, threads, parms):
+    func = partial(func, parms=parms)
+    if is_debug():
+        ret_list = list(map(func, lst))
     else:
-        c_size = 1
+        p = Pool(threads, initializer=initializer, initargs=(parms,))
+        if len(lst) > 1000:
+            c_size = calc_chunksize(threads, len(lst), factor=4)
+        else:
+            c_size = 1
 
-    ret_list = list(
-        tqdm.tqdm(
-            p.imap_unordered(
-                func, [group for name, group in dfGrouped], chunksize=c_size
-            ),
-            total=len([group for name, group in dfGrouped]),
-            leave=True,
-            ncols=80,
-            desc=f"References processed",
+        ret_list = list(
+            tqdm.tqdm(
+                p.imap_unordered(func, lst, chunksize=c_size),
+                total=len(lst),
+                leave=True,
+                ncols=80,
+                desc=f"References processed",
+            )
         )
-    )
-    p.close()
-    p.join()
+        p.close()
+        p.join()
     return concat_df(ret_list)
 
 
@@ -407,6 +434,7 @@ def create_output_files(prefix, input):
         "multimap": f"{prefix}_multimap.tsv.gz",
         "coverage": f"{prefix}_cov-stats.tsv.gz",
         "kegg_coverage": f"{prefix}_kegg-cov-stats.tsv.gz",
+        "group_abundances": f"{prefix}_group-abundances.tsv.gz",
     }
     return out_files
 
@@ -419,3 +447,11 @@ def isin(column, iterable):
 def isnotin(column, iterable):
     content = [dt.f[column] != entry for entry in iterable]
     return reduce(or_, content)
+
+
+def create_filter_conditions(filter_type, filter_conditions):
+    if filter_type in ["breadth", "depth", "breadth_expected_ratio"]:
+        dt_filter = dt.f[filter_type] > filter_conditions[filter_type]
+    else:
+        dt_filter = dt.f[filter_type] <= filter_conditions[filter_type]
+    return dt_filter

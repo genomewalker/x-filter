@@ -13,12 +13,22 @@ see <https://www.gnu.org/licenses/>.
 
 
 import logging
-from re import A
+from os import get_terminal_size
+from re import A, T
 import pandas as pd
 import numpy as np
-from x_filter.utils import get_arguments, create_output_files, apply_parallel, concat_df
-from x_filter.filter import resolve_multimaps, read_and_filter_alns, get_stats
+from x_filter.utils import get_arguments, create_output_files, create_filter_conditions
+from x_filter.filter import (
+    resolve_multimaps,
+    read_and_filter_alns,
+    initialize_subject_weights,
+    get_coverage_stats,
+    aggregate_gene_abundances,
+)
 import datatable as dt
+from pyinstrument import Profiler
+from pyinstrument.renderers import ConsoleRenderer
+import pyranges as pr
 
 log = logging.getLogger("my_logger")
 
@@ -40,10 +50,13 @@ def main():
     filter_conditions = {
         "bitscore": args.bitscore,
         "evalue": args.evalue,
-        "expected_breadth_ratio": args.expected_breadth_ratio,
+        "breadth": args.breadth,
+        "breadth_expected_ratio": args.breadth_expected_ratio,
         "depth": args.depth,
         "depth_evenness": args.depth_evenness,
     }
+
+    filter_conditions = {k: v for k, v in filter_conditions.items() if v is not None}
 
     col_names = (
         [
@@ -68,6 +81,7 @@ def main():
     logging.info(
         f"Reading and filtering alignments [evalue: {str(args.evalue)}; bitscore: {str(args.bitscore)}]..."
     )
+
     alns = read_and_filter_alns(
         aln=args.input,
         bitscore=args.bitscore,
@@ -76,63 +90,161 @@ def main():
         threads=args.threads,
     )
 
+    logging.info("Getting coverage statistics...")
+    df = alns[:, ["subjectId", "queryId", "subjectStart", "subjectEnd", "slen"],][
+        :,
+        {
+            "Chromosome": dt.f.subjectId,
+            "Query": dt.f.queryId,
+            "Start": dt.f.subjectStart,
+            "End": dt.f.subjectEnd,
+            "len": dt.f.slen,
+        },
+    ].to_pandas()
+
+    avg_rl = int(np.mean(alns[:, "qlen"].to_list()) / 3 / 2)
+
+    results = get_coverage_stats(df, avg_rl, trim=True)
+    # Filter results
+    logging.info(f"Filtering references...")
+    logging.info(f"::: [Filter:{args.filter}; Value:{filter_conditions[args.filter]}]")
+    dt_filter_conditions = create_filter_conditions(
+        filter_type=args.filter, filter_conditions=filter_conditions
+    )
+
+    # Select these references that passed the filtering from all alignments
+    refs = results[dt_filter_conditions, :]
+
+    refs = dt.unique(results[:, {"subjectId": dt.f.reference}][:, "subjectId"])
+    refs[:, dt.update(keep="keep")]
+
+    refs.key = "subjectId"
+    alns = alns[
+        :,
+        :,
+        dt.join(
+            refs,
+        ),
+    ]
+    alns = alns[dt.f.keep == "keep", :]
+    del alns["keep"]
+    # Count how many queries we kept
+
+    nqueries = alns[:, dt.nunique(dt.f.queryId)][0, 0]
+
+    logging.info(
+        f"{refs.shape[0]:,} references and {nqueries:,} queries passing filter..."
+    )
+
     logging.info(
         f"Resolving multimapping alignments [iters: {str(args.iters)}; scale: {str(args.scale)}]..."
     )
+
     # Process multimapping reads
-    alns_filtered = resolve_multimaps(
-        df=alns,
-        threads=args.threads,
-        scale=args.scale,
-        iters=args.iters,
-    )
-
-    logging.info("Combining filtered alignments...")
-    queries = dt.unique(alns_filtered["queryId"]).to_pandas()
-    outer_join = alns.to_pandas().merge(queries, how="outer", indicator=True)
-    anti_join = outer_join[~(outer_join._merge == "both")].drop("_merge", axis=1)
-    alns = concat_df([anti_join, alns_filtered.to_pandas()])
-
-    df = (
-        dt.Frame(alns)[
-            :,
-            ["subjectId", "subjectStart", "subjectEnd", "slen"],
-        ][:, :, dt.sort("subjectId")]
-        .to_pandas()
-        .rename(
-            columns={
-                "subjectId": "Chromosome",
-                "subjectStart": "Start",
-                "subjectEnd": "End",
-                "slen": "len",
-            }
+    # initialize the dataframe
+    logging.info(f"::: Initializing data...")
+    alns_mp = alns[:, ["queryId", "subjectId", "bitScore", "slen"]]
+    alns_mp = initialize_subject_weights(alns_mp)
+    # print(
+    #     alns_mp[
+    #         (dt.f.subjectId == "nca:Noca_4326")
+    #         & (dt.f.queryId == "11348bc767_000000480528__1"),
+    #         :,
+    #     ]
+    # )
+    if alns_mp is not None:
+        alns_filtered = resolve_multimaps(
+            df=alns_mp,
+            threads=args.threads,
+            scale=args.scale,
+            iters=args.iters,
         )
-    )
+
+        # logging.info("Combining filtered alignments...")
+        # queries = dt.unique(alns_filtered["queryId"]).to_pandas()
+        # outer_join = alns.to_pandas().merge(queries, how="outer", indicator=True)
+        # anti_join = outer_join[~(outer_join._merge == "both")].drop("_merge", axis=1)
+        # alns = concat_df([anti_join, alns_filtered.to_pandas()])
+
+        alns = dt.Frame(alns.to_pandas().merge(alns_filtered.to_pandas(), how="inner"))
+    else:
+        logging.info("No multimapping reads found.")
+
+    df = alns[:, ["subjectId", "queryId", "subjectStart", "subjectEnd", "slen"],][
+        :,
+        {
+            "Chromosome": dt.f.subjectId,
+            "Query": dt.f.queryId,
+            "Start": dt.f.subjectStart,
+            "End": dt.f.subjectEnd,
+            "len": dt.f.slen,
+        },
+    ].to_pandas()
 
     logging.info("Getting coverage statistics...")
-    results = apply_parallel(df.groupby("Chromosome"), get_stats, threads=args.threads)
 
-    logging.info("Filtering references...")
-    logging.info(
-        f"depth >= {filter_conditions['depth']} & depth_evenness <= {filter_conditions['depth_evenness']} & expected_breadth_ratio >= {filter_conditions['expected_breadth_ratio']}"
+    avg_rl = int(np.mean(alns[:, "qlen"].to_list()) / 3 / 2)
+
+    results = get_coverage_stats(df, avg_rl, trim=True)
+
+    # Filter results
+    logging.info(f"Filtering references...")
+    logging.info(f"::: [Filter:{args.filter}; Value:{filter_conditions[args.filter]}]")
+    dt_filter_conditions = create_filter_conditions(
+        filter_type=args.filter, filter_conditions=filter_conditions
     )
 
-    results_filtered = results.loc[
-        (results["depth_mean"] >= filter_conditions["depth"])
-        & (results["depth_evenness"] <= filter_conditions["depth_evenness"])
-        & (results["breadth_exp_ratio"] >= filter_conditions["expected_breadth_ratio"])
+    # Select these references that passed the filtering from all alignments
+    results_filtered = results[dt_filter_conditions, :]
+
+    refs = dt.unique(results_filtered[:, {"subjectId": dt.f.reference}][:, "subjectId"])
+    refs[:, dt.update(keep="keep")]
+
+    refs.key = "subjectId"
+    alns = alns[
+        :,
+        :,
+        dt.join(
+            refs,
+        ),
     ]
+    alns = alns[dt.f.keep == "keep", :]
+    del alns["keep"]
+    # Count how many queries we kept
+
+    nqueries = alns[:, dt.nunique(dt.f.queryId)][0, 0]
+
+    logging.info(
+        f"{refs.shape[0]:,} references and {nqueries:,} queries passing filter..."
+    )
+
     # write stats to file
     logging.info(f"Writing filtered alignments to {out_files['multimap']}")
-    alns = alns[col_names[0]]
+    alns = alns.to_pandas()[col_names[0]]
     alns.to_csv(out_files["multimap"], sep="\t", index=False, compression="gzip")
 
     logging.info(f"Writing coverage statistics to {out_files['coverage']}")
-    results_filtered.to_csv(
+    results_filtered.to_pandas().to_csv(
         out_files["coverage"], sep="\t", index=False, compression="gzip"
     )
 
-    logging.info(f"ALL DONE.")
+    # use map file to aggregate gene abundances
+    if args.mapping_file:
+        logging.info("Aggregating gene abundances...")
+        group_abundances = aggregate_gene_abundances(
+            mapping_file=args.mapping_file,
+            gene_abundances=results_filtered,
+            threads=args.threads,
+        )
+
+        if group_abundances is None:
+            logging.info("Couldn't map anything to the references.")
+            logging.info(f"ALL DONE.")
+            exit(0)
+        logging.info(f"Writing group abundances to {out_files['group_abundances']}")
+        group_abundances.to_csv(
+            out_files["group_abundances"], sep="\t", index=False, compression="gzip"
+        )
 
 
 if __name__ == "__main__":
