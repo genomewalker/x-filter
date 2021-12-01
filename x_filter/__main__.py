@@ -91,20 +91,22 @@ def main():
     )
 
     logging.info("Getting coverage statistics...")
-    df = alns[:, ["subjectId", "queryId", "subjectStart", "subjectEnd", "slen"],][
+    df = alns[
+        :,
+        ["subjectId", "queryId", "subjectStart", "subjectEnd", "slen", "qlen"],
+    ][
         :,
         {
             "Chromosome": dt.f.subjectId,
             "Query": dt.f.queryId,
             "Start": dt.f.subjectStart,
             "End": dt.f.subjectEnd,
-            "len": dt.f.slen,
+            "slen": dt.f.slen,
+            "qlen": dt.f.qlen,
         },
     ].to_pandas()
 
-    avg_rl = int(np.mean(alns[:, "qlen"].to_list()) / 3 / 2)
-
-    results = get_coverage_stats(df, avg_rl, trim=True)
+    results = get_coverage_stats(df, trim=args.trim)
     # Filter results
     logging.info(f"Filtering references...")
     logging.info(f"::: [Filter:{args.filter}; Value:{filter_conditions[args.filter]}]")
@@ -170,22 +172,24 @@ def main():
     else:
         logging.info("No multimapping reads found.")
 
-    df = alns[:, ["subjectId", "queryId", "subjectStart", "subjectEnd", "slen"],][
+    df = alns[
+        :,
+        ["subjectId", "queryId", "subjectStart", "subjectEnd", "slen", "qlen"],
+    ][
         :,
         {
             "Chromosome": dt.f.subjectId,
             "Query": dt.f.queryId,
             "Start": dt.f.subjectStart,
             "End": dt.f.subjectEnd,
-            "len": dt.f.slen,
+            "slen": dt.f.slen,
+            "qlen": dt.f.qlen,
         },
     ].to_pandas()
 
     logging.info("Getting coverage statistics...")
 
-    avg_rl = int(np.mean(alns[:, "qlen"].to_list()) / 3 / 2)
-
-    results = get_coverage_stats(df, avg_rl, trim=True)
+    results = get_coverage_stats(df, trim=args.trim)
 
     # Filter results
     logging.info(f"Filtering references...")

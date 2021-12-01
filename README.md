@@ -1,11 +1,11 @@
 
-# xFilter
+# xFilter: a BLASTx filtering tool
 
 
 [![GitHub release (latest by date including pre-releases)](https://img.shields.io/github/v/release/genomewalker/x-filter?include_prereleases&label=version)](https://github.com/genomewalker/x-filter/releases) [![x-filter](https://github.com/genomewalker/x-filter/workflows/xFilter_ci/badge.svg)](https://github.com/genomewalker/x-filter/actions) [![PyPI](https://img.shields.io/pypi/v/x-filter)](https://pypi.org/project/x-filter/) [![Conda](https://img.shields.io/conda/v/genomewalker/x-filter)](https://anaconda.org/genomewalker/x-filter)
 
 
-A simple tool to calculate metrics from a BAM file and filter references to be used with Woltka
+A simple tool to filter BLASTx results with special emphasis on ancient DNA studies. xFilter implements the same filtering approach as [FAMLI](https://bmcbioinformatics.biomedcentral.com/articles/10.1186/s12859-020-03802-0) but adds a couple of features designed for the annotation of ancient DNA short reads. Besides the evenness filtering of references, xFilter allows to filter them based on a scaled version of the expected breadth of coverage, similar to the one described in [inStrain](https://instrain.readthedocs.io/en/latest/important_concepts.html#detecting-organisms-in-metagenomic-data). Furthermore xFilter allows to aggregate the coverage values of the filtered references into higher categories, like KEGG orthologs or viral genomes.
 
 # Installation
 
@@ -58,35 +58,41 @@ xFilter only needs a BAM file. For a complete list of options:
 ```
 $ xFilter --help
 
-usage: xFilter [-h] [-t THREADS] [-p PREFIX] [-l MIN_READ_LENGTH] [-n MIN_READ_COUNT] [-b MIN_EXPECTED_BREADTH_RATIO] [-a MIN_READ_ANI] [-c MIN_COVERAGE_EVENNESS] [-m SORT_MEMORY] [-r REFERENCE_LENGTHS]
-                 [--debug] [--version]
-                 bam
+usage: xFilter [-h] [-i INPUT] [-t THREADS] [-p PREFIX] [-n ITERS] [-e EVALUE] [-s SCALE] [-b BITSCORE] [-f FILTER]
+               [--breadth BREADTH] [--breadth-expected-ratio BREADTH_EXPECTED_RATIO] [--depth DEPTH]
+               [--depth-evenness DEPTH_EVENNESS] [-m MAPPING_FILE] [--no-trim] [--debug] [--version]
 
 A simple tool to calculate metrics from a BAM file and filter references to be used with Woltka
 
-positional arguments:
-  bam                   BAM file containing aligned reads
-
 optional arguments:
   -h, --help            show this help message and exit
+  -i INPUT, --input INPUT
+                        A blastx m8 formatted file containing aligned reads to references. It has to contain query and
+                        subject lengths (default: None)
   -t THREADS, --threads THREADS
                         Number of threads to use (default: 1)
   -p PREFIX, --prefix PREFIX
                         Prefix used for the output files (default: None)
-  -l MIN_READ_LENGTH, --min-read-length MIN_READ_LENGTH
-                        Minimum read length (default: 30)
-  -n MIN_READ_COUNT, --min-read-count MIN_READ_COUNT
-                        Minimum read count (default: 10)
-  -b MIN_EXPECTED_BREADTH_RATIO, --min-expected-breadth-ratio MIN_EXPECTED_BREADTH_RATIO
-                        Minimum expected breadth ratio (default: 0.5)
-  -a MIN_READ_ANI, --min-read-ani MIN_READ_ANI
-                        Minimum average read ANI (default: 90.0)
-  -c MIN_COVERAGE_EVENNESS, --min-coverage-evenness MIN_COVERAGE_EVENNESS
-                        Minimum coverage evenness (default: 0)
-  -m SORT_MEMORY, --sort-memory SORT_MEMORY
-                        Set maximum memory per thread for sorting; suffix K/M/G recognized (default: 1G)
-  -r REFERENCE_LENGTHS, --reference-lengths REFERENCE_LENGTHS
-                        File with references lengths (default: None)
+  -n ITERS, --n-iters ITERS
+                        Number of iterations for the FAMLI-like filtering (default: 25)
+  -e EVALUE, --evalue EVALUE
+                        Evalue where to filter the results (default: 1e-10)
+  -s SCALE, --scale SCALE
+                        Scale to select the best weithing alignments (default: 0.9)
+  -b BITSCORE, --bitscore BITSCORE
+                        Bitscore where to filter the results (default: 60)
+  -f FILTER, --filter FILTER
+                        Which filter to use. Possible values are: breadth, depth, depth_evenness,
+                        breadth_expected_ratio (default: breadth_expected_ratio)
+  --breadth BREADTH     Breadth of the coverage (default: 0.5)
+  --breadth-expected-ratio BREADTH_EXPECTED_RATIO
+                        Expected breath to observed breadth ratio (scaled) (default: 0.5)
+  --depth DEPTH         Depth to filter out (default: 0.1)
+  --depth-evenness DEPTH_EVENNESS
+                        Reference with higher evenness will be removed (default: 1.0)
+  -m MAPPING_FILE, --mapping-file MAPPING_FILE
+                        File with mappings to genes for aggregation (default: None)
+  --no-trim             Deactivate the trimming for the coverage calculations (default: True)
   --debug               Print debug messages (default: False)
   --version             Print program version
 ```
@@ -94,17 +100,46 @@ optional arguments:
 One would run xFilter as:
 
 ```bash
-xFilter --min-read-count 100 --min-expected-breadth-ratio 0.75 --min-read-ani 98 --sort-memory 1G --threads 16  c55d4e2df1.woltka.dedup.bam
+xFilter --input xFilter-1M-test.m8.gz --bitscore 60 --evalue 1e-5 --filter breadth_expected_ratio --breadth-expected-ratio 0.4 --n-iters 25 --mapping-file ko_gene_list.tsv.gz --threads 8
 ```
 
-**--min-read-count**: Minimum number of reads mapped to a reference in the BAM file
+**--input**: A BLASTx tabular output with the query and subject lengths.
 
-**--min-expected-breadth-ratio**: Minimum expected breadth ratio needed to keep a reference. This is based on the concepts defined [here](https://instrain.readthedocs.io/en/latest/important_concepts.html#detecting-organisms-in-metagenomic-data). I basically estimates the ratio between the observed and expected breadth, the closest to 1 the more evenly distributed the mapped reads are and we can be more confident that the genome was detected.
+**--bitscore**: Bitscore where to filter the BLASTx results.
 
-**--min-read-ani**: Minimum average read ANI that a reference has
+**--evalue**: Evalue where to filter the BLASTx results.
 
-**--sort-memory**: Memory used for each thread when sorting the filtered BAM file
+**--filter**: Which filter to use to filter the references. We have the following options:
+ - depth: Filter out references with a depth below a given threshold. 
+ - depth_evenness: Filter out references with a depth evenness below a given threshold. This is FAMLI's approach (SD/MEAN)
+ - breadth: Filter out references with a breadth below a given threshold.
+ - breadth_expected_ratio: Filter out references with a breadth below the scaled observed breadth to expected breadth ratio as in _(breadth/(1 - e<sup>-coverage</sup>)) &#215; breadth_. 
+
+**--breadth-expected-ratio**: The observed breadth to expected breadth ratio (scaled).
+
+**--mapping-file**: File with mappings to genes for aggregation. It contains two columns: the gene name and the grouping.
 
 **--threads**: Number of threads
+
+xFilter by default will trim the coverage values on both 5' and 3' ends based on the average read length (in amino acid) mapped to each query. This can be deactivated with the **--no-trim** option.
+
+xFilter will generate the following files:
+ - {prefix}**_multimap.tsv.gz**: This file contains the filtered BLASTx results after removing non-well supported references and multi-mappings.
+ - {prefix}**_cov-stats.tsv.gz**: This file contains the coverage statistics of the references after the filtering. It contains the following columns:
+   - **reference**: Reference name
+   - **depth_mean**: Coverage mean
+   - **depth_std**: Coverage standard deviation
+   - **depth_evenness**: Coverage evenness (SD/MEAN)
+   - **breadth**: Breadth of coverage
+   - **breadth_expected**: Expected breadth of coverage
+   - **breadth_expected_ratio**: Observed breadth to expected breadth ratio (scaled)
+   - **n_alns**: Number of alignments
+  - {prefix}**_group-abundances.tsv.gz**: If a mapping file is provided, it reports:
+    - **group**: Group name
+    - **mean**: Mean coverage values
+    - **std**: Standard deviation of coverage values
+    - **median**: Median coverage values
+    - **sum**: Sum of coverage values
+    - **n_genes**: Number of genes in the group
 
 

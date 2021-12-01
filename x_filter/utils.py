@@ -154,6 +154,7 @@ help_msg = {
     "help": "Help message",
     "debug": f"Print debug messages",
     "version": f"Print program version",
+    "trim": f"Deactivate the trimming for the coverage calculations",
 }
 
 
@@ -280,6 +281,9 @@ def get_arguments(argv=None):
         default=defaults["mapping_file"],
         dest="mapping_file",
         help=help_msg["mapping_file"],
+    )
+    parser.add_argument(
+        "--no-trim", dest="trim", action="store_false", help=help_msg["trim"]
     )
     parser.add_argument(
         "--debug", dest="debug", action="store_true", help=help_msg["debug"]
@@ -428,7 +432,7 @@ def calc_chunksize(n_workers, len_iterable, factor=4):
 
 def create_output_files(prefix, input):
     if prefix is None:
-        prefix = Path(input).resolve().stem
+        prefix = Path(input).resolve().stem.split(".")[0]
     # create output files
     out_files = {
         "multimap": f"{prefix}_multimap.tsv.gz",

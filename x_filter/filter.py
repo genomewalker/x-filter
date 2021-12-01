@@ -249,7 +249,7 @@ def resolve_multimaps(
     return df1
 
 
-def get_stats_coverage(x, trim=False, strim_5=18, strim_3=18):
+def get_stats_coverage(x, gen_data, trim=False, strim_5=18, strim_3=18):
     """Get coverage statistics
 
     Args:
@@ -427,35 +427,47 @@ def get_stats_coverage(x, gen_data, trim=False, strim_5=18, strim_3=18):
         )
 
 
-def get_coverage_stats(df, avg_rl, trim=True):
+def get_coverage_stats(df, trim=True):
 
     queries = defaultdict(int)
     gen_data = defaultdict(dict)
-    for a, q, b, c, d in tqdm.tqdm(
-        zip(df["Chromosome"], df["Query"], df["Start"], df["End"], df["len"]),
+    rl = defaultdict(list)
+    for a, q, b, c, d, e in tqdm.tqdm(
+        zip(
+            df["Chromosome"],
+            df["Query"],
+            df["Start"],
+            df["End"],
+            df["slen"],
+            df["qlen"],
+        ),
         total=df.shape[0],
         leave=False,
         ncols=100,
         desc=f"Alignments processed",
     ):
         b = b - 1
-        queries[q] += 1
+
         if a in gen_data:
             gen_data[a]["cov"][b:c] += 1
             gen_data[a]["n_alns"] += 1
-
+            rl[a] += [e / 3]
         else:
             gen_data[a]["cov"] = np.zeros(d, dtype=int)
             gen_data[a]["cov"][b:c] += 1
             gen_data[a]["n_alns"] = 0
             gen_data[a]["n_alns"] += 1
-    if trim:
-        logging.info(
-            f"References will be trimmed at 5'/3'-ends {avg_rl}aa (half of the avg. read length)"
-        )
+            rl[a] += [e / 3]
+    logging.info(
+        f"References will be dinamycally trimmed at 5'/3'-ends (half of the avg. read length)"
+    )
     stats = [
         get_stats_coverage(
-            chrom, gen_data=gen_data, strim_5=avg_rl, strim_3=avg_rl, trim=trim
+            chrom,
+            gen_data=gen_data,
+            strim_5=int(np.mean(rl[chrom]) / 2),
+            strim_3=int(np.mean(rl[chrom]) / 2),
+            trim=trim,
         )
         for chrom in tqdm.tqdm(
             gen_data,
@@ -512,4 +524,3 @@ def aggregate_gene_abundances(mapping_file, gene_abundances, threads=1):
         mappings = mappings.reset_index("group")
         mappings.rename({"count": "n_genes"}, axis=1, inplace=True)
         return mappings
-
