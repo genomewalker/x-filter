@@ -16,7 +16,6 @@ from x_filter.utils import (
 import datatable as dt
 import pyranges as pr
 from multiprocessing import Pool
-from pyinstrument import Profiler
 from functools import partial, reduce
 from collections import defaultdict
 

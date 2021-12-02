@@ -26,8 +26,6 @@ from x_filter.filter import (
     aggregate_gene_abundances,
 )
 import datatable as dt
-from pyinstrument import Profiler
-from pyinstrument.renderers import ConsoleRenderer
 import pyranges as pr
 
 log = logging.getLogger("my_logger")
