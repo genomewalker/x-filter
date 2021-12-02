@@ -1,7 +1,7 @@
 GNU GENERAL PUBLIC LICENSE
                       Version 3, 29 June 2007
 
-    A simple genome de-replication tool with fastANI
+   A simple tool to filter BLASTx m8 files using the FAMLI algorithm
     Copyright (C) 2020  Antonio Fernandez-Guerra
 
     This program is free software: you can redistribute it and/or modify

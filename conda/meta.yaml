@@ -20,6 +20,7 @@ requirements:
     - Cython>=0.29.24
   run:
     - python>=3.9
+    - Cython>=0.29.24
     - pip
     - pandas>=1.3.4
     - scipy>=1.7.3
@@ -35,6 +36,6 @@ test:
 
 about:
   home: https://github.com/genomewalker/x-filter
-  summary: "A simple tool to identify and clean misassemblies for ancient metagenomics"
+  summary: "A simple tool to filter BLASTx m8 files using the FAMLI algorithm"
   license: {{ setup_data['license'] }}
   license_file: LICENSE
