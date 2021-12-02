@@ -306,31 +306,6 @@ def suppress_stdout():
             yield (err, out)
 
 
-def apply_parallel_1(lst, func, threads, parms):
-    func = partial(func, parms=parms)
-    if is_debug():
-        ret_list = list(map(func, lst))
-    else:
-        p = Pool(threads, initializer=initializer, initargs=(parms,))
-        if len(lst) > 1000:
-            c_size = calc_chunksize(threads, len(lst), factor=4)
-        else:
-            c_size = 1
-
-        ret_list = list(
-            tqdm.tqdm(
-                p.imap_unordered(func, lst, chunksize=c_size),
-                total=len(lst),
-                leave=True,
-                ncols=80,
-                desc=f"References processed",
-            )
-        )
-        p.close()
-        p.join()
-    return concat_df(ret_list)
-
-
 def fast_flatten(input_list):
     return list(chain.from_iterable(input_list))
 
@@ -346,90 +321,6 @@ def concat_df(frames):
     return df
 
 
-def initializer(init_data):
-    global parms
-    parms = init_data
-
-
-def do_parallel(parms, lst, func, threads):
-    if is_debug():
-        dfs = list(map(partial(func, parms=parms), lst))
-    else:
-        p = Pool(threads, initializer=initializer, initargs=(parms,))
-        c_size = calc_chunksize(threads, len(lst))
-        dfs = list(
-            tqdm.tqdm(
-                p.imap_unordered(
-                    partial(func, parms=parms),
-                    lst,
-                    chunksize=c_size,
-                ),
-                total=len(lst),
-                leave=False,
-                ncols=80,
-                desc=f"Components processed",
-            )
-        )
-        p.close()
-        p.join()
-    return concat_df(dfs)
-
-
-def do_parallel_lst(parms, lst, func, threads):
-    if is_debug():
-        lst = list(map(partial(func, parms=parms), lst))
-    else:
-        p = Pool(threads, initializer=initializer, initargs=(parms,))
-        c_size = calc_chunksize(threads, len(lst))
-        lst = list(
-            tqdm.tqdm(
-                p.imap_unordered(
-                    partial(func, parms=parms),
-                    lst,
-                    chunksize=c_size,
-                ),
-                total=len(lst),
-                leave=False,
-                ncols=80,
-                desc=f"Components processed",
-            )
-        )
-
-    return lst
-
-
-def get_components_large(parms, components, func, threads):
-    dfs = list(
-        tqdm.tqdm(
-            map(partial(func, parms=parms), components),
-            total=len(components),
-            leave=False,
-            ncols=80,
-            desc=f"Components processed",
-        )
-    )
-    return concat_df(dfs)
-
-
-def clean_up(keep, temp_dir):
-    if keep:
-        logging.info(f"Cleaning up temporary files")
-        logging.shutdown()
-        shutil.rmtree(temp_dir, ignore_errors=True)
-
-
-# from https://stackoverflow.com/questions/53751050/python-multiprocessing-understanding-logic-behind-chunksize/54032744#54032744
-def calc_chunksize(n_workers, len_iterable, factor=4):
-    """Calculate chunksize argument for Pool-methods.
-
-    Resembles source-code within `multiprocessing.pool.Pool._map_async`.
-    """
-    chunksize, extra = divmod(len_iterable, n_workers * factor)
-    if extra:
-        chunksize += 1
-    return chunksize
-
-
 def create_output_files(prefix, input):
     if prefix is None:
         prefix = Path(input).resolve().stem.split(".")[0]
@@ -441,16 +332,6 @@ def create_output_files(prefix, input):
         "group_abundances": f"{prefix}_group-abundances.tsv.gz",
     }
     return out_files
-
-
-def isin(column, iterable):
-    content = [dt.f[column] == entry for entry in iterable]
-    return reduce(or_, content)
-
-
-def isnotin(column, iterable):
-    content = [dt.f[column] != entry for entry in iterable]
-    return reduce(or_, content)
 
 
 def create_filter_conditions(filter_type, filter_conditions):

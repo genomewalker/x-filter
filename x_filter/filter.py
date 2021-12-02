@@ -6,7 +6,6 @@ import tqdm
 import logging
 from x_filter.utils import (
     is_debug,
-    calc_chunksize,
 )
 import datatable as dt
 import pyranges as pr
@@ -18,34 +17,6 @@ from collections import defaultdict
 log = logging.getLogger("my_logger")
 
 sys.setrecursionlimit(10 ** 6)
-
-
-def get_aln_stats_worker(what, parms):
-    # return list(set(parms.df[what].to_list()[0]))
-    return list(parms.df[what].to_pandas()[what].unique())
-
-
-def get_aln_stats(ns, threads=1):
-    lst = ["queryId", "subjectId"]
-
-    func = partial(get_aln_stats_worker, parms=ns)
-
-    p = Pool(threads, initializer=initializer, initargs=(ns,))
-    ret_list = list(
-        tqdm.tqdm(
-            p.imap(func, lst),
-            total=len(lst),
-            leave=False,
-            ncols=100,
-            desc=f"Getting basic stats",
-        )
-    )
-    p.close()
-    p.join()
-
-    nqueries = ret_list[0]
-    nrefs = ret_list[1]
-    return nqueries, nrefs
 
 
 def read_and_filter_alns(
@@ -309,74 +280,6 @@ def cov_stats(alns, refs):
     df.insert(df.shape[1], "depth_evenness", df["depth_sd"] / df["depth_mean"])
 
     return df.drop("Run Value Sum Intermediate".split(), axis=1)
-
-
-mgr = None
-
-
-def initializer_1(x):
-    global mgr
-    mgr = x
-
-
-def apply_parallel(data, func, p, threads):
-    func = partial(func)
-    if is_debug():
-        ret_list = list(map(func, data))
-    else:
-        if len((data)) > 1000:
-            c_size = calc_chunksize(threads, len((data)), factor=4)
-        else:
-            c_size = 1
-
-        ret_list = list(
-            tqdm.tqdm(
-                p.imap_unordered(func, data, chunksize=c_size),
-                total=len((data)),
-                leave=False,
-                ncols=100,
-                desc=f"References processed",
-            )
-        )
-        p.close()
-        p.join()
-    print(dt.rbind(ret_list))
-    return dt.rbind(ret_list)
-
-
-def get_stats(data):
-    data = pr.PyRanges(data)
-    refs = data.df.head(1)[["Chromosome", "len"]]
-    refs["Start"] = 1
-    refs = refs.rename(
-        columns={
-            "len": "End",
-        }
-    )
-    # # refs["End"] = refs["End"] + 1
-    refs = pr.PyRanges(refs)
-    # alns = pr.PyRanges(data)
-    mean_cov = cov_stats(data, refs)
-    b_cov = refs.coverage(
-        data, overlap_col="n_reads", fraction_col="breadth", nb_cpu=1
-    ).df
-
-    b_cov = b_cov.merge(
-        mean_cov[["Chromosome", "depth_mean", "depth_sd", "depth_evenness"]],
-        how="inner",
-        on="Chromosome",
-    )
-
-    b_cov.insert(b_cov.shape[1], "exp_breadth", 1 - np.exp(-b_cov["depth_mean"]))
-
-    b_cov.insert(
-        b_cov.shape[1], "breadth_exp_ratio", b_cov["breadth"] / b_cov["exp_breadth"]
-    )
-
-    b_cov.drop(["Start"], axis=1, inplace=True)
-    b_cov["End"] = b_cov["End"]
-
-    return dt.Frame(b_cov.rename(columns={"End": "length", "Chromosome": "reference"}))
 
 
 def get_stats_coverage(x, gen_data, trim=False, strim_5=18, strim_3=18):
