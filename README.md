@@ -5,7 +5,11 @@
 [![GitHub release (latest by date including pre-releases)](https://img.shields.io/github/v/release/genomewalker/x-filter?include_prereleases&label=version)](https://github.com/genomewalker/x-filter/releases) [![x-filter](https://github.com/genomewalker/x-filter/workflows/xFilter_ci/badge.svg)](https://github.com/genomewalker/x-filter/actions) [![PyPI](https://img.shields.io/pypi/v/x-filter)](https://pypi.org/project/x-filter/) [![Conda](https://img.shields.io/conda/v/genomewalker/x-filter)](https://anaconda.org/genomewalker/x-filter)
 
 
-A simple tool to filter BLASTx results with special emphasis on ancient DNA studies. xFilter implements the same filtering approach as [FAMLI](https://bmcbioinformatics.biomedcentral.com/articles/10.1186/s12859-020-03802-0) but adds a couple of features designed for the annotation of ancient DNA short reads. Besides the evenness filtering of references, xFilter allows to filter them based on a scaled version of the expected breadth of coverage, similar to the one described in [inStrain](https://instrain.readthedocs.io/en/latest/important_concepts.html#detecting-organisms-in-metagenomic-data). Furthermore xFilter allows to aggregate the coverage values of the filtered references into higher categories, like KEGG orthologs or viral genomes.
+A simple tool to filter BLASTx results with special emphasis on ancient DNA studies. xFilter implements the same filtering approach as [FAMLI](https://bmcbioinformatics.biomedcentral.com/articles/10.1186/s12859-020-03802-0) but adds a couple of features designed for the annotation of ancient DNA short reads. [FAMLI](https://bmcbioinformatics.biomedcentral.com/articles/10.1186/s12859-020-03802-0) solved one the principal problems when annotating short reads by iteratively assigning multi-mapped reads to the most likely true protein. You can find more information [here](https://www.minot.bio/home/2018/4/4/famli).
+
+In addition to the filter that removes references with uneven coverage, xFilter allows to filter them based on a scaled version of the expected breadth of coverage, similar to the one described in [inStrain](https://instrain.readthedocs.io/en/latest/important_concepts.html#detecting-organisms-in-metagenomic-data). Furthermore, xFilter allows to aggregate the coverage values of the filtered references into higher categories, like KEGG orthologs or viral genomes.
+
+For the BLASTx searches we recommend to use [MMSseqs2](https://github.com/soedinglab/MMseqs2) with parameters optimized for ancient DNA data as described [here](#)
 
 # Installation
 
@@ -53,7 +57,7 @@ pip install -e .
 
 # Usage
 
-xFilter only needs a BAM file. For a complete list of options:
+xFilter uses a BLASTx m8 formatted file containing aligned reads to references. It has to contain query and subject lengths. For a complete list of options:
 
 ```
 $ xFilter --help

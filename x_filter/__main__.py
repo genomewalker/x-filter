@@ -79,7 +79,7 @@ def main():
 
     # Read in aln file and filter
     logging.info(
-        f"Reading and filtering alignments [evalue: {str(args.evalue)}; bitscore: {str(args.bitscore)}]..."
+        f"Reading and filtering alignments [evalue: {str(args.evalue)}; bitscore: {str(args.bitscore)}]"
     )
 
     alns = read_and_filter_alns(
@@ -90,7 +90,7 @@ def main():
         threads=args.threads,
     )
 
-    logging.info("Getting coverage statistics...")
+    logging.info("Getting coverage statistics")
     df = alns[
         :,
         ["subjectId", "queryId", "subjectStart", "subjectEnd", "slen", "qlen"],
@@ -108,7 +108,7 @@ def main():
 
     results = get_coverage_stats(df, trim=args.trim)
     # Filter results
-    logging.info(f"Filtering references...")
+    logging.info(f"Filtering references")
     logging.info(f"::: [Filter:{args.filter}; Value:{filter_conditions[args.filter]}]")
     dt_filter_conditions = create_filter_conditions(
         filter_type=args.filter, filter_conditions=filter_conditions
@@ -135,16 +135,16 @@ def main():
     nqueries = alns[:, dt.nunique(dt.f.queryId)][0, 0]
 
     logging.info(
-        f"{refs.shape[0]:,} references and {nqueries:,} queries passing filter..."
+        f"{refs.shape[0]:,} references and {nqueries:,} queries passing filter"
     )
 
     logging.info(
-        f"Resolving multimapping alignments [iters: {str(args.iters)}; scale: {str(args.scale)}]..."
+        f"Resolving multimapping alignments [iters: {str(args.iters)}; scale: {str(args.scale)}]"
     )
 
     # Process multimapping reads
     # initialize the dataframe
-    logging.info(f"::: Initializing data...")
+    logging.info(f"::: Initializing data")
     alns_mp = alns[:, ["queryId", "subjectId", "bitScore", "slen"]]
     alns_mp = initialize_subject_weights(alns_mp)
     # print(
@@ -162,7 +162,7 @@ def main():
             iters=args.iters,
         )
 
-        # logging.info("Combining filtered alignments...")
+        # logging.info("Combining filtered alignments")
         # queries = dt.unique(alns_filtered["queryId"]).to_pandas()
         # outer_join = alns.to_pandas().merge(queries, how="outer", indicator=True)
         # anti_join = outer_join[~(outer_join._merge == "both")].drop("_merge", axis=1)
@@ -187,12 +187,12 @@ def main():
         },
     ].to_pandas()
 
-    logging.info("Getting coverage statistics...")
+    logging.info("Getting coverage statistics")
 
     results = get_coverage_stats(df, trim=args.trim)
 
     # Filter results
-    logging.info(f"Filtering references...")
+    logging.info(f"Filtering references")
     logging.info(f"::: [Filter:{args.filter}; Value:{filter_conditions[args.filter]}]")
     dt_filter_conditions = create_filter_conditions(
         filter_type=args.filter, filter_conditions=filter_conditions
@@ -219,7 +219,7 @@ def main():
     nqueries = alns[:, dt.nunique(dt.f.queryId)][0, 0]
 
     logging.info(
-        f"{refs.shape[0]:,} references and {nqueries:,} queries passing filter..."
+        f"{refs.shape[0]:,} references and {nqueries:,} queries passing filter"
     )
 
     # write stats to file
@@ -234,7 +234,7 @@ def main():
 
     # use map file to aggregate gene abundances
     if args.mapping_file:
-        logging.info("Aggregating gene abundances...")
+        logging.info("Aggregating gene abundances")
         group_abundances = aggregate_gene_abundances(
             mapping_file=args.mapping_file,
             gene_abundances=results_filtered,

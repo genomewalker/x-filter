@@ -141,9 +141,9 @@ def resolve_multimaps(
     """Resolve multimaps by iteratively removing the lowest scoring reads.
 
     Args:
-        df ([dataFrame]): [description]
-        scale (float, optional): [description]. Defaults to 0.9.
-        iters (int, optional): [description]. Defaults to 10.
+        df ([Frame]): A Frame containing the alignments
+        scale (float, optional): Scale where to filter. Defaults to 0.9.
+        iters (int, optional): Number of iterations. Defaults to 10.
         threa
     """
     dt.options.progress.clear_on_success = True
@@ -157,7 +157,7 @@ def resolve_multimaps(
 
     #       col_names <- c("label", "query", "theader", "pident", "alnlen", "mismatch", "gapopen", "qstart", "qend", "tstart", "tend", "evalue", "bits", "qlen", "tlen")
 
-    logging.info(f"::: Iter: {iter + 1} - Calculating query bitscores")
+    logging.info(f"::: Iter: {iter + 1} - Getting scores")
 
     n_alns = df.shape[0]
     logging.info(f"::: Iter: {iter + 1} - Total alignment: {n_alns}")
