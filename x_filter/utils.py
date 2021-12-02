@@ -160,7 +160,7 @@ help_msg = {
 
 def get_arguments(argv=None):
     parser = argparse.ArgumentParser(
-        description="A simple tool to calculate metrics from a BAM file and filter references to be used with Woltka",
+        description="A simple tool to filter BLASTx m8 files using the FAMLI algorithm",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     parser.add_argument(

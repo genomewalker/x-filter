@@ -10,8 +10,6 @@ requirements = [
     "pyrle>=0.0.33",
     "pyranges>=0.0.112",
     "datatable>=1.0.0",
-    "ray[default]==1.5.2",
-    "aiohttp==3.7",
 ]
 
 setup(
