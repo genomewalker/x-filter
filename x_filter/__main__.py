@@ -13,10 +13,6 @@ see <https://www.gnu.org/licenses/>.
 
 
 import logging
-from os import get_terminal_size
-from re import A, T
-import pandas as pd
-import numpy as np
 from x_filter.utils import get_arguments, create_output_files, create_filter_conditions
 from x_filter.filter import (
     resolve_multimaps,
@@ -26,7 +22,6 @@ from x_filter.filter import (
     aggregate_gene_abundances,
 )
 import datatable as dt
-import pyranges as pr
 
 log = logging.getLogger("my_logger")
 

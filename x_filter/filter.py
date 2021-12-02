@@ -1,22 +1,17 @@
 import numpy as np
-import re, os, sys
-import pandas as pd
-from multiprocessing import Pool, Manager
-import functools
+import sys
+from multiprocessing import Pool
 from scipy import stats
 import tqdm
 import logging
-import warnings
 from x_filter.utils import (
     is_debug,
     calc_chunksize,
-    fast_flatten,
-    initializer,
 )
 import datatable as dt
 import pyranges as pr
 from multiprocessing import Pool
-from functools import partial, reduce
+from functools import partial
 from collections import defaultdict
 
 
