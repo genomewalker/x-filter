@@ -21,6 +21,13 @@ requirements:
   run:
     - python>=3.9
     - pip
+    - pandas>=1.3.4
+    - scipy>=1.7.3
+    - tqdm>=4.62.3
+    - numpy>=1.21.4
+    - pyrle>=0.0.33
+    - pyranges>=0.0.112
+    - datatable
     
 test:
   commands:
