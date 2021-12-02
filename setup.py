@@ -2,7 +2,6 @@ from setuptools import setup
 import versioneer
 
 requirements = [
-    "Cython>=0.29.24",
     "pandas>=1.3.4",
     "scipy>=1.7.3",
     "tqdm>=4.62.3",
