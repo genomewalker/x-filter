@@ -22,6 +22,7 @@ from x_filter.filter import (
     aggregate_gene_abundances,
 )
 import datatable as dt
+import numpy as np
 
 log = logging.getLogger("my_logger")
 
@@ -29,7 +30,9 @@ log = logging.getLogger("my_logger")
 def main():
 
     logging.basicConfig(
-        level=logging.DEBUG, format="%(levelname)s ::: %(asctime)s ::: %(message)s"
+        level=logging.DEBUG,
+        format="%(levelname)s ::: %(asctime)s ::: %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
     )
 
     args = get_arguments()
@@ -125,7 +128,8 @@ def main():
     del alns["keep"]
     # Count how many queries we kept
 
-    nqueries = alns[:, dt.nunique(dt.f.queryId)][0, 0]
+    # nqueries = alns[:, dt.nunique(dt.f.queryId)][0, 0]
+    nqueries = np.unique(alns[:, ["queryId"]]).size
 
     logging.info(
         f"{refs.shape[0]:,} references and {nqueries:,} queries passing filter"
@@ -209,8 +213,8 @@ def main():
     del alns["keep"]
     # Count how many queries we kept
 
-    nqueries = alns[:, dt.nunique(dt.f.queryId)][0, 0]
-
+    # nqueries = alns[:, dt.nunique(dt.f.queryId)][0, 0]
+    nqueries = np.unique(alns[:, ["queryId"]]).size
     logging.info(
         f"{refs.shape[0]:,} references and {nqueries:,} queries passing filter"
     )

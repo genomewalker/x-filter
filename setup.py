@@ -8,7 +8,7 @@ requirements = [
     "numpy>=1.21.4",
     "pyrle>=0.0.33",
     "pyranges>=0.0.112",
-    "datatable @ git+https://github.com/h2oai/datatable.git@ffb58ac31a77d5b8f6323fe4e94c9caebb97f90e",
+    "datatable>=1.0.0",
 ]
 
 setup(
