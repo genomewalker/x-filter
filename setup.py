@@ -8,13 +8,13 @@ requirements = [
     "numpy>=1.21.4",
     "pyrle>=0.0.33",
     "pyranges>=0.0.112",
-    "datatable>=1.0.0",
+    "datatable @ git+https://github.com/h2oai/datatable.git",
 ]
 
 setup(
     setup_requires=[
         # Setuptools 18.0 properly handles Cython extensions.
-        "setuptools>=18.0",
+        "setuptools>=39.1.0",
         "Cython>=0.29.24",
     ],
     name="x-filter",
