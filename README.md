@@ -127,7 +127,7 @@ xFilter --input xFilter-1M-test.m8.gz --bitscore 60 --evalue 1e-5 --filter bread
 xFilter by default will trim the coverage values on both 5' and 3' ends based on the average read length (in amino acid) mapped to each query. This can be deactivated with the **--no-trim** option.
 
 xFilter will generate the following files:
- - {prefix}**_nomultimap.tsv.gz**: This file contains the filtered BLASTx results after removing non-well supported references and multi-mappings.
+ - {prefix}**_no-multimap.tsv.gz**: This file contains the filtered BLASTx results after removing non-well supported references and multi-mappings.
  - {prefix}**_cov-stats.tsv.gz**: This file contains the coverage statistics of the references after the filtering. It contains the following columns:
    - **reference**: Reference name
    - **depth_mean**: Coverage mean
@@ -144,5 +144,15 @@ xFilter will generate the following files:
     - **median**: Median coverage values
     - **sum**: Sum of coverage values
     - **n_genes**: Number of genes in the group
+  - {prefix}**_group-abundances.tsv.gz**: If a mapping file is provided, it reports:
+   - **reference**: Reference name
+   - **group**: Group name
+   - **depth_mean**: Coverage mean
+   - **depth_std**: Coverage standard deviation
+   - **depth_evenness**: Coverage evenness (SD/MEAN)
+   - **breadth**: Breadth of coverage
+   - **breadth_expected**: Expected breadth of coverage
+   - **breadth_expected_ratio**: Observed breadth to expected breadth ratio (scaled)
+   - **n_alns**: Number of alignments
 
 

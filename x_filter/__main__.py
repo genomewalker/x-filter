@@ -17,7 +17,6 @@ from x_filter.utils import (
     get_arguments,
     create_output_files,
     create_filter_conditions,
-    concat_df,
 )
 from x_filter.filter import (
     resolve_multimaps,
@@ -28,8 +27,6 @@ from x_filter.filter import (
 )
 import datatable as dt
 import numpy as np
-
-import pandas as pd
 
 log = logging.getLogger("my_logger")
 
@@ -167,11 +164,6 @@ def main():
         logging.info(f"Removing multimapping reads")
         alns.key = ["queryId", "subjectId"]
         alns = alns_filtered[:, ["queryId", "subjectId"]][:, :, dt.join(alns)]
-        # alns = dt.Frame(
-        #     alns[:, ["queryId", "subjectId"]]
-        #     .to_pandas()
-        #     .merge(alns_filtered.to_pandas(), how="inner")
-        # )
     else:
         logging.info("No multimapping reads found.")
 

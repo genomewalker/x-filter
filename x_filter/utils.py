@@ -2,19 +2,14 @@ import argparse
 import sys
 import gzip
 import os
-import shutil
 import logging
 import pandas as pd
-from multiprocessing import Pool
-from functools import partial, reduce
 from contextlib import contextmanager, redirect_stderr, redirect_stdout
 from os import devnull
-import tqdm
 from x_filter import __version__
 import time
 from itertools import chain
 from pathlib import Path
-from operator import or_
 import datatable as dt
 
 log = logging.getLogger("my_logger")
