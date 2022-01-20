@@ -70,10 +70,13 @@ def read_and_filter_alns(
         f"Filtering alignments with bitscore >= {bitscore} and evalue <= {evalue}"
     )
     aln = aln[(dt.f.eVal < evalue) & (dt.f.bitScore > bitscore), :]
-
     nalns = aln.shape[0]
-
     logging.info(f"Post-filtering: {nalns:,} alignments found")
+
+    aln = aln[:1, :, dt.by(dt.f.queryId, dt.f.subjectId), dt.sort(-dt.f.bitScore)]
+    nalns = aln.shape[0]
+    logging.info(f"Removing reads mapping multiple times to the same subject")
+    logging.info(f"::: Kept best bitScore alignments: {nalns:,}")
     return aln
 
 
@@ -125,7 +128,7 @@ def resolve_multimaps(
     logging.info(f"::: Iter: {iter + 1} - Getting scores")
 
     n_alns = df.shape[0]
-    logging.info(f"::: Iter: {iter + 1} - Total alignment: {n_alns}")
+    logging.info(f"::: Iter: {iter + 1} - Total alignment: {n_alns:,}")
 
     # Calculate the weights for each subject
     df[:, dt.update(s_W=dt.sum(dt.f.prob) / dt.f.slen), dt.by("subjectId")]
@@ -196,10 +199,10 @@ def resolve_multimaps(
     total_n_unique = df[:, {"n_aln": dt.count()}, dt.by("queryId")]
     total_n_unique = total_n_unique[dt.f.n_aln <= 1, :].shape[0]
     keep_processing = to_remove.shape[0] != 0
-    logging.info(f"::: Iter: {iter} - Removed {to_remove.shape[0]} alignments")
-    logging.info(f"::: Iter: {iter} - New unique mapping queries: {n_unique}")
-    logging.info(f"::: Iter: {iter} - Total unique mapping queries: {total_n_unique}")
-    logging.info(f"::: Iter: {iter} - Alns left: {str(df.shape[0])}")
+    logging.info(f"::: Iter: {iter} - Removed {to_remove.shape[0]:,} alignments")
+    logging.info(f"::: Iter: {iter} - New unique mapping queries: {n_unique:,}")
+    logging.info(f"::: Iter: {iter} - Total unique mapping queries: {total_n_unique:,}")
+    logging.info(f"::: Iter: {iter} - Alns left: {df.shape[0]:,}")
 
     logging.info(f"::: Iter: {iter} - done!")
     if iter < iters and keep_processing:
@@ -414,10 +417,10 @@ def aggregate_gene_abundances(mapping_file, gene_abundances, threads=1):
     if mappings.shape[0] == 0:
         return None
     else:
-        mappings = mappings.groupby("group").agg(
+        mappings_agg = mappings.groupby("group").agg(
             {"depth_mean": ["mean", "std", "median", "sum", "count"]}
         )
-        mappings = mappings.xs("depth_mean", axis=1, drop_level=True)
-        mappings = mappings.reset_index("group")
-        mappings.rename({"count": "n_genes"}, axis=1, inplace=True)
-        return mappings
+        mappings_agg = mappings_agg.xs("depth_mean", axis=1, drop_level=True)
+        mappings_agg = mappings_agg.reset_index("group")
+        mappings_agg.rename({"count": "n_genes"}, axis=1, inplace=True)
+        return mappings, mappings_agg

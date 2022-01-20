@@ -326,10 +326,11 @@ def create_output_files(prefix, input):
         prefix = Path(input).resolve().stem.split(".")[0]
     # create output files
     out_files = {
-        "multimap": f"{prefix}_multimap.tsv.gz",
+        "multimap": f"{prefix}_no-multimap.tsv.gz",
         "coverage": f"{prefix}_cov-stats.tsv.gz",
         "kegg_coverage": f"{prefix}_kegg-cov-stats.tsv.gz",
         "group_abundances": f"{prefix}_group-abundances.tsv.gz",
+        "group_abundances_agg": f"{prefix}_group-abundances-agg.tsv.gz",
     }
     return out_files
 

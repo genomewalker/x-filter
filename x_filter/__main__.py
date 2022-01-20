@@ -13,7 +13,12 @@ see <https://www.gnu.org/licenses/>.
 
 
 import logging
-from x_filter.utils import get_arguments, create_output_files, create_filter_conditions
+from x_filter.utils import (
+    get_arguments,
+    create_output_files,
+    create_filter_conditions,
+    concat_df,
+)
 from x_filter.filter import (
     resolve_multimaps,
     read_and_filter_alns,
@@ -23,6 +28,8 @@ from x_filter.filter import (
 )
 import datatable as dt
 import numpy as np
+
+import pandas as pd
 
 log = logging.getLogger("my_logger")
 
@@ -128,7 +135,6 @@ def main():
     del alns["keep"]
     # Count how many queries we kept
 
-    # nqueries = alns[:, dt.nunique(dt.f.queryId)][0, 0]
     nqueries = np.unique(alns[:, ["queryId"]]).size
 
     logging.info(
@@ -158,16 +164,18 @@ def main():
             scale=args.scale,
             iters=args.iters,
         )
-
-        # logging.info("Combining filtered alignments")
-        # queries = dt.unique(alns_filtered["queryId"]).to_pandas()
-        # outer_join = alns.to_pandas().merge(queries, how="outer", indicator=True)
-        # anti_join = outer_join[~(outer_join._merge == "both")].drop("_merge", axis=1)
-        # alns = concat_df([anti_join, alns_filtered.to_pandas()])
-
-        alns = dt.Frame(alns.to_pandas().merge(alns_filtered.to_pandas(), how="inner"))
+        logging.info(f"Removing multimapping reads")
+        alns.key = ["queryId", "subjectId"]
+        alns = alns_filtered[:, ["queryId", "subjectId"]][:, :, dt.join(alns)]
+        # alns = dt.Frame(
+        #     alns[:, ["queryId", "subjectId"]]
+        #     .to_pandas()
+        #     .merge(alns_filtered.to_pandas(), how="inner")
+        # )
     else:
         logging.info("No multimapping reads found.")
+
+    logging.info("Getting coverage statistics")
 
     df = alns[
         :,
@@ -183,8 +191,6 @@ def main():
             "qlen": dt.f.qlen,
         },
     ].to_pandas()
-
-    logging.info("Getting coverage statistics")
 
     results = get_coverage_stats(df, trim=args.trim)
 
@@ -213,8 +219,8 @@ def main():
     del alns["keep"]
     # Count how many queries we kept
 
-    # nqueries = alns[:, dt.nunique(dt.f.queryId)][0, 0]
     nqueries = np.unique(alns[:, ["queryId"]]).size
+
     logging.info(
         f"{refs.shape[0]:,} references and {nqueries:,} queries passing filter"
     )
@@ -232,19 +238,25 @@ def main():
     # use map file to aggregate gene abundances
     if args.mapping_file:
         logging.info("Aggregating gene abundances")
-        group_abundances = aggregate_gene_abundances(
+        gene_abundances, gene_abundances_agg = aggregate_gene_abundances(
             mapping_file=args.mapping_file,
             gene_abundances=results_filtered,
             threads=args.threads,
         )
 
-        if group_abundances is None:
+        if gene_abundances is None:
             logging.info("Couldn't map anything to the references.")
             logging.info(f"ALL DONE.")
             exit(0)
         logging.info(f"Writing group abundances to {out_files['group_abundances']}")
-        group_abundances.to_csv(
+        gene_abundances.to_csv(
             out_files["group_abundances"], sep="\t", index=False, compression="gzip"
+        )
+        logging.info(
+            f"Writing aggregated group abundances to {out_files['group_abundances_agg']}"
+        )
+        gene_abundances_agg.to_csv(
+            out_files["group_abundances_agg"], sep="\t", index=False, compression="gzip"
         )
 
 
