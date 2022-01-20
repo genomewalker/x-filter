@@ -161,7 +161,7 @@ def main():
             scale=args.scale,
             iters=args.iters,
         )
-        logging.info(f"Removing multimapping reads")
+        logging.info(f"Removing multimapping queries")
         alns.key = ["queryId", "subjectId"]
         alns = alns_filtered[:, ["queryId", "subjectId"]][:, :, dt.join(alns)]
     else:
