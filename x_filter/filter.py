@@ -6,7 +6,6 @@ import datatable as dt
 
 from collections import defaultdict
 
-
 log = logging.getLogger("my_logger")
 
 sys.setrecursionlimit(10 ** 6)

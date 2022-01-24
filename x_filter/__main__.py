@@ -27,6 +27,7 @@ from x_filter.filter import (
 )
 import datatable as dt
 import numpy as np
+import gc
 
 log = logging.getLogger("my_logger")
 
@@ -107,6 +108,8 @@ def main():
     ].to_pandas()
 
     results = get_coverage_stats(df, trim=args.trim)
+    del df
+    gc.collect()
     # Filter results
     logging.info(f"Filtering references")
     logging.info(f"::: [Filter:{args.filter}; Value:{filter_conditions[args.filter]}]")
@@ -119,7 +122,10 @@ def main():
 
     refs = dt.unique(results[:, {"subjectId": dt.f.reference}][:, "subjectId"])
     refs[:, dt.update(keep="keep")]
-
+    
+    del results
+    gc.collect()
+    
     refs.key = "subjectId"
     alns = alns[
         :,
@@ -155,15 +161,18 @@ def main():
     #     ]
     # )
     if alns_mp is not None:
+        alns.key = ["queryId", "subjectId"]
         alns_filtered = resolve_multimaps(
             df=alns_mp,
             threads=args.threads,
             scale=args.scale,
             iters=args.iters,
         )
+        alns_filtered = alns_filtered[:, ["queryId", "subjectId"]]
+        logging.info(f"Garbage collection")
+        gc.collect()
         logging.info(f"Removing multimapping queries")
-        alns.key = ["queryId", "subjectId"]
-        alns = alns_filtered[:, ["queryId", "subjectId"]][:, :, dt.join(alns)]
+        alns = alns_filtered[:, :, dt.join(alns)]
     else:
         logging.info("No multimapping reads found.")
 
