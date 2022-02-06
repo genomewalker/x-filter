@@ -407,7 +407,7 @@ def aggregate_gene_abundances(mapping_file, gene_abundances, threads=1):
 
     # exit if mappings has no rows
     if mappings.shape[0] == 0:
-        return None
+        return None, None
     else:
         mappings_agg = mappings.groupby("group").agg(
             {"depth_mean": ["mean", "std", "median", "sum", "count"]}
