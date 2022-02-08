@@ -50,7 +50,7 @@ def read_and_filter_alns(
         aln,
         sep="\t",
         header=False,
-        nthreads=32,
+        nthreads=threads,
         columns=col_names[0],
     )
     aln[dt.bool8] = dt.int32
