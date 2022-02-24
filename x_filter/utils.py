@@ -130,6 +130,7 @@ defaults = {
     "iters": 25,
     "scale": 0.9,
     "filter": "breadth_expected_ratio",
+    "annotation_source": "unknown",
 }
 
 help_msg = {
@@ -146,6 +147,8 @@ help_msg = {
     "mapping_file": "File with mappings to genes for aggregation",
     "iters": "Number of iterations for the FAMLI-like filtering",
     "scale": "Scale to select the best weithing alignments",
+    "anvio": "Create output compatible with anvi'o",
+    "annotation_source": "Source of the annotation",
     "help": "Help message",
     "debug": f"Print debug messages",
     "version": f"Print program version",
@@ -281,6 +284,16 @@ def get_arguments(argv=None):
         "--no-trim", dest="trim", action="store_false", help=help_msg["trim"]
     )
     parser.add_argument(
+        "--anvio", dest="anvio", action="store_true", help=help_msg["anvio"]
+    )
+    parser.add_argument(
+        "--annotation-source",
+        type=str,
+        default=defaults["annotation_source"],
+        dest="annotation_source",
+        help=help_msg["annotation_source"],
+    )
+    parser.add_argument(
         "--debug", dest="debug", action="store_true", help=help_msg["debug"]
     )
     parser.add_argument(
@@ -325,6 +338,7 @@ def create_output_files(prefix, input):
         "coverage": f"{prefix}_cov-stats.tsv.gz",
         "kegg_coverage": f"{prefix}_kegg-cov-stats.tsv.gz",
         "group_abundances": f"{prefix}_group-abundances.tsv.gz",
+        "group_abundances_anvio": f"{prefix}_group-abundances-anvio.tsv.gz",
         "group_abundances_agg": f"{prefix}_group-abundances-agg.tsv.gz",
     }
     return out_files

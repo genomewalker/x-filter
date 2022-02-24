@@ -416,3 +416,22 @@ def aggregate_gene_abundances(mapping_file, gene_abundances, threads=1):
         mappings_agg = mappings_agg.reset_index("group")
         mappings_agg.rename({"count": "n_genes"}, axis=1, inplace=True)
         return mappings, mappings_agg
+
+
+def convert_to_anvio(df, annotation_source):
+    # gene_id	enzyme_accession	source	coverage	detection
+    # Select and rename columns from pandas dataframe
+    df = df.copy()
+    df["group"] = df["group"].str.replace("ko:", "")
+    df["source"] = annotation_source
+    df = df[["reference", "group", "source", "depth_mean", "breadth"]]
+    df.rename(
+        columns={
+            "reference": "gene_id",
+            "group": "enzyme_accession",
+            "depth_mean": "coverage",
+            "breadth": "detection",
+        },
+        inplace=True,
+    )
+    return df

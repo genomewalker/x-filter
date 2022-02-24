@@ -24,6 +24,7 @@ from x_filter.filter import (
     initialize_subject_weights,
     get_coverage_stats,
     aggregate_gene_abundances,
+    convert_to_anvio,
 )
 import datatable as dt
 import numpy as np
@@ -122,10 +123,10 @@ def main():
 
     refs = dt.unique(results[:, {"subjectId": dt.f.reference}][:, "subjectId"])
     refs[:, dt.update(keep="keep")]
-    
+
     del results
     gc.collect()
-    
+
     refs.key = "subjectId"
     alns = alns[
         :,
@@ -253,6 +254,21 @@ def main():
         gene_abundances.to_csv(
             out_files["group_abundances"], sep="\t", index=False, compression="gzip"
         )
+
+        if args.anvio:
+            gene_abundances_agg_anvio = convert_to_anvio(
+                df=gene_abundances, annotation_source=args.annotation_source
+            )
+            logging.info(
+                f"Writing abundances with anvi'o format to {out_files['group_abundances_anvio']}"
+            )
+            gene_abundances_agg_anvio.to_csv(
+                out_files["group_abundances_anvio"],
+                sep="\t",
+                index=False,
+                compression="gzip",
+            )
+
         logging.info(
             f"Writing aggregated group abundances to {out_files['group_abundances_agg']}"
         )

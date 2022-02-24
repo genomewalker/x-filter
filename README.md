@@ -95,6 +95,9 @@ optional arguments:
                         Reference with higher evenness will be removed (default: 1.0)
   -m MAPPING_FILE, --mapping-file MAPPING_FILE
                         File with mappings to genes for aggregation (default: None)
+  --anvio               Create output compatible with anvi'o (default: False)
+  --annotation-source ANNOTATION_SOURCE
+                        Source of the annotation (default: unknown)
   --no-trim             Deactivate the trimming for the coverage calculations (default: True)
   --debug               Print debug messages (default: False)
   --version             Print program version
@@ -154,5 +157,16 @@ xFilter will generate the following files:
    - **breadth_expected**: Expected breadth of coverage
    - **breadth_expected_ratio**: Observed breadth to expected breadth ratio (scaled)
    - **n_alns**: Number of alignments
+
+If you use `--anvio` it will generate the output necessary for the `anvi-estimate-metabolism` program. Check [here](https://github.com/merenlab/anvio/pull/1890) for its usage.
+
+> Note: At the moment only available in [anvi'o](https://github.com/merenlab/anvio/) `master`
+
+- {prefix}**_group-abundances-anvio.tsv.gz**
+  - **gene_id**: Reference name
+  - **enzyme_accession**: Group name
+  - **source**: Source of the annotation
+  - **coverage**: Coverage mean
+  - **detection**: Breadth of coverage
 
 
