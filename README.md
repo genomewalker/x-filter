@@ -158,7 +158,7 @@ xFilter will generate the following files:
    - **breadth_expected_ratio**: Observed breadth to expected breadth ratio (scaled)
    - **n_alns**: Number of alignments
 
-If you use `--anvio` it will generate the output necessary for the `anvi-estimate-metabolism` program. Check [here](https://github.com/merenlab/anvio/pull/1890) for its usage.
+If you use `--anvio` it will generate the output necessary for the `anvi-estimate-metabolism` program. Check [here](https://github.com/merenlab/anvio/pull/1890) for its usage. You can define the `source` using `--annotation-source`.
 
 > Note: At the moment only available in [anvi'o](https://github.com/merenlab/anvio/) `master`
 
