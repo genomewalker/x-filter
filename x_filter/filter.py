@@ -53,7 +53,6 @@ def read_and_filter_alns(
         nthreads=threads,
         columns=col_names[0],
     )
-    aln[dt.bool8] = dt.int32
     nalns = aln.shape[0]
     # logging.info(f"Read {nalns:,} alignments. Getting basic statistics.")
 
@@ -62,6 +61,7 @@ def read_and_filter_alns(
         f"Filtering alignments with bitscore >= {bitscore} and evalue <= {evalue}"
     )
     aln = aln[(dt.f.eVal < evalue) & (dt.f.bitScore > bitscore), :]
+    aln[dt.bool8] = dt.int32
     nalns = aln.shape[0]
     logging.info(f"Post-filtering: {nalns:,} alignments found")
 
