@@ -64,10 +64,10 @@ def read_and_filter_alns(
     aln[dt.bool8] = dt.int32
     nalns = aln.shape[0]
     logging.info(f"Post-filtering: {nalns:,} alignments found")
-
+   
+    logging.info(f"Removing reads mapping multiple times to the same subject")
     aln = aln[:1, :, dt.by(dt.f.queryId, dt.f.subjectId), dt.sort(-dt.f.bitScore)]
     nalns = aln.shape[0]
-    logging.info(f"Removing reads mapping multiple times to the same subject")
     logging.info(f"::: Kept best bitScore alignments: {nalns:,}")
     return aln
 
