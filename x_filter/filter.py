@@ -3,7 +3,7 @@ import sys
 import tqdm
 import logging
 import datatable as dt
-
+import gc
 from collections import defaultdict
 
 log = logging.getLogger("my_logger")
@@ -46,22 +46,73 @@ def read_and_filter_alns(
     """
     dt.options.progress.clear_on_success = True
     dt.options.nthreads = threads
-    aln = dt.fread(
+    aln_0 = dt.fread(
         aln,
         sep="\t",
         header=False,
         nthreads=threads,
         columns=col_names[0],
     )
-    nalns = aln.shape[0]
-    # logging.info(f"Read {nalns:,} alignments. Getting basic statistics.")
+    nalns = aln_0.shape[0]
+    max_rows = int((2 ** 31) - 1)
 
-    logging.info(f"Pre-filtering: {nalns:,} alignments found")
-    logging.info(
-        f"Filtering alignments with bitscore >= {bitscore} and evalue <= {evalue}"
-    )
-    aln = aln[(dt.f.eVal < evalue) & (dt.f.bitScore > bitscore), :]
-    aln[dt.bool8] = dt.int32
+    # if the number of alignmentsis larger than the number of rows
+    # that can be read by fread, we need to read it by chunks instead
+    alns = []
+    if nalns > max_rows:
+        del aln_0
+        gc.collect()
+        logging.info(
+            f"Pre-filtering: {nalns:,} alignments found. This is more than {max_rows:,} alignments."
+        )
+        logging.info(
+            f"::: This is not supported by datatable at the moment. Trying to read and filter using chunks instead."
+        )
+
+        k, m = divmod(nalns, max_rows)
+
+        for i in range(k + 1):
+            logging.info(f"::: Reading chunk #{i+1:,}.")
+            up = max_rows * (i + 1)
+            if up > nalns:
+                up = nalns
+            else:
+                up = int(up - max_rows * i)
+            aln_chunk = dt.fread(
+                aln,
+                sep="\t",
+                header=False,
+                nthreads=threads,
+                columns=col_names[0],
+                skip_to_line=int(max_rows * i),
+                max_nrows=up,
+            )
+            logging.info(
+                f"::: Filtering alignments in chunk #{i+1:,} with bitscore >= {bitscore} and evalue <= {evalue}"
+            )
+            aln_chunk = aln_chunk[(dt.f.eVal < evalue) & (dt.f.bitScore > bitscore), :]
+            alns.append(aln_chunk)
+        logging.info(f"::: Concatenating chunks.")
+        aln = alns[0]
+        alns.pop(0)
+
+        if len(alns) > 0:
+            for i in alns:
+                aln.rbind(i)
+        if aln.shape[0] > max_rows:
+            logging.error(f"The resulting table has more than {max_rows,} alignments and it is not supported at the moment.")
+            exit(1)
+    else:
+        logging.info(f"Pre-filtering: {nalns:,} alignments found")
+        # logging.info(f"Read {nalns:,} alignments. Getting basic statistics.")
+
+        logging.info(
+            f"Filtering alignments with bitscore >= {bitscore} and evalue <= {evalue}"
+        )
+        aln = aln_0
+        del aln_0
+        aln = aln[(dt.f.eVal < evalue) & (dt.f.bitScore > bitscore), :]
+
     nalns = aln.shape[0]
     logging.info(f"Post-filtering: {nalns:,} alignments found")
 
@@ -324,20 +375,35 @@ def get_coverage_stats(df, trim=True):
     queries = defaultdict(int)
     gen_data = defaultdict(dict)
     rl = defaultdict(list)
-    for a, q, b, c, d, e in tqdm.tqdm(
-        zip(
-            df["Chromosome"],
-            df["Query"],
-            df["Start"],
-            df["End"],
-            df["slen"],
-            df["qlen"],
-        ),
+    # for a, q, b, c, d, e in tqdm.tqdm(
+    #     zip(
+    #         df["Chromosome"],
+    #         df["Query"],
+    #         df["Start"],
+    #         df["End"],
+    #         df["slen"],
+    #         df["qlen"],
+    #     ),
+    #     total=df.shape[0],
+    #     leave=False,
+    #     ncols=100,
+    #     desc=f"Alignments processed",
+    # ):
+    for i in tqdm.tqdm(
+        np.arange(df.shape[0]),
         total=df.shape[0],
         leave=False,
         ncols=100,
         desc=f"Alignments processed",
     ):
+        i = int(i)
+        a = df[i, "subjectId"]
+        q = df[i, "queryId"]
+        b = df[i, "subjectStart"]
+        c = df[i, "subjectEnd"]
+        d = df[i, "slen"]
+        e = df[i, "qlen"]
+
         b = b - 1
 
         if a in gen_data:
@@ -351,7 +417,7 @@ def get_coverage_stats(df, trim=True):
             gen_data[a]["n_alns"] += 1
             rl[a] += [e / 3]
     logging.info(
-        f"References will be dinamycally trimmed at 5'/3'-ends (half of the avg. read length)"
+        f"References will be dynamically trimmed at 5'/3'-ends (half of the avg. read length)"
     )
     stats = [
         get_stats_coverage(

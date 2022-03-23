@@ -93,24 +93,22 @@ def main():
     )
 
     logging.info("Getting coverage statistics")
-    df = alns[
-        :,
-        ["subjectId", "queryId", "subjectStart", "subjectEnd", "slen", "qlen"],
-    ][
-        :,
-        {
-            "Chromosome": dt.f.subjectId,
-            "Query": dt.f.queryId,
-            "Start": dt.f.subjectStart,
-            "End": dt.f.subjectEnd,
-            "slen": dt.f.slen,
-            "qlen": dt.f.qlen,
-        },
-    ].to_pandas()
+    # df = alns[
+    #     :,
+    #     ["subjectId", "queryId", "subjectStart", "subjectEnd", "slen", "qlen"],
+    # ][
+    #     :,
+    #     {
+    #         "Chromosome": dt.f.subjectId,
+    #         "Query": dt.f.queryId,
+    #         "Start": dt.f.subjectStart,
+    #         "End": dt.f.subjectEnd,
+    #         "slen": dt.f.slen,
+    #         "qlen": dt.f.qlen,
+    #     },
+    # ].to_pandas()
 
-    results = get_coverage_stats(df, trim=args.trim)
-    del df
-    gc.collect()
+    results = get_coverage_stats(alns, trim=args.trim)
     # Filter results
     logging.info(f"Filtering references")
     logging.info(f"::: [Filter:{args.filter}; Value:{filter_conditions[args.filter]}]")
@@ -137,7 +135,9 @@ def main():
     ]
     alns = alns[dt.f.keep == "keep", :]
     del alns["keep"]
+    gc.collect()
     # Count how many queries we kept
+    alns.key = ["queryId", "subjectId"]
 
     nqueries = np.unique(alns[:, ["queryId"]]).size
 
@@ -162,7 +162,6 @@ def main():
     #     ]
     # )
     if alns_mp is not None:
-        alns.key = ["queryId", "subjectId"]
         alns_filtered = resolve_multimaps(
             df=alns_mp,
             threads=args.threads,
@@ -182,17 +181,7 @@ def main():
     df = alns[
         :,
         ["subjectId", "queryId", "subjectStart", "subjectEnd", "slen", "qlen"],
-    ][
-        :,
-        {
-            "Chromosome": dt.f.subjectId,
-            "Query": dt.f.queryId,
-            "Start": dt.f.subjectStart,
-            "End": dt.f.subjectEnd,
-            "slen": dt.f.slen,
-            "qlen": dt.f.qlen,
-        },
-    ].to_pandas()
+    ]
 
     results = get_coverage_stats(df, trim=args.trim)
 
@@ -229,6 +218,7 @@ def main():
 
     # write stats to file
     logging.info(f"Writing filtered alignments to {out_files['multimap']}")
+    alns[dt.bool8] = dt.int32
     alns = alns.to_pandas()[col_names[0]]
     alns.to_csv(out_files["multimap"], sep="\t", index=False, compression="gzip")
 
