@@ -55,17 +55,15 @@ xFilter uses a BLASTx m8 formatted file containing aligned reads to references. 
 ```
 $ xFilter --help
 
-usage: xFilter [-h] [-i INPUT] [-t THREADS] [-p PREFIX] [-n ITERS] [-e EVALUE] [-s SCALE] [-b BITSCORE] [-f FILTER]
-               [--breadth BREADTH] [--breadth-expected-ratio BREADTH_EXPECTED_RATIO] [--depth DEPTH]
-               [--depth-evenness DEPTH_EVENNESS] [-m MAPPING_FILE] [--no-trim] [--debug] [--version]
+usage: xFilter [-h] [-i INPUT] [-t THREADS] [-p PREFIX] [-n ITERS] [-e EVALUE] [-s SCALE] [-b BITSCORE] [-f FILTER] [--breadth BREADTH] [--breadth-expected-ratio BREADTH_EXPECTED_RATIO] [--depth DEPTH] [--depth-evenness DEPTH_EVENNESS]
+               [-m MAPPING_FILE] [--no-trim] [--anvio] [--annotation-source ANNOTATION_SOURCE] [--debug] [--version]
 
 A simple tool to filter BLASTx m8 files using the FAMLI algorithm
 
 optional arguments:
   -h, --help            show this help message and exit
   -i INPUT, --input INPUT
-                        A blastx m8 formatted file containing aligned reads to references. It has to contain query and
-                        subject lengths (default: None)
+                        A blastx m8 formatted file containing aligned reads to references. It has to contain query and subject lengths (default: None)
   -t THREADS, --threads THREADS
                         Number of threads to use (default: 1)
   -p PREFIX, --prefix PREFIX
@@ -79,8 +77,7 @@ optional arguments:
   -b BITSCORE, --bitscore BITSCORE
                         Bitscore where to filter the results (default: 60)
   -f FILTER, --filter FILTER
-                        Which filter to use. Possible values are: breadth, depth, depth_evenness,
-                        breadth_expected_ratio (default: breadth_expected_ratio)
+                        Which filter to use. Possible values are: breadth, depth, depth_evenness, breadth_expected_ratio (default: breadth_expected_ratio)
   --breadth BREADTH     Breadth of the coverage (default: 0.5)
   --breadth-expected-ratio BREADTH_EXPECTED_RATIO
                         Expected breath to observed breadth ratio (scaled) (default: 0.5)
@@ -89,10 +86,10 @@ optional arguments:
                         Reference with higher evenness will be removed (default: 1.0)
   -m MAPPING_FILE, --mapping-file MAPPING_FILE
                         File with mappings to genes for aggregation (default: None)
+  --no-trim             Deactivate the trimming for the coverage calculations (default: True)
   --anvio               Create output compatible with anvi'o (default: False)
   --annotation-source ANNOTATION_SOURCE
                         Source of the annotation (default: unknown)
-  --no-trim             Deactivate the trimming for the coverage calculations (default: True)
   --debug               Print debug messages (default: False)
   --version             Print program version
 ```
