@@ -4,11 +4,20 @@ import tqdm
 import logging
 import datatable as dt
 import gc
+import psutil
+import tempfile
 from collections import defaultdict
+import os
 
 log = logging.getLogger("my_logger")
 
 sys.setrecursionlimit(10 ** 6)
+
+# from https://softwareengineering.stackexchange.com/a/419985
+def line_estimation(filename, first_size=1 << 24):
+    with open(filename, "rb") as file:
+        buf = file.read(first_size)
+        return len(buf) // buf.count(b"\n")
 
 
 def read_and_filter_alns(
@@ -46,27 +55,27 @@ def read_and_filter_alns(
     """
     dt.options.progress.clear_on_success = True
     dt.options.nthreads = threads
-    aln_0 = dt.fread(
-        aln,
-        sep="\t",
-        header=False,
-        nthreads=threads,
-        columns=col_names[0],
-    )
-    nalns = aln_0.shape[0]
+
+    # We do a raw estimation of the number of alignments in a file. This is
+    # because we don't know how many alignments are in the file and they can be in
+    # in the order of billions.
+
+    logging.info("Getting a raw estimate of the number of alignments...")
+    nalns = os.path.getsize(aln) // line_estimation(aln)
+    logging.info(f"Approximately {nalns:,} alignments found.")
+
     max_rows = int((2 ** 31) - 1)
 
     # if the number of alignmentsis larger than the number of rows
     # that can be read by fread, we need to read it by chunks instead
     alns = []
     if nalns > max_rows:
-        del aln_0
         gc.collect()
         logging.info(
             f"Pre-filtering: {nalns:,} alignments found. This is more than {max_rows:,} alignments."
         )
         logging.info(
-            f"::: This is not supported by datatable at the moment. Trying to read and filter using chunks instead."
+            f"::: This is not supported at the moment. Trying to read and filter using chunks instead."
         )
 
         k, m = divmod(nalns, max_rows)
@@ -76,22 +85,36 @@ def read_and_filter_alns(
             up = max_rows * (i + 1)
             if up > nalns:
                 up = nalns
+                aln_chunk = dt.fread(
+                    aln,
+                    sep="\t",
+                    header=False,
+                    nthreads=threads,
+                    columns=col_names[0],
+                    skip_to_line=int(max_rows * i),
+                )
             else:
                 up = int(up - max_rows * i)
-            aln_chunk = dt.fread(
-                aln,
-                sep="\t",
-                header=False,
-                nthreads=threads,
-                columns=col_names[0],
-                skip_to_line=int(max_rows * i),
-                max_nrows=up,
-            )
+                aln_chunk = dt.fread(
+                    aln,
+                    sep="\t",
+                    header=False,
+                    nthreads=threads,
+                    columns=col_names[0],
+                    skip_to_line=int(max_rows * i),
+                    max_nrows=up,
+                )
             logging.info(
                 f"::: Filtering alignments in chunk #{i+1:,} with bitscore >= {bitscore} and evalue <= {evalue}"
             )
-            aln_chunk = aln_chunk[(dt.f.eVal < evalue) & (dt.f.bitScore > bitscore), :]
-            alns.append(aln_chunk)
+            alns.append(
+                aln_chunk[(dt.f.eVal < evalue) & (dt.f.bitScore > bitscore), :].copy(
+                    deep=True
+                )
+            )
+            del aln_chunk
+            gc.collect(generation=2)
+
         logging.info(f"::: Concatenating chunks.")
         aln = alns[0]
         alns.pop(0)
@@ -100,7 +123,9 @@ def read_and_filter_alns(
             for i in alns:
                 aln.rbind(i)
         if aln.shape[0] > max_rows:
-            logging.error(f"The resulting table has more than {max_rows,} alignments and it is not supported at the moment.")
+            logging.error(
+                f"The resulting table has more than {max_rows,} alignments and it is not supported at the moment."
+            )
             exit(1)
     else:
         logging.info(f"Pre-filtering: {nalns:,} alignments found")
@@ -109,8 +134,13 @@ def read_and_filter_alns(
         logging.info(
             f"Filtering alignments with bitscore >= {bitscore} and evalue <= {evalue}"
         )
-        aln = aln_0
-        del aln_0
+        aln = dt.fread(
+            aln,
+            sep="\t",
+            header=False,
+            nthreads=threads,
+            columns=col_names[0],
+        )
         aln = aln[(dt.f.eVal < evalue) & (dt.f.bitScore > bitscore), :]
 
     nalns = aln.shape[0]
@@ -465,7 +495,6 @@ def aggregate_gene_abundances(mapping_file, gene_abundances, threads=1):
         Returns:
             dt.Frame: The aggregated gene abundances
     """
-
     mappings = dt.fread(
         mapping_file, sep="\t", columns=["reference", "group"]
     ).to_pandas()

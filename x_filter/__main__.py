@@ -117,7 +117,7 @@ def main():
     )
 
     # Select these references that passed the filtering from all alignments
-    refs = results[dt_filter_conditions, :]
+    refs = results[dt_filter_conditions, :].copy(deep=True)
 
     refs = dt.unique(results[:, {"subjectId": dt.f.reference}][:, "subjectId"])
     refs[:, dt.update(keep="keep")]
