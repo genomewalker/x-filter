@@ -20,6 +20,41 @@ def line_estimation(filename, first_size=1 << 24):
         return len(buf) // buf.count(b"\n")
 
 
+# def get_multi_keys(aln_rows, key_col):
+#     keys = aln_rows[0]
+#     aln_rows.pop(0)
+#     if len(aln_rows) > 0:
+#         for k in aln_rows:
+#             keys.rbind(k)
+#     keys = keys[
+#         :,
+#         {"n": dt.count()},
+#         dt.by(
+#             key_col,
+#         ),
+#     ]
+#     # keys_multi = keys[dt.f.n > 1, key_col]
+#     # keys_nomulti = keys[dt.f.n == 1, key_col]
+#     # keys_nomulti.key = key_col
+#     keys[:, dt.update(is_multi=dt.ifelse(dt.f.n > 1, "multi", "nomulti"))]
+#     keys.key = key_col
+#     return keys
+
+
+def filter_eval_perc(alns, evalues, perc=0.1):
+    logging.info(f"Removing alignments within {int(perc * 100)}% of the best e-value")
+    evalues[:, "maxlogEvalue"] = -1 * perc * (np.log(evalues[:, "eVal"]) / np.log(10))
+    evalues.key = "subjectId"
+    aln_sizes = []
+    for i in np.arange(len(alns)):
+        alns[i] = alns[i][:, :, dt.join(evalues)]
+        alns[i][:, "logEvalue"] = -1 * ((np.log(alns[i][:, "eVal"])) / np.log(10))
+        aln_sizes.append(alns[i][(dt.f.logEvalue > dt.f.maxlogEvalue), :].shape[0])
+        del alns[i]["maxlogEvalue"]
+        del alns[i]["logEvalue"]
+    return aln_sizes
+
+
 def read_and_filter_alns(
     aln,
     bitscore=60,
@@ -41,6 +76,8 @@ def read_and_filter_alns(
         "slen",
     ],
     threads=1,
+    evalue_perc=None,
+    evalue_perc_step=0.1,
 ):
     """Read and filter alignments.
 
@@ -61,14 +98,16 @@ def read_and_filter_alns(
     # in the order of billions.
 
     logging.info("Getting a raw estimate of the number of alignments...")
-    nalns = os.path.getsize(aln) // line_estimation(aln)
+    nalns = os.path.getsize(aln) // line_estimation(
+        filename=aln, first_size=int(os.path.getsize(aln) * 0.01)
+    )
     logging.info(f"Approximately {nalns:,} alignments found.")
 
     max_rows = int((2 ** 31) - 1)
-
+    # max_rows = int(5e6)
     # if the number of alignmentsis larger than the number of rows
     # that can be read by fread, we need to read it by chunks instead
-    alns = []
+
     if nalns > max_rows:
         gc.collect()
         logging.info(
@@ -79,7 +118,8 @@ def read_and_filter_alns(
         )
 
         k, m = divmod(nalns, max_rows)
-
+        evalues = []
+        alns = []
         for i in range(k + 1):
             logging.info(f"::: Reading chunk #{i+1:,}.")
             up = max_rows * (i + 1)
@@ -107,14 +147,82 @@ def read_and_filter_alns(
             logging.info(
                 f"::: Filtering alignments in chunk #{i+1:,} with bitscore >= {bitscore} and evalue <= {evalue}"
             )
-            alns.append(
-                aln_chunk[(dt.f.eVal < evalue) & (dt.f.bitScore > bitscore), :].copy(
-                    deep=True
-                )
-            )
+            aln_chunk = aln_chunk[(dt.f.eVal < evalue) & (dt.f.bitScore > bitscore), :]
+            logging.info(f"Getting evalues")
+            evals = aln_chunk[:1, ["eVal"], dt.by(dt.f.subjectId), dt.sort(dt.f.eVal)]
+            # evals[:, "maxlogEvalue"] = (
+            #     -1 * evalue_perc * (np.log(evals[:, "eVal"]) / np.log(10))
+            # )
+            logging.info(f"Deep copying resulting frames")
+            evalues.append(evals.copy(deep=True))
+            alns.append(aln_chunk.copy(deep=True))
             del aln_chunk
+            del evals
             gc.collect(generation=2)
 
+        evalues = dt.rbind(*evalues)
+        evalues = evalues[:1, ["eVal"], dt.by(dt.f.subjectId), dt.sort(dt.f.eVal)]
+        # evalues.key = "subjectId"
+        # TODO: do a binary search to speed up the process
+        if evalue_perc is None:
+            logging.info("Trying to find best filtering threshold to fit data")
+            for perc in np.arange(0, 1, evalue_perc_step)[1:]:
+                # logging.info(
+                #     f"Removing alignments within {int(perc * 100)}% of the best e-value"
+                # )
+                # evalues[:, "maxlogEvalue"] = (
+                #     -1 * perc * (np.log(evalues[:, "eVal"]) / np.log(10))
+                # )
+                # evalues.key = "subjectId"
+                # aln_sizes = []
+                # for i in np.arange(len(alns)):
+                #     alns[i] = alns[i][:, :, dt.join(evalues)]
+                #     alns[i][:, "logEvalue"] = -1 * (
+                #         (np.log(alns[i][:, "eVal"])) / np.log(10)
+                #     )
+                #     aln_sizes.append(
+                #         alns[i][(dt.f.logEvalue > dt.f.maxlogEvalue), :].shape[0]
+                #     )
+                #     del alns[i]["maxlogEvalue"]
+                #     del alns[i]["logEvalue"]
+                aln_sizes = filter_eval_perc(alns=alns, evalues=evalues, perc=perc)
+                if np.sum(aln_sizes) < max_rows:
+                    for i in np.arange(len(alns)):
+                        alns[i] = alns[i][:, :, dt.join(evalues)]
+                        alns[i][:, "logEvalue"] = -1 * (
+                            (np.log(alns[i][:, "eVal"])) / np.log(10)
+                        )
+
+                        alns[i] = alns[i][(dt.f.logEvalue > dt.f.maxlogEvalue), :]
+
+                        del alns[i]["maxlogEvalue"]
+                        del alns[i]["logEvalue"]
+                        logging.info(f"Filter {perc} produced a manageable table.")
+                    break
+                else:
+                    logging.info(
+                        f"{np.sum(aln_sizes):,} alignments found. Increasing filtering threshold"
+                    )
+        else:
+            aln_sizes = filter_eval_perc(alns=alns, evalues=evalues, perc=evalue_perc)
+            if np.sum(aln_sizes) < max_rows:
+                for i in np.arange(len(alns)):
+                    alns[i] = alns[i][:, :, dt.join(evalues)]
+                    alns[i][:, "logEvalue"] = -1 * (
+                        (np.log(alns[i][:, "eVal"])) / np.log(10)
+                    )
+
+                    alns[i] = alns[i][(dt.f.logEvalue > dt.f.maxlogEvalue), :]
+
+                    del alns[i]["maxlogEvalue"]
+                    del alns[i]["logEvalue"]
+                logging.info(f"Filter {evalue_perc} produced a manageable table.")
+
+        if np.sum(aln_sizes) > max_rows:
+            logging.error(
+                f"The resulting table has more than {max_rows:,} alignments and it is not supported at the moment."
+            )
+            exit(1)
         logging.info(f"::: Concatenating chunks.")
         aln = alns[0]
         alns.pop(0)
@@ -122,13 +230,8 @@ def read_and_filter_alns(
         if len(alns) > 0:
             for i in alns:
                 aln.rbind(i)
-        if aln.shape[0] > max_rows:
-            logging.error(
-                f"The resulting table has more than {max_rows,} alignments and it is not supported at the moment."
-            )
-            exit(1)
     else:
-        logging.info(f"Pre-filtering: {nalns:,} alignments found")
+        logging.info(f"Pre-filtering: {nalns:,} alignments estimated")
         # logging.info(f"Read {nalns:,} alignments. Getting basic statistics.")
 
         logging.info(
