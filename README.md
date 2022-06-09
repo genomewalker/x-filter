@@ -147,15 +147,15 @@ xFilter will generate the following files:
     - **sum**: Sum of coverage values
     - **n_genes**: Number of genes in the group
   - {prefix}**_group-abundances.tsv.gz**: If a mapping file is provided, it reports:
-   - **reference**: Reference name
-   - **group**: Group name
-   - **depth_mean**: Coverage mean
-   - **depth_std**: Coverage standard deviation
-   - **depth_evenness**: Coverage evenness (SD/MEAN)
-   - **breadth**: Breadth of coverage
-   - **breadth_expected**: Expected breadth of coverage
-   - **breadth_expected_ratio**: Observed breadth to expected breadth ratio (scaled)
-   - **n_alns**: Number of alignments
+    - **reference**: Reference name
+    - **group**: Group name
+    - **depth_mean**: Coverage mean
+    - **depth_std**: Coverage standard deviation
+    - **depth_evenness**: Coverage evenness (SD/MEAN)
+    - **breadth**: Breadth of coverage
+    - **breadth_expected**: Expected breadth of coverage
+    - **breadth_expected_ratio**: Observed breadth to expected breadth ratio (scaled)
+    - **n_alns**: Number of alignments
 
 If you use `--anvio` it will generate the output necessary for the `anvi-estimate-metabolism` program. Check [here](https://github.com/merenlab/anvio/pull/1890) for its usage. You can define the `source` using `--annotation-source`
 
