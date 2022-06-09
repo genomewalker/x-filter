@@ -90,6 +90,8 @@ def main():
         col_names=col_names,
         evalue=args.evalue,
         threads=args.threads,
+        evalue_perc=args.evalue_perc,
+        evalue_perc_step=args.evalue_perc_step,
     )
 
     logging.info("Getting coverage statistics")

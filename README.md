@@ -55,7 +55,9 @@ xFilter uses a BLASTx m8 formatted file containing aligned reads to references. 
 ```
 $ xFilter --help
 
-usage: xFilter [-h] [-i INPUT] [-t THREADS] [-p PREFIX] [-n ITERS] [-e EVALUE] [-s SCALE] [-b BITSCORE] [-f FILTER] [--breadth BREADTH] [--breadth-expected-ratio BREADTH_EXPECTED_RATIO] [--depth DEPTH] [--depth-evenness DEPTH_EVENNESS]
+usage: xFilter [-h] [-i INPUT] [-t THREADS] [-p PREFIX] [-n ITERS] [-e EVALUE] [-s SCALE] [-b BITSCORE] [-f FILTER]
+               [--breadth BREADTH] [--breadth-expected-ratio BREADTH_EXPECTED_RATIO] [--depth DEPTH]
+               [--depth-evenness DEPTH_EVENNESS] [--evalue-perc EVALUE_PERC] [--evalue-perc-step EVALUE_PERC_STEP]
                [-m MAPPING_FILE] [--no-trim] [--anvio] [--annotation-source ANNOTATION_SOURCE] [--debug] [--version]
 
 A simple tool to filter BLASTx m8 files using the FAMLI algorithm
@@ -63,7 +65,8 @@ A simple tool to filter BLASTx m8 files using the FAMLI algorithm
 optional arguments:
   -h, --help            show this help message and exit
   -i INPUT, --input INPUT
-                        A blastx m8 formatted file containing aligned reads to references. It has to contain query and subject lengths (default: None)
+                        A blastx m8 formatted file containing aligned reads to references. It has to contain query
+                        and subject lengths (default: None)
   -t THREADS, --threads THREADS
                         Number of threads to use (default: 1)
   -p PREFIX, --prefix PREFIX
@@ -77,13 +80,18 @@ optional arguments:
   -b BITSCORE, --bitscore BITSCORE
                         Bitscore where to filter the results (default: 60)
   -f FILTER, --filter FILTER
-                        Which filter to use. Possible values are: breadth, depth, depth_evenness, breadth_expected_ratio (default: breadth_expected_ratio)
+                        Which filter to use. Possible values are: breadth, depth, depth_evenness,
+                        breadth_expected_ratio (default: breadth_expected_ratio)
   --breadth BREADTH     Breadth of the coverage (default: 0.5)
   --breadth-expected-ratio BREADTH_EXPECTED_RATIO
                         Expected breath to observed breadth ratio (scaled) (default: 0.5)
   --depth DEPTH         Depth to filter out (default: 0.1)
   --depth-evenness DEPTH_EVENNESS
                         Reference with higher evenness will be removed (default: 1.0)
+  --evalue-perc EVALUE_PERC
+                        Percentage of the -log(Evalue) to filter out results (default: None)
+  --evalue-perc-step EVALUE_PERC_STEP
+                        Step size to find the percentage of the -log(Evalue) to filter out results (default: 0.1)
   -m MAPPING_FILE, --mapping-file MAPPING_FILE
                         File with mappings to genes for aggregation (default: None)
   --no-trim             Deactivate the trimming for the coverage calculations (default: True)
@@ -139,15 +147,15 @@ xFilter will generate the following files:
     - **sum**: Sum of coverage values
     - **n_genes**: Number of genes in the group
   - {prefix}**_group-abundances.tsv.gz**: If a mapping file is provided, it reports:
-   - **reference**: Reference name
-   - **group**: Group name
-   - **depth_mean**: Coverage mean
-   - **depth_std**: Coverage standard deviation
-   - **depth_evenness**: Coverage evenness (SD/MEAN)
-   - **breadth**: Breadth of coverage
-   - **breadth_expected**: Expected breadth of coverage
-   - **breadth_expected_ratio**: Observed breadth to expected breadth ratio (scaled)
-   - **n_alns**: Number of alignments
+    - **reference**: Reference name
+    - **group**: Group name
+    - **depth_mean**: Coverage mean
+    - **depth_std**: Coverage standard deviation
+    - **depth_evenness**: Coverage evenness (SD/MEAN)
+    - **breadth**: Breadth of coverage
+    - **breadth_expected**: Expected breadth of coverage
+    - **breadth_expected_ratio**: Observed breadth to expected breadth ratio (scaled)
+    - **n_alns**: Number of alignments
 
 If you use `--anvio` it will generate the output necessary for the `anvi-estimate-metabolism` program. Check [here](https://github.com/merenlab/anvio/pull/1890) for its usage. You can define the `source` using `--annotation-source`
 
@@ -161,3 +169,8 @@ If you use `--anvio` it will generate the output necessary for the `anvi-estimat
   - **detection**: Breadth of coverage
 
 
+# Limitations
+
+At the moment we only can handle files with `2,147,483,647` alignments owing to a restriction imposed by [datatable](https://github.com/h2oai/datatable/issues/2336). If there are more alignments, `xFilter` will read the files by batches and try to filter the alignments using an iterative approach where each reference keeps the alignments within a given percentage of the best `-log(evalue)`. By default, `xFilter` will start iteratively trying to keep 90% of the alignments until the 10% for each reference, using steps of 10% and then it will stop if the data cannot be fitted within the `datatable` limitations. The user can specify the granularity of the iterability with the `--evalue-perc-step` options. A specific threshold can also be provided with `--evalue-perc-step`
+
+> xFilter performs a very rough estimation of the number of alignments based on reading 1% of the file and estimate the size of each line 

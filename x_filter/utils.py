@@ -131,6 +131,8 @@ defaults = {
     "scale": 0.9,
     "filter": "breadth_expected_ratio",
     "annotation_source": "unknown",
+    "evalue_perc": None,
+    "evalue_perc_step": 0.1,
 }
 
 help_msg = {
@@ -147,6 +149,8 @@ help_msg = {
     "mapping_file": "File with mappings to genes for aggregation",
     "iters": "Number of iterations for the FAMLI-like filtering",
     "scale": "Scale to select the best weithing alignments",
+    "evalue_perc": "Percentage of the -log(Evalue) to filter out results",
+    "evalue_perc_step": "Step size to find the percentage of the -log(Evalue) to filter out results",
     "anvio": "Create output compatible with anvi'o",
     "annotation_source": "Source of the annotation",
     "help": "Help message",
@@ -270,6 +274,26 @@ def get_arguments(argv=None):
         default=defaults["depth_evenness"],
         dest="depth_evenness",
         help=help_msg["depth_evenness"],
+    )
+    parser.add_argument(
+        "--evalue-perc",
+        type=lambda x: float(
+            check_values(x, minval=0, maxval=1.0, parser=parser, var="--evalue-perc")
+        ),
+        default=defaults["evalue_perc"],
+        dest="evalue_perc",
+        help=help_msg["evalue_perc"],
+    )
+    parser.add_argument(
+        "--evalue-perc-step",
+        type=lambda x: float(
+            check_values(
+                x, minval=0, maxval=1.0, parser=parser, var="--evalue-perc-step"
+            )
+        ),
+        default=defaults["evalue_perc_step"],
+        dest="evalue_perc_step",
+        help=help_msg["evalue_perc_step"],
     )
     # reference_lengths
     parser.add_argument(
