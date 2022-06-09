@@ -8,6 +8,8 @@ import psutil
 import tempfile
 from collections import defaultdict
 import os
+from functools import reduce
+import pandas as pd
 
 log = logging.getLogger("my_logger")
 
@@ -393,48 +395,6 @@ def resolve_multimaps(
     return df1
 
 
-def get_stats_coverage(x, gen_data, trim=False, strim_5=18, strim_3=18):
-    """Get coverage statistics
-
-    Args:
-        x (list): A list with the coverage per position
-        strim_5 (int, optional): How much to trim on the 5'. Defaults to 18.
-        strim_3 (int, optional): How much to trim on the 3'. Defaults to 18.
-
-    Returns:
-        [type]: [description]
-    """
-    cov = gen_data[x]["cov"]
-    length = cov.shape[0]
-
-    # If we need to trim
-    if trim:
-        long_enough = cov.shape[0] >= strim_5 + strim_3 + 10
-        if long_enough:
-            cov = cov[strim_5:-strim_3]
-
-    cov_mean = cov.mean()
-    if cov_mean > 0:
-        cov_std = cov.std()
-        cov_evenness = cov_std / cov_mean
-        breadth = ((cov != 0).sum()) / length
-        breadth_exp = 1 - np.exp(-cov_mean)
-        if breadth >= breadth_exp:
-            breadth_exp_ratio = 1.0 * breadth
-        else:
-            breadth_exp_ratio = (breadth / breadth_exp) * breadth
-        return (
-            x,
-            cov_mean,
-            cov_std,
-            cov_evenness,
-            breadth,
-            breadth_exp,
-            breadth_exp_ratio,
-            gen_data[x]["n_alns"],
-        )
-
-
 def cov_stats(alns, refs):
 
     rle = alns.to_rle(nb_cpu=1)
@@ -461,7 +421,7 @@ def cov_stats(alns, refs):
     return df.drop("Run Value Sum Intermediate".split(), axis=1)
 
 
-def get_stats_coverage(x, gen_data, trim=False, strim_5=18, strim_3=18):
+def get_stats_coverage(x, gen_data, rl, trim=False, strim_5=18, strim_3=18):
     """Get coverage statistics
 
     Args:
@@ -474,12 +434,18 @@ def get_stats_coverage(x, gen_data, trim=False, strim_5=18, strim_3=18):
     """
     cov = gen_data[x]["cov"]
     length = cov.shape[0]
-
     # If we need to trim
     if trim:
         long_enough = cov.shape[0] >= strim_5 + strim_3 + 10
         if long_enough:
             cov = cov[strim_5:-strim_3]
+
+    if gen_data[x]["n_alns"] > 1:
+        rl_mean = np.mean(rl)
+        rl_std = np.std(rl, ddof=1)
+    else:
+        rl_mean = rl[0]
+        rl_std = 0
 
     cov_mean = cov.mean()
     if cov_mean > 0:
@@ -500,6 +466,8 @@ def get_stats_coverage(x, gen_data, trim=False, strim_5=18, strim_3=18):
             breadth_exp,
             breadth_exp_ratio,
             gen_data[x]["n_alns"],
+            rl_mean,
+            rl_std,
         )
 
 
@@ -507,6 +475,7 @@ def get_coverage_stats(df, trim=True):
 
     queries = defaultdict(int)
     gen_data = defaultdict(dict)
+    al = defaultdict(list)
     rl = defaultdict(list)
     # for a, q, b, c, d, e in tqdm.tqdm(
     #     zip(
@@ -535,30 +504,33 @@ def get_coverage_stats(df, trim=True):
         b = df[i, "subjectStart"]
         c = df[i, "subjectEnd"]
         d = df[i, "slen"]
-        e = df[i, "qlen"]
-
+        e = df[i, "alnLength"]
+        f = df[i, "qlen"]
         b = b - 1
 
         if a in gen_data:
             gen_data[a]["cov"][b:c] += 1
             gen_data[a]["n_alns"] += 1
-            rl[a] += [e / 3]
+            al[a] += [e / 3]
+            rl[a] += [f]
         else:
             gen_data[a]["cov"] = np.zeros(d, dtype=int)
             gen_data[a]["cov"][b:c] += 1
             gen_data[a]["n_alns"] = 0
             gen_data[a]["n_alns"] += 1
-            rl[a] += [e / 3]
+            al[a] += [e / 3]
+            rl[a] += [f]
     logging.info(
-        f"References will be dynamically trimmed at 5'/3'-ends (half of the avg. read length)"
+        f"References will be dynamically trimmed at 5'/3'-ends (half of the avg. aln length)"
     )
     stats = [
         get_stats_coverage(
             chrom,
             gen_data=gen_data,
-            strim_5=int(np.mean(rl[chrom]) / 2),
-            strim_3=int(np.mean(rl[chrom]) / 2),
+            strim_5=int(np.mean(al[chrom]) / 2),
+            strim_3=int(np.mean(al[chrom]) / 2),
             trim=trim,
+            rl=rl[chrom],
         )
         for chrom in tqdm.tqdm(
             gen_data,
@@ -582,6 +554,8 @@ def get_coverage_stats(df, trim=True):
         "breadth_expected",
         "breadth_expected_ratio",
         "n_alns",
+        "avg_read_length",
+        "stdev_read_length",
     ]
     return stats
 
@@ -607,12 +581,49 @@ def aggregate_gene_abundances(mapping_file, gene_abundances, threads=1):
     if mappings.shape[0] == 0:
         return None, None
     else:
-        mappings_agg = mappings.groupby("group").agg(
-            {"depth_mean": ["mean", "std", "median", "sum", "count"]}
+        mappings_agg_dm = mappings.groupby("group").agg(
+            {
+                "depth_mean": ["mean", "std", "median", "sum", "count"],
+            }
         )
-        mappings_agg = mappings_agg.xs("depth_mean", axis=1, drop_level=True)
-        mappings_agg = mappings_agg.reset_index("group")
-        mappings_agg.rename({"count": "n_genes"}, axis=1, inplace=True)
+        mappings_agg_dm = mappings_agg_dm.xs(
+            "depth_mean",
+            axis=1,
+            drop_level=True,
+        )
+        mappings_agg_dm = mappings_agg_dm.reset_index("group")
+        mappings_agg_dm.rename({"count": "n_genes"}, axis=1, inplace=True)
+
+        mappings_agg_al = mappings.groupby("group").agg(
+            {
+                "avg_read_length": ["mean"],
+            }
+        )
+        mappings_agg_al = mappings_agg_al.xs(
+            "avg_read_length",
+            axis=1,
+            drop_level=True,
+        )
+        mappings_agg_al = mappings_agg_al.reset_index("group")
+        mappings_agg_al.rename({"mean": "avg_read_length"}, axis=1, inplace=True)
+
+        mappings_agg_sl = mappings.groupby("group").agg(
+            {
+                "stdev_read_length": ["mean"],
+            }
+        )
+        mappings_agg_sl = mappings_agg_sl.xs(
+            "stdev_read_length",
+            axis=1,
+            drop_level=True,
+        )
+        mappings_agg_sl = mappings_agg_sl.reset_index("group")
+        mappings_agg_sl.rename({"mean": "stdev_read_length"}, axis=1, inplace=True)
+
+        mappings_agg = reduce(
+            lambda left, right: pd.merge(left, right, on=["group"], how="inner"),
+            [mappings_agg_dm, mappings_agg_al, mappings_agg_sl],
+        )
         return mappings, mappings_agg
 
 

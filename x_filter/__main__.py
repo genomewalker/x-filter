@@ -182,7 +182,15 @@ def main():
 
     df = alns[
         :,
-        ["subjectId", "queryId", "subjectStart", "subjectEnd", "slen", "qlen"],
+        [
+            "subjectId",
+            "queryId",
+            "subjectStart",
+            "subjectEnd",
+            "slen",
+            "qlen",
+            "alnLength",
+        ],
     ]
 
     results = get_coverage_stats(df, trim=args.trim)
@@ -228,7 +236,6 @@ def main():
     results_filtered.to_pandas().to_csv(
         out_files["coverage"], sep="\t", index=False, compression="gzip"
     )
-
     # use map file to aggregate gene abundances
     if args.mapping_file:
         logging.info("Aggregating gene abundances")
