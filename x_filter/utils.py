@@ -370,7 +370,7 @@ def create_output_files(prefix, input):
 
 def create_filter_conditions(filter_type, filter_conditions):
     if filter_type in ["breadth", "depth", "breadth_expected_ratio"]:
-        dt_filter = dt.f[filter_type] > filter_conditions[filter_type]
+        dt_filter = dt.f[filter_type] >= filter_conditions[filter_type]
     else:
         dt_filter = dt.f[filter_type] <= filter_conditions[filter_type]
     return dt_filter

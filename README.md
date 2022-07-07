@@ -6,7 +6,7 @@
 
 A simple tool to filter BLASTx results with special emphasis on ancient DNA studies. xFilter implements the same filtering approach as [FAMLI](https://bmcbioinformatics.biomedcentral.com/articles/10.1186/s12859-020-03802-0) but adds a couple of features designed for the annotation of ancient DNA short reads. [FAMLI](https://bmcbioinformatics.biomedcentral.com/articles/10.1186/s12859-020-03802-0) solved one the principal problems when annotating short reads by iteratively assigning multi-mapped reads to the most likely true protein. You can find more information [here](https://www.minot.bio/home/2018/4/4/famli).
 
-In addition to the filter that removes references with uneven coverage, xFilter allows to filter them based on a scaled version of the expected breadth of coverage, similar to the one described in [inStrain](https://instrain.readthedocs.io/en/latest/important_concepts.html#detecting-organisms-in-metagenomic-data). xFilter can dynamically trim the references for the coverage calculations using the average read length of the queries mapped to each reference. Furthermore, xFilter allows to aggregate the coverage values of the filtered references into higher categories, like KEGG orthologs or viral genomes.
+In addition to the filter that removes references with uneven coverage, xFilter allows to filter them based on a scaled version of the expected breadth of coverage, similar to the one described in [inStrain](https://instrain.readthedocs.io/en/latest/important_concepts.html#detecting-organisms-in-metagenomic-data). xFilter can dynamically trim the references for the coverage calculations using the average alignment length of the queries mapped to each reference. Furthermore, xFilter allows to aggregate the coverage values of the filtered references into higher categories, like KEGG orthologs or viral genomes.
 
 For the BLASTx searches we recommend to use [MMSseqs2](https://github.com/soedinglab/MMseqs2) with parameters optimized for ancient DNA data as described [here](#)
 
@@ -126,7 +126,7 @@ xFilter --input xFilter-1M-test.m8.gz --bitscore 60 --evalue 1e-5 --filter bread
 
 **--threads**: Number of threads
 
-xFilter by default will trim the coverage values on both 5' and 3' ends based on the average read length (in amino acid) mapped to each query. This can be deactivated with the **--no-trim** option.
+xFilter by default will trim the coverage values on both 5' and 3' ends based on the average alignment length (in amino acid) mapped to each query. This can be deactivated with the **--no-trim** option.
 
 xFilter will generate the following files:
  - {prefix}**_no-multimap.tsv.gz**: This file contains the filtered BLASTx results after removing non-well supported references and multi-mappings.
@@ -146,6 +146,8 @@ xFilter will generate the following files:
     - **median**: Median coverage values
     - **sum**: Sum of coverage values
     - **n_genes**: Number of genes in the group
+    - **avg_read_length**: Average read length of the reads mapping to a gene
+    - **stdev_read_length**: Standard deviation of read length of the reads mapping to a gene
   - {prefix}**_group-abundances.tsv.gz**: If a mapping file is provided, it reports:
     - **reference**: Reference name
     - **group**: Group name
@@ -156,6 +158,8 @@ xFilter will generate the following files:
     - **breadth_expected**: Expected breadth of coverage
     - **breadth_expected_ratio**: Observed breadth to expected breadth ratio (scaled)
     - **n_alns**: Number of alignments
+    - **avg_read_length**: The average of the average lengths of the reads mapping to the genes in a group
+    - **stdev_read_length**: The average of the standard deviations of the lengths of the reads mapping to the genes in a group
 
 If you use `--anvio` it will generate the output necessary for the `anvi-estimate-metabolism` program. Check [here](https://github.com/merenlab/anvio/pull/1890) for its usage. You can define the `source` using `--annotation-source`
 
