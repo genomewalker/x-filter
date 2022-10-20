@@ -19,7 +19,11 @@ sys.setrecursionlimit(10 ** 6)
 def line_estimation(filename, first_size=1 << 24):
     with open(filename, "rb") as file:
         buf = file.read(first_size)
-        return len(buf) // buf.count(b"\n")
+        if buf.count(b"\n") == 0:
+            log.info("No lines found in file to process. Exiting...")
+            exit(0)
+        else:
+            return len(buf) // buf.count(b"\n")
 
 
 # def get_multi_keys(aln_rows, key_col):
