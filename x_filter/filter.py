@@ -147,12 +147,12 @@ def read_and_filter_alns(
     # in the order of billions.
 
     logging.info("Getting a raw estimate of the number of alignments...")
+
     if guess_type(aln)[1] == "gzip":
         fsize = estimate_uncompressed_gz_size(aln)
     else:
         fsize = os.path.getsize(aln)
-    print(fsize)
-    exit()
+
     nalns = fsize // line_estimation(
         filename=aln, first_size=int(os.path.getsize(aln) * 0.01)
     )
