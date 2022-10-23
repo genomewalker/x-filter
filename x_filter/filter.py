@@ -60,8 +60,6 @@ def line_estimation(filename, first_size=1 << 24):
     _open = partial(gzip.open, mode="rb") if encoding == "gzip" else open
     with _open(filename) as file:
         buf = file.read(first_size)
-        print(len(buf))
-        print(buf.count(b"\n"))
         if buf.count(b"\n") == 0:
             log.info("No lines found in file to process. Exiting...")
             exit(0)
