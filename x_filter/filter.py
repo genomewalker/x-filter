@@ -20,8 +20,8 @@ sys.setrecursionlimit(10 ** 6)
 # from https://softwareengineering.stackexchange.com/a/419985
 def line_estimation(filename, first_size=1 << 24):
     encoding = guess_type(filename)[1]
-    _open = partial(gzip.open, mode="at") if encoding == "gzip" else open
-    with _open(filename, "rb") as file:
+    _open = partial(gzip.open, mode="rb") if encoding == "gzip" else open
+    with _open(filename) as file:
         buf = file.read(first_size)
         if buf.count(b"\n") == 0:
             log.info("No lines found in file to process. Exiting...")
