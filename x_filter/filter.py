@@ -8,8 +8,10 @@ import psutil
 import tempfile
 from collections import defaultdict
 import os
-from functools import reduce
+from functools import reduce, partial
 import pandas as pd
+import gzip
+from mimetypes import guess_type
 
 log = logging.getLogger("my_logger")
 
@@ -17,7 +19,9 @@ sys.setrecursionlimit(10 ** 6)
 
 # from https://softwareengineering.stackexchange.com/a/419985
 def line_estimation(filename, first_size=1 << 24):
-    with open(filename, "rb") as file:
+    encoding = guess_type(filename)[1]
+    _open = partial(gzip.open, mode="at") if encoding == "gzip" else open
+    with _open(filename, "rb") as file:
         buf = file.read(first_size)
         if buf.count(b"\n") == 0:
             log.info("No lines found in file to process. Exiting...")
