@@ -12,10 +12,47 @@ from functools import reduce, partial
 import pandas as pd
 import gzip
 from mimetypes import guess_type
+from io import SEEK_END
+import os
+
+import zlib
+import struct
 
 log = logging.getLogger("my_logger")
 
 sys.setrecursionlimit(10 ** 6)
+
+# estimate file size of a gzip compressed file
+
+# From https://stackoverflow.com/a/68939759
+def estimate_uncompressed_gz_size(filename):
+    # From the input file, get some data:
+    # - the 32 LSB from the gzip stream
+    # - 1MB sample of compressed data
+    # - compressed file size
+    with open(filename, "rb") as gz_in:
+        sample = gz_in.read(1000000)
+        gz_in.seek(-4, SEEK_END)
+        lsb = struct.unpack("I", gz_in.read(4))[0]
+        file_size = os.fstat(gz_in.fileno()).st_size
+    # Estimate the total size by decompressing the sample to get the
+    # compression ratio so we can extrapolate the uncompressed size
+    # using the compression ratio and the real file size
+    dobj = zlib.decompressobj(31)
+    d_sample = dobj.decompress(sample)
+
+    compressed_len = len(sample) - len(dobj.unconsumed_tail)
+    decompressed_len = len(d_sample)
+
+    estimate = file_size * decompressed_len // compressed_len
+    # 32 LSB to zero
+    mask = ~0xFFFFFFFF
+
+    # Kill the 32 LSB to be substituted by the data read from the file
+    adjusted_estimate = (estimate & mask) | lsb
+
+    return adjusted_estimate
+
 
 # from https://softwareengineering.stackexchange.com/a/419985
 def line_estimation(filename, first_size=1 << 24):
@@ -23,6 +60,8 @@ def line_estimation(filename, first_size=1 << 24):
     _open = partial(gzip.open, mode="rb") if encoding == "gzip" else open
     with _open(filename) as file:
         buf = file.read(first_size)
+        print(len(buf))
+        print(buf.count(b"\n"))
         if buf.count(b"\n") == 0:
             log.info("No lines found in file to process. Exiting...")
             exit(0)
@@ -108,7 +147,13 @@ def read_and_filter_alns(
     # in the order of billions.
 
     logging.info("Getting a raw estimate of the number of alignments...")
-    nalns = os.path.getsize(aln) // line_estimation(
+    if guess_type(aln)[1] == "gzip":
+        fsize = estimate_uncompressed_gz_size(aln)
+    else:
+        fsize = os.path.getsize(aln)
+    print(fsize)
+    exit()
+    nalns = fsize // line_estimation(
         filename=aln, first_size=int(os.path.getsize(aln) * 0.01)
     )
     logging.info(f"Approximately {nalns:,} alignments found.")
