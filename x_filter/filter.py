@@ -20,7 +20,7 @@ import struct
 
 log = logging.getLogger("my_logger")
 
-sys.setrecursionlimit(10 ** 6)
+sys.setrecursionlimit(10**6)
 
 # estimate file size of a gzip compressed file
 
@@ -58,13 +58,22 @@ def estimate_uncompressed_gz_size(filename):
 def line_estimation(filename, first_size=1 << 24):
     encoding = guess_type(filename)[1]
     _open = partial(gzip.open, mode="rb") if encoding == "gzip" else open
-    with _open(filename) as file:
-        buf = file.read(first_size)
-        if buf.count(b"\n") == 0:
-            log.info("No lines found in file to process. Exiting...")
-            exit(0)
-        else:
-            return len(buf) // buf.count(b"\n")
+    if encoding == "gzip":
+        with _open(filename) as file:
+            buf = file.read(first_size)
+            if buf.count(b"\n") == 0:
+                log.info("No lines found in file to process. Exiting...")
+                exit(0)
+            else:
+                return len(buf) // buf.count(b"\n")
+    else:
+        with _open(filename) as file:
+            buf = file.read(first_size)
+            if buf.count("\n") == 0:
+                log.info("No lines found in file to process. Exiting...")
+                exit(0)
+            else:
+                return len(buf) // buf.count("\n")
 
 
 # def get_multi_keys(aln_rows, key_col):
@@ -156,7 +165,7 @@ def read_and_filter_alns(
     )
     logging.info(f"Approximately {nalns:,} alignments found.")
 
-    max_rows = int((2 ** 31) - 1)
+    max_rows = int((2**31) - 1)
     # max_rows = int(5e6)
     # if the number of alignmentsis larger than the number of rows
     # that can be read by fread, we need to read it by chunks instead
