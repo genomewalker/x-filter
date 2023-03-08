@@ -20,7 +20,7 @@ import struct
 
 log = logging.getLogger("my_logger")
 
-sys.setrecursionlimit(10**6)
+sys.setrecursionlimit(10 ** 6)
 
 # estimate file size of a gzip compressed file
 
@@ -165,7 +165,7 @@ def read_and_filter_alns(
     )
     logging.info(f"Approximately {nalns:,} alignments found.")
 
-    max_rows = int((2**31) - 1)
+    max_rows = int((2 ** 31) - 1)
     # max_rows = int(5e6)
     # if the number of alignmentsis larger than the number of rows
     # that can be read by fread, we need to read it by chunks instead
@@ -516,7 +516,9 @@ def get_stats_coverage(x, gen_data, rl, trim=False, strim_5=18, strim_3=18):
         if breadth >= breadth_exp:
             breadth_exp_ratio = 1.0 * breadth
         else:
-            breadth_exp_ratio = (breadth / breadth_exp) * breadth
+            breadth_exp_ratio = breadth / breadth_exp
+            if breadth_exp_ratio > 1.0:
+                breadth_exp_ratio = 1.0
         return (
             x,
             cov_mean,

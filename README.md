@@ -6,7 +6,7 @@
 
 A simple tool to filter BLASTx results with special emphasis on ancient DNA studies. xFilter implements the same filtering approach as [FAMLI](https://bmcbioinformatics.biomedcentral.com/articles/10.1186/s12859-020-03802-0) but adds a couple of features designed for the annotation of ancient DNA short reads. [FAMLI](https://bmcbioinformatics.biomedcentral.com/articles/10.1186/s12859-020-03802-0) solved one the principal problems when annotating short reads by iteratively assigning multi-mapped reads to the most likely true protein. You can find more information [here](https://www.minot.bio/home/2018/4/4/famli).
 
-In addition to the filter that removes references with uneven coverage, xFilter allows to filter them based on a scaled version of the expected breadth of coverage, similar to the one described in [inStrain](https://instrain.readthedocs.io/en/latest/important_concepts.html#detecting-organisms-in-metagenomic-data). xFilter can dynamically trim the references for the coverage calculations using the average alignment length of the queries mapped to each reference. Furthermore, xFilter allows to aggregate the coverage values of the filtered references into higher categories, like KEGG orthologs or viral genomes.
+In addition to the filter that removes references with uneven coverage, xFilter allows to filter them based on the expected breadth of coverage, similar to the one described in [inStrain](https://instrain.readthedocs.io/en/latest/important_concepts.html#detecting-organisms-in-metagenomic-data). xFilter can dynamically trim the references for the coverage calculations using the average alignment length of the queries mapped to each reference. Furthermore, xFilter allows to aggregate the coverage values of the filtered references into higher categories, like KEGG orthologs or viral genomes.
 
 For the BLASTx searches we recommend to use [MMSseqs2](https://github.com/soedinglab/MMseqs2) with parameters optimized for ancient DNA data as described [here](#)
 
@@ -84,7 +84,7 @@ optional arguments:
                         breadth_expected_ratio (default: breadth_expected_ratio)
   --breadth BREADTH     Breadth of the coverage (default: 0.5)
   --breadth-expected-ratio BREADTH_EXPECTED_RATIO
-                        Expected breath to observed breadth ratio (scaled) (default: 0.5)
+                        Expected breath to observed breadth ratio (default: 0.5)
   --depth DEPTH         Depth to filter out (default: 0.1)
   --depth-evenness DEPTH_EVENNESS
                         Reference with higher evenness will be removed (default: 1.0)
@@ -118,9 +118,9 @@ xFilter --input xFilter-1M-test.m8.gz --bitscore 60 --evalue 1e-5 --filter bread
  - depth: Filter out references with a depth below a given threshold. 
  - depth_evenness: Filter out references with a depth evenness below a given threshold. This is FAMLI's approach (SD/MEAN)
  - breadth: Filter out references with a breadth below a given threshold.
- - breadth_expected_ratio: Filter out references with a breadth below the scaled observed breadth to expected breadth ratio as in _(breadth/(1 - e<sup>-coverage</sup>)) &#215; breadth_. 
+ - breadth_expected_ratio: Filter out references with a breadth below the observed breadth to expected breadth ratio as in _breadth/(1 - e<sup>-coverage</sup>)_. 
 
-**--breadth-expected-ratio**: The observed breadth to expected breadth ratio (scaled).
+**--breadth-expected-ratio**: The observed breadth to expected breadth ratio.
 
 **--mapping-file**: File with mappings to genes for aggregation. It contains two columns: the gene name and the grouping.
 
@@ -156,7 +156,7 @@ xFilter will generate the following files:
     - **depth_evenness**: Coverage evenness (SD/MEAN)
     - **breadth**: Breadth of coverage
     - **breadth_expected**: Expected breadth of coverage
-    - **breadth_expected_ratio**: Observed breadth to expected breadth ratio (scaled)
+    - **breadth_expected_ratio**: Observed breadth to expected breadth ratio
     - **n_alns**: Number of alignments
     - **avg_read_length**: The average of the average lengths of the reads mapping to the genes in a group
     - **stdev_read_length**: The average of the standard deviations of the lengths of the reads mapping to the genes in a group

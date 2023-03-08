@@ -143,7 +143,7 @@ help_msg = {
     "evalue": "Evalue where to filter the results",
     "filter": "Which filter to use. Possible values are: breadth, depth, depth_evenness, breadth_expected_ratio",
     "breadth": "Breadth of the coverage",
-    "breadth_expected_ratio": "Expected breath to observed breadth ratio (scaled)",
+    "breadth_expected_ratio": "Expected breath to observed breadth ratio",
     "depth": "Depth to filter out",
     "depth_evenness": "Reference with higher evenness will be removed",
     "mapping_file": "File with mappings to genes for aggregation",
