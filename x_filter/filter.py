@@ -20,9 +20,10 @@ import struct
 
 log = logging.getLogger("my_logger")
 
-sys.setrecursionlimit(10 ** 6)
+sys.setrecursionlimit(10**6)
 
 # estimate file size of a gzip compressed file
+
 
 # From https://stackoverflow.com/a/68939759
 def estimate_uncompressed_gz_size(filename):
@@ -165,7 +166,7 @@ def read_and_filter_alns(
     )
     logging.info(f"Approximately {nalns:,} alignments found.")
 
-    max_rows = int((2 ** 31) - 1)
+    max_rows = int((2**31) - 1)
     # max_rows = int(5e6)
     # if the number of alignmentsis larger than the number of rows
     # that can be read by fread, we need to read it by chunks instead
@@ -343,7 +344,6 @@ def resolve_multimaps(
     iters=10,
     threads=1,
 ):
-
     """Resolve multimaps by iteratively removing the lowest scoring reads.
 
     Args:
@@ -456,7 +456,6 @@ def resolve_multimaps(
 
 
 def cov_stats(alns, refs):
-
     rle = alns.to_rle(nb_cpu=1)
     g3 = rle[refs]
     df = g3.df
@@ -481,7 +480,7 @@ def cov_stats(alns, refs):
     return df.drop("Run Value Sum Intermediate".split(), axis=1)
 
 
-def get_stats_coverage(x, gen_data, rl, trim=False, strim_5=18, strim_3=18):
+def get_stats_coverage(x, gen_data, rl, il, trim=False, strim_5=18, strim_3=18):
     """Get coverage statistics
 
     Args:
@@ -503,9 +502,13 @@ def get_stats_coverage(x, gen_data, rl, trim=False, strim_5=18, strim_3=18):
     if gen_data[x]["n_alns"] > 1:
         rl_mean = np.mean(rl)
         rl_std = np.std(rl, ddof=1)
+        il_mean = np.mean(il)
+        il_std = np.std(il, ddof=1)
     else:
         rl_mean = rl[0]
         rl_std = 0
+        il_mean = il[0]
+        il_std = 0
 
     cov_mean = cov.mean()
     if cov_mean > 0:
@@ -530,15 +533,17 @@ def get_stats_coverage(x, gen_data, rl, trim=False, strim_5=18, strim_3=18):
             gen_data[x]["n_alns"],
             rl_mean,
             rl_std,
+            il_mean,
+            il_std,
         )
 
 
 def get_coverage_stats(df, trim=True):
-
     queries = defaultdict(int)
     gen_data = defaultdict(dict)
     al = defaultdict(list)
     rl = defaultdict(list)
+    il = defaultdict(list)
     # for a, q, b, c, d, e in tqdm.tqdm(
     #     zip(
     #         df["Chromosome"],
@@ -568,6 +573,7 @@ def get_coverage_stats(df, trim=True):
         d = df[i, "slen"]
         e = df[i, "alnLength"]
         f = df[i, "qlen"]
+        g = df[i, "percIdentity"]
         b = b - 1
 
         if a in gen_data:
@@ -575,6 +581,7 @@ def get_coverage_stats(df, trim=True):
             gen_data[a]["n_alns"] += 1
             al[a] += [e / 3]
             rl[a] += [f]
+            il[a] += [g]
         else:
             gen_data[a]["cov"] = np.zeros(d, dtype=int)
             gen_data[a]["cov"][b:c] += 1
@@ -582,6 +589,7 @@ def get_coverage_stats(df, trim=True):
             gen_data[a]["n_alns"] += 1
             al[a] += [e / 3]
             rl[a] += [f]
+            il[a] += [g]
     logging.info(
         f"References will be dynamically trimmed at 5'/3'-ends (half of the avg. aln length)"
     )
@@ -593,6 +601,7 @@ def get_coverage_stats(df, trim=True):
             strim_3=int(np.mean(al[chrom]) / 2),
             trim=trim,
             rl=rl[chrom],
+            il=il[chrom],
         )
         for chrom in tqdm.tqdm(
             gen_data,
@@ -618,6 +627,8 @@ def get_coverage_stats(df, trim=True):
         "n_alns",
         "avg_read_length",
         "stdev_read_length",
+        "avg_identity",
+        "stdev_identity",
     ]
     return stats
 
@@ -682,9 +693,42 @@ def aggregate_gene_abundances(mapping_file, gene_abundances, threads=1):
         mappings_agg_sl = mappings_agg_sl.reset_index("group")
         mappings_agg_sl.rename({"mean": "stdev_read_length"}, axis=1, inplace=True)
 
+        # Get average identities
+        mappings_agg_ai = mappings.groupby("group").agg(
+            {
+                "avg_identity": ["mean"],
+            }
+        )
+        mappings_agg_ai = mappings_agg_ai.xs(
+            "avg_identity",
+            axis=1,
+            drop_level=True,
+        )
+        mappings_agg_ai = mappings_agg_ai.reset_index("group")
+        mappings_agg_ai.rename({"mean": "avg_identity"}, axis=1, inplace=True)
+
+        mappings_agg_si = mappings.groupby("group").agg(
+            {
+                "stdev_identity": ["mean"],
+            }
+        )
+        mappings_agg_si = mappings_agg_si.xs(
+            "stdev_identity",
+            axis=1,
+            drop_level=True,
+        )
+        mappings_agg_si = mappings_agg_si.reset_index("group")
+        mappings_agg_si.rename({"mean": "stdev_identity"}, axis=1, inplace=True)
+
         mappings_agg = reduce(
             lambda left, right: pd.merge(left, right, on=["group"], how="inner"),
-            [mappings_agg_dm, mappings_agg_al, mappings_agg_sl],
+            [
+                mappings_agg_dm,
+                mappings_agg_al,
+                mappings_agg_sl,
+                mappings_agg_ai,
+                mappings_agg_si,
+            ],
         )
         return mappings, mappings_agg
 
