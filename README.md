@@ -141,13 +141,15 @@ xFilter will generate the following files:
    - **n_alns**: Number of alignments
   - {prefix}**_group-abundances-agg.tsv.gz**: If a mapping file is provided, it reports:
     - **group**: Group name
-    - **mean**: Mean coverage values
-    - **std**: Standard deviation of coverage values
-    - **median**: Median coverage values
-    - **sum**: Sum of coverage values
+    - **coverage_mean**: Mean coverage values
+    - **coverage_stdev**: Standard deviation of coverage values
+    - **coverage_median**: Median coverage values
+    - **coverage_sum**: Sum of coverage values
     - **n_genes**: Number of genes in the group
     - **avg_read_length**: Average read length of the reads mapping to a gene
     - **stdev_read_length**: Standard deviation of read length of the reads mapping to a gene
+    - **avg_identity**: Average identity of the reads mapping to a gene
+    - **stdev_identity**: Standard deviation of identity of the reads mapping to a gene
   - {prefix}**_group-abundances.tsv.gz**: If a mapping file is provided, it reports:
     - **reference**: Reference name
     - **group**: Group name
