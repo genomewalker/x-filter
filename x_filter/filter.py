@@ -730,6 +730,18 @@ def aggregate_gene_abundances(mapping_file, gene_abundances, threads=1):
                 mappings_agg_si,
             ],
         )
+        mappings_agg.columns = [
+            "group",
+            "coverage_mean",
+            "coverage_stdev",
+            "coverage_median",
+            "coverage_sum",
+            "n_genes",
+            "avg_read_length",
+            "stdev_read_length",
+            "avg_identity",
+            "stdev_identity",
+        ]
         return mappings, mappings_agg
 
 
