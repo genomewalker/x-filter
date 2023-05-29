@@ -189,6 +189,7 @@ def main():
             "slen",
             "qlen",
             "alnLength",
+            "percIdentity",
         ],
     ]
 
