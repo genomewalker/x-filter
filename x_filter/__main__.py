@@ -34,7 +34,6 @@ log = logging.getLogger("my_logger")
 
 
 def main():
-
     logging.basicConfig(
         level=logging.DEBUG,
         format="%(levelname)s ::: %(asctime)s ::: %(message)s",
@@ -190,6 +189,7 @@ def main():
             "slen",
             "qlen",
             "alnLength",
+            "percIdentity",
         ],
     ]
 
