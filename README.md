@@ -2,7 +2,7 @@
 # xFilter: a BLASTx filtering tool
 
 
-[![GitHub release (latest by date including pre-releases)](https://img.shields.io/github/v/release/genomewalker/x-filter?include_prereleases&label=version)](https://github.com/genomewalker/x-filter/releases) [![x-filter](https://github.com/genomewalker/x-filter/workflows/xFilter_ci/badge.svg)](https://github.com/genomewalker/x-filter/actions) [![PyPI](https://img.shields.io/pypi/v/x-filter)](https://pypi.org/project/x-filter/) [![](https://img.shields.io/conda/v/genomewalker/x-filter)](https://anaconda.org/genomewalker/x-filter)
+[![GitHub release (latest by date including pre-releases)](https://img.shields.io/github/v/release/genomewalker/x-filter?include_prereleases&label=version)](https://github.com/genomewalker/x-filter/releases) [![x-filter](https://github.com/genomewalker/x-filter/workflows/xFilter_ci/badge.svg)](https://github.com/genomewalker/x-filter/actions) [![PyPI](https://img.shields.io/pypi/v/x-filter)](https://pypi.org/project/x-filter/)
 
 A simple tool to filter BLASTx results with special emphasis on ancient DNA studies. xFilter implements the same filtering approach as [FAMLI](https://bmcbioinformatics.biomedcentral.com/articles/10.1186/s12859-020-03802-0) but adds a couple of features designed for the annotation of ancient DNA short reads. [FAMLI](https://bmcbioinformatics.biomedcentral.com/articles/10.1186/s12859-020-03802-0) solved one the principal problems when annotating short reads by iteratively assigning multi-mapped reads to the most likely true protein. You can find more information [here](https://www.minot.bio/home/2018/4/4/famli).
 
