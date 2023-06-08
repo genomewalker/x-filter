@@ -8,7 +8,10 @@ A simple tool to filter BLASTx results with special emphasis on ancient DNA stud
 
 In addition to the filter that removes references with uneven coverage, xFilter allows to filter them based on the expected breadth of coverage, similar to the one described in [inStrain](https://instrain.readthedocs.io/en/latest/important_concepts.html#detecting-organisms-in-metagenomic-data). xFilter can dynamically trim the references for the coverage calculations using the average alignment length of the queries mapped to each reference. Furthermore, xFilter allows to aggregate the coverage values of the filtered references into higher categories, like KEGG orthologs or viral genomes.
 
-For the BLASTx searches we recommend to use [MMSseqs2](https://github.com/soedinglab/MMseqs2) with parameters optimized for ancient DNA data as described [here](#)
+For the BLASTx searches we recommend to use [MMSseqs2](https://github.com/soedinglab/MMseqs2) with parameters optimized for ancient DNA data as described [here]
+
+
+![assets/images/xfilter-schema.png](assets/images/xfilter-schema.png#center)
 
 # Installation
 
