@@ -131,6 +131,11 @@ def read_and_filter_alns(
         "bitScore",
         "qlen",
         "slen",
+        "cigar",
+        "qaln",
+        "taln",
+        "qframe",
+        "tframe",
     ],
     threads=1,
     evalue_perc=None,
@@ -177,8 +182,14 @@ def read_and_filter_alns(
             f"Pre-filtering: {nalns:,} alignments found. This is more than {max_rows:,} alignments."
         )
         logging.info(
-            f"::: This is not supported at the moment. Trying to read and filter using chunks instead."
+            "::: This is not supported at the moment. Trying to read and filter using chunks instead."
         )
+
+        # Guess number of columns
+        df = dt.fread(aln, sep="\t", header=False, nthreads=threads, max_nrows=1)
+        ncol = df.shape[1]
+        del df
+        col_names = col_names[:ncol]
 
         k, m = divmod(nalns, max_rows)
         evalues = []
