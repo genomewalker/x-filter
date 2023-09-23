@@ -189,6 +189,7 @@ def read_and_filter_alns(
         df = dt.fread(aln, sep="\t", header=False, nthreads=threads, max_nrows=1)
         ncol = df.shape[1]
         del df
+        logging.info(f"::: Detected {ncol} columns in the blastx results.")
         col_names = col_names[:ncol]
 
         k, m = divmod(nalns, max_rows)
