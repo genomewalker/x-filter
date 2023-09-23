@@ -15,6 +15,8 @@ from mimetypes import guess_type
 from io import SEEK_END
 import os
 
+from x_filter.utils import get_open_func
+
 import zlib
 import struct
 
@@ -177,9 +179,11 @@ def read_and_filter_alns(
     # that can be read by fread, we need to read it by chunks instead
 
     # Guess number of columns
-    df = dt.fread(aln, sep="\t", header=False, nthreads=threads, max_nrows=1)
-    ncol = df.shape[1]
-    del df
+    # open file, get first line and count number of columns
+    with get_open_func(aln)(aln, "rt") as f:
+        first_line = f.readline()
+        ncol = len(first_line.split("\t"))
+
     logging.info(f"::: Detected {ncol} columns in the blastx results.")
     col_names = col_names[:ncol]
 
