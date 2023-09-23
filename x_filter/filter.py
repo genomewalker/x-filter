@@ -176,6 +176,13 @@ def read_and_filter_alns(
     # if the number of alignmentsis larger than the number of rows
     # that can be read by fread, we need to read it by chunks instead
 
+    # Guess number of columns
+    df = dt.fread(aln, sep="\t", header=False, nthreads=threads, max_nrows=1)
+    ncol = df.shape[1]
+    del df
+    logging.info(f"::: Detected {ncol} columns in the blastx results.")
+    col_names = col_names[:ncol]
+
     if nalns > max_rows:
         gc.collect()
         logging.info(
@@ -184,14 +191,7 @@ def read_and_filter_alns(
         logging.info(
             "::: This is not supported at the moment. Trying to read and filter using chunks instead."
         )
-
-        # Guess number of columns
-        df = dt.fread(aln, sep="\t", header=False, nthreads=threads, max_nrows=1)
-        ncol = df.shape[1]
-        del df
-        logging.info(f"::: Detected {ncol} columns in the blastx results.")
-        col_names = col_names[:ncol]
-
+        # Estimate number of rows per chunk
         k, m = divmod(nalns, max_rows)
         evalues = []
         alns = []
