@@ -209,7 +209,7 @@ def read_and_filter_alns(
                     sep="\t",
                     header=False,
                     nthreads=threads,
-                    columns=col_names[0],
+                    columns=col_names,
                     skip_to_line=int(max_rows * i),
                 )
             else:
@@ -219,7 +219,7 @@ def read_and_filter_alns(
                     sep="\t",
                     header=False,
                     nthreads=threads,
-                    columns=col_names[0],
+                    columns=col_names,
                     skip_to_line=int(max_rows * i),
                     max_nrows=up,
                 )
@@ -321,7 +321,7 @@ def read_and_filter_alns(
             sep="\t",
             header=False,
             nthreads=threads,
-            columns=col_names[0],
+            columns=col_names,
         )
         aln = aln[(dt.f.eVal < evalue) & (dt.f.bitScore > bitscore), :]
 
