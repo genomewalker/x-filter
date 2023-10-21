@@ -1,22 +1,22 @@
-name: xfilter_ci
+name: xFilter_ci
 
 on: [push, pull_request]
 
 jobs:
-  xfilter_ci:
-    name: xfilter_ci
+  xFilter_ci:
+    name: xFilter_ci
     runs-on: "ubuntu-latest"
     if: "!contains(github.event.head_commit.message, '[skip_ci]')"
     steps:
       - uses: actions/checkout@v2
       - uses: conda-incubator/setup-miniconda@v2
         with:
-          python-version: 3.9
-          mamba-version: "*"
+          python-version: "3.9"
+          solver: "libmamba"
           channels: conda-forge,bioconda,defaults
           channel-priority: true
           environment-file: environment.yml
-          activate-environment: xfilter
+          activate-environment: xFilter
       - name: Lint with flake8
         shell: bash -l {0}
         run: |
@@ -28,7 +28,7 @@ jobs:
           pip install Cython 'ray>=0.8.7'
           pip install -e .
           pip install pytest pytest-cov pytest-dependency pytest-console-scripts
-      - name: Check xfilter help message
+      - name: Check xFilter help message
         shell: bash -l {0}
         run: |
-          xfilter --help
+          xFilter --help
