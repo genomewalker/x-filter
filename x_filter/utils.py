@@ -23,6 +23,7 @@ def is_debug():
 
 filters = ["breadth", "depth", "depth_evenness", "breadth_expected_ratio"]
 
+
 # From https://stackoverflow.com/a/59617044/15704171
 def convert_list_to_str(lst):
     n = len(lst)
@@ -374,3 +375,6 @@ def create_filter_conditions(filter_type, filter_conditions):
     else:
         dt_filter = dt.f[filter_type] <= filter_conditions[filter_type]
     return dt_filter
+
+
+

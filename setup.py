@@ -8,7 +8,7 @@ requirements = [
     "numpy>=1.21.4",
     "pyrle>=0.0.33",
     "pyranges>=0.0.112",
-    "datatable>=1.0.0",
+    "python-datatable",
     "psutil",
 ]
 
