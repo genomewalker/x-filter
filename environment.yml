@@ -6,4 +6,3 @@ channels:
 dependencies:
   - python>=3.9,<3.10
   - Cython>=0.29.24
-  - mmseqs2>=13.45111
