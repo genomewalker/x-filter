@@ -4,8 +4,6 @@ import tqdm
 import logging
 import datatable as dt
 import gc
-import psutil
-import tempfile
 from collections import defaultdict
 import os
 from functools import reduce, partial
@@ -13,7 +11,7 @@ import pandas as pd
 import gzip
 from mimetypes import guess_type
 from io import SEEK_END
-import os
+
 
 import zlib
 import struct
@@ -57,8 +55,24 @@ def estimate_uncompressed_gz_size(filename):
 
 # from https://softwareengineering.stackexchange.com/a/419985
 def line_estimation(filename, first_size=1 << 24):
+    """
+    Estimates the number of lines in a file based on the first `first_size` bytes of the file.
+
+    Args:
+        filename (str): The path to the file to estimate the number of lines.
+        first_size (int): The number of bytes to read from the beginning of the
+                          file to estimate the number of lines.
+
+    Returns:
+        int: The estimated number of lines in the file.
+    """
+
     encoding = guess_type(filename)[1]
-    _open = partial(gzip.open, mode="rb") if encoding == "gzip" else open
+
+    if encoding == "gzip":
+        _open = partial(gzip.open, mode="rb")
+    else:
+        _open = open
     if encoding == "gzip":
         with _open(filename) as file:
             buf = file.read(first_size)
@@ -99,6 +113,17 @@ def line_estimation(filename, first_size=1 << 24):
 
 
 def filter_eval_perc(alns, evalues, perc=0.1):
+    """
+    Filter alignments based on e-value.
+
+    Args:
+        alns (list): List of alignments.
+        evalues (ndarray): Array of e-values.
+        perc (float): Percentage of the best e-value to keep.
+
+    Returns:
+        list: List of alignment sizes after filtering.
+    """
     logging.info(f"Removing alignments within {int(perc * 100)}% of the best e-value")
     evalues[:, "maxlogEvalue"] = -1 * perc * (np.log(evalues[:, "eVal"]) / np.log(10))
     evalues.key = "subjectId"
@@ -131,6 +156,9 @@ def read_and_filter_alns(
         "bitScore",
         "qlen",
         "slen",
+        "cigar",
+        "qaln",
+        "taln",
     ],
     threads=1,
     evalue_perc=None,
@@ -174,12 +202,14 @@ def read_and_filter_alns(
     if nalns > max_rows:
         gc.collect()
         logging.info(
-            f"Pre-filtering: {nalns:,} alignments found. This is more than {max_rows:,} alignments."
+            f"Pre-filtering: {nalns:,} alignments found. "
+            f"This is more than {max_rows:,} alignments."
         )
         logging.info(
-            f"::: This is not supported at the moment. Trying to read and filter using chunks instead."
+            "::: This is not supported at the moment. "
+            "Trying to read and filter using chunks instead."
         )
-
+        # Estimate number of rows per chunk
         k, m = divmod(nalns, max_rows)
         evalues = []
         alns = []
@@ -193,7 +223,7 @@ def read_and_filter_alns(
                     sep="\t",
                     header=False,
                     nthreads=threads,
-                    columns=col_names[0],
+                    columns=col_names,
                     skip_to_line=int(max_rows * i),
                 )
             else:
@@ -203,20 +233,21 @@ def read_and_filter_alns(
                     sep="\t",
                     header=False,
                     nthreads=threads,
-                    columns=col_names[0],
+                    columns=col_names,
                     skip_to_line=int(max_rows * i),
                     max_nrows=up,
                 )
             logging.info(
-                f"::: Filtering alignments in chunk #{i+1:,} with bitscore >= {bitscore} and evalue <= {evalue}"
+                f"::: Filtering alignments in chunk #{i+1:,} with bitscore >= {bitscore} "
+                f"and evalue <= {evalue}"
             )
             aln_chunk = aln_chunk[(dt.f.eVal < evalue) & (dt.f.bitScore > bitscore), :]
-            logging.info(f"Getting evalues")
+            logging.info("Getting evalues")
             evals = aln_chunk[:1, ["eVal"], dt.by(dt.f.subjectId), dt.sort(dt.f.eVal)]
             # evals[:, "maxlogEvalue"] = (
             #     -1 * evalue_perc * (np.log(evals[:, "eVal"]) / np.log(10))
             # )
-            logging.info(f"Deep copying resulting frames")
+            logging.info("Deep copying resulting frames")
             evalues.append(evals.copy(deep=True))
             alns.append(aln_chunk.copy(deep=True))
             del aln_chunk
@@ -230,24 +261,6 @@ def read_and_filter_alns(
         if evalue_perc is None:
             logging.info("Trying to find best filtering threshold to fit data")
             for perc in np.arange(0, 1, evalue_perc_step)[1:]:
-                # logging.info(
-                #     f"Removing alignments within {int(perc * 100)}% of the best e-value"
-                # )
-                # evalues[:, "maxlogEvalue"] = (
-                #     -1 * perc * (np.log(evalues[:, "eVal"]) / np.log(10))
-                # )
-                # evalues.key = "subjectId"
-                # aln_sizes = []
-                # for i in np.arange(len(alns)):
-                #     alns[i] = alns[i][:, :, dt.join(evalues)]
-                #     alns[i][:, "logEvalue"] = -1 * (
-                #         (np.log(alns[i][:, "eVal"])) / np.log(10)
-                #     )
-                #     aln_sizes.append(
-                #         alns[i][(dt.f.logEvalue > dt.f.maxlogEvalue), :].shape[0]
-                #     )
-                #     del alns[i]["maxlogEvalue"]
-                #     del alns[i]["logEvalue"]
                 aln_sizes = filter_eval_perc(alns=alns, evalues=evalues, perc=perc)
                 if np.sum(aln_sizes) < max_rows:
                     for i in np.arange(len(alns)):
@@ -283,10 +296,11 @@ def read_and_filter_alns(
 
         if np.sum(aln_sizes) > max_rows:
             logging.error(
-                f"The resulting table has more than {max_rows:,} alignments and it is not supported at the moment."
+                "The resulting table has more than "
+                f"{max_rows:,} alignments and it is not supported at the moment."
             )
             exit(1)
-        logging.info(f"::: Concatenating chunks.")
+        logging.info("::: Concatenating chunks.")
         aln = alns[0]
         alns.pop(0)
 
@@ -305,14 +319,14 @@ def read_and_filter_alns(
             sep="\t",
             header=False,
             nthreads=threads,
-            columns=col_names[0],
+            columns=col_names,
         )
         aln = aln[(dt.f.eVal < evalue) & (dt.f.bitScore > bitscore), :]
 
     nalns = aln.shape[0]
     logging.info(f"Post-filtering: {nalns:,} alignments found")
 
-    logging.info(f"Removing reads mapping multiple times to the same subject")
+    logging.info("Removing reads mapping multiple times to the same subject")
     aln = aln[:1, :, dt.by(dt.f.queryId, dt.f.subjectId), dt.sort(-dt.f.bitScore)]
     nalns = aln.shape[0]
     logging.info(f"::: Kept best bitScore alignments: {nalns:,}")
@@ -320,19 +334,31 @@ def read_and_filter_alns(
 
 
 def initialize_subject_weights(df):
-    # df[:, dt.update(n_aln=dt.count()), dt.by("queryId")]
-    # df_unique = df[dt.f.n_aln <= 1, :]
-    # df = df[dt.f.n_aln > 1, :]
+    """
+    Initializes weights for each subject in the input dataframe based on the bit
+    score and sequence length.
+
+    Args:
+    - df: A datatable dataframe containing the following columns:
+        - queryId: The ID of the query sequence.
+        - s_W: The weight of the subject sequence based on its length.
+        - bitScore: The bit score of the subject sequence.
+
+    Returns:
+    - A datatable dataframe with the following columns:
+        - queryId: The ID of the query sequence.
+        - s_W: The weight of the subject sequence based on its length.
+        - bitScore: The bit score of the subject sequence.
+        - prob: The probability of the subject sequence being a true positive.
+    """
+
     if df.shape[0] > 0:
-        # df[:, dt.update(weight=dt.f.n_aln / df.n_aln.sum()), dt.by("queryId")]
         df[:, dt.update(s_W=1 / dt.f.slen)]
         df[
             :,
             dt.update(prob=dt.f.bitScore / dt.sum(dt.f.bitScore)),
             dt.by("queryId"),
         ]
-        # df = dt.rbind(df, df_unique, force=True)
-        # del df["n_aln"]
         return df
     else:
         return None
@@ -361,7 +387,9 @@ def resolve_multimaps(
     else:
         iter = 0
 
-    #       col_names <- c("label", "query", "theader", "pident", "alnlen", "mismatch", "gapopen", "qstart", "qend", "tstart", "tend", "evalue", "bits", "qlen", "tlen")
+    # col_names <- c("label", "query", "theader", "pident", "alnlen", "mismatch",
+    #                 "gapopen", "qstart", "qend", "tstart", "tend", "evalue", "bits",
+    #                 "qlen", "tlen")
 
     logging.info(f"::: Iter: {iter + 1} - Getting scores")
 
@@ -456,6 +484,17 @@ def resolve_multimaps(
 
 
 def cov_stats(alns, refs):
+    """
+    Calculate coverage statistics for a given set of alignments and references.
+
+    Args:
+        alns (Alignment): An Alignment object containing the alignments to be analyzed.
+        refs (list): A list of reference sequences to use for the analysis.
+
+    Returns:
+        DataFrame: A pandas DataFrame containing the coverage statistics for
+        the given alignments and references.
+    """
     rle = alns.to_rle(nb_cpu=1)
     g3 = rle[refs]
     df = g3.df
@@ -484,12 +523,28 @@ def get_stats_coverage(x, gen_data, rl, il, trim=False, strim_5=18, strim_3=18):
     """Get coverage statistics
 
     Args:
-        x (list): A list with the coverage per position
-        strim_5 (int, optional): How much to trim on the 5'. Defaults to 18.
-        strim_3 (int, optional): How much to trim on the 3'. Defaults to 18.
+        x (int): The index of the coverage data in gen_data
+        gen_data (list): A list of dictionaries containing coverage data
+        rl (list): A list of read lengths
+        il (list): A list of insert sizes
+        trim (bool, optional): Whether to trim the coverage data. Defaults to False.
+        strim_5 (int, optional): How much to trim on the 5' end. Defaults to 18.
+        strim_3 (int, optional): How much to trim on the 3' end. Defaults to 18.
 
     Returns:
-        [type]: [description]
+        tuple: A tuple containing the following coverage statistics:
+            - x (int): The index of the coverage data in gen_data
+            - cov_mean (float): The mean coverage
+            - cov_std (float): The standard deviation of coverage
+            - cov_evenness (float): The evenness of coverage
+            - breadth (float): The breadth of coverage
+            - breadth_exp (float): The expected breadth of coverage
+            - breadth_exp_ratio (float): The ratio of observed breadth to expected breadth
+            - n_alns (int): The number of alignments
+            - rl_mean (float): The mean read length
+            - rl_std (float): The standard deviation of read length
+            - il_mean (float): The mean insert size
+            - il_std (float): The standard deviation of insert size
     """
     cov = gen_data[x]["cov"]
     length = cov.shape[0]
@@ -539,35 +594,58 @@ def get_stats_coverage(x, gen_data, rl, il, trim=False, strim_5=18, strim_3=18):
 
 
 def get_coverage_stats(df, trim=True):
-    queries = defaultdict(int)
+    """
+    Compute coverage statistics for a set of genomic alignments.
+
+    Parameters
+    ----------
+    df : pandas.DataFrame
+        A DataFrame containing the genomic alignments to process. The DataFrame
+        must have the following columns:
+        - subjectId: the reference genome identifier
+        - subjectStart: the start position of the alignment on the reference genome
+        - subjectEnd: the end position of the alignment on the reference genome
+        - slen: the length of the reference genome
+        - alnLength: the length of the alignment
+        - qlen: the length of the query sequence
+        - percIdentity: the percentage of identical matches in the alignment
+
+    trim : bool, optional
+        Whether to trim the reference genome at the 5' and 3' ends based on the average
+        alignment length. Default is True.
+
+    Returns
+    -------
+    stats : datatable.Frame
+        A datatable containing the coverage statistics for each reference genome.
+        The table has the following columns:
+        - reference: the reference genome identifier
+        - depth_mean: the mean coverage depth
+        - depth_std: the standard deviation of the coverage depth
+        - depth_evenness: the evenness of the coverage depth
+        - breadth: the breadth of coverage (proportion of the genome covered)
+        - breadth_expected: the expected breadth of coverage (based on the average read length)
+        - breadth_expected_ratio: the ratio of observed breadth to expected breadth
+        - n_alns: the number of alignments
+        - avg_read_length: the average read length
+        - stdev_read_length: the standard deviation of the read length
+        - avg_identity: the average percentage of identical matches
+        - stdev_identity: the standard deviation of the percentage of identical matches
+    """
     gen_data = defaultdict(dict)
     al = defaultdict(list)
     rl = defaultdict(list)
     il = defaultdict(list)
-    # for a, q, b, c, d, e in tqdm.tqdm(
-    #     zip(
-    #         df["Chromosome"],
-    #         df["Query"],
-    #         df["Start"],
-    #         df["End"],
-    #         df["slen"],
-    #         df["qlen"],
-    #     ),
-    #     total=df.shape[0],
-    #     leave=False,
-    #     ncols=100,
-    #     desc=f"Alignments processed",
-    # ):
+
     for i in tqdm.tqdm(
         np.arange(df.shape[0]),
         total=df.shape[0],
         leave=False,
         ncols=100,
-        desc=f"Alignments processed",
+        desc="Alignments processed",
     ):
         i = int(i)
         a = df[i, "subjectId"]
-        q = df[i, "queryId"]
         b = df[i, "subjectStart"]
         c = df[i, "subjectEnd"]
         d = df[i, "slen"]
@@ -591,7 +669,7 @@ def get_coverage_stats(df, trim=True):
             rl[a] += [f]
             il[a] += [g]
     logging.info(
-        f"References will be dynamically trimmed at 5'/3'-ends (half of the avg. aln length)"
+        "References will be dynamically trimmed at 5'/3'-ends (half of the avg. aln length)"
     )
     stats = [
         get_stats_coverage(
@@ -608,7 +686,7 @@ def get_coverage_stats(df, trim=True):
             total=len(gen_data.keys()),
             leave=False,
             ncols=100,
-            desc=f"References processed",
+            desc="References processed",
         )
     ]
     stats = [x for x in stats if x is not None]
@@ -634,17 +712,21 @@ def get_coverage_stats(df, trim=True):
 
 
 def aggregate_gene_abundances(mapping_file, gene_abundances, threads=1):
+    """
+    Aggregates gene abundances based on mapping file and gene abundance data.
+
+    Args:
+        mapping_file (str): Path to mapping file.
+        gene_abundances (pandas.DataFrame): Gene abundance data.
+        threads (int): Number of threads to use.
+
+    Returns:
+        Tuple[pandas.DataFrame, pandas.DataFrame]: A tuple containing two pandas DataFrames.
+            The first DataFrame contains the merged mapping data and gene abundance data.
+            The second DataFrame contains the aggregated gene abundances.
+    """
     dt.options.progress.clear_on_success = True
     dt.options.nthreads = threads
-    """Aggregate gene abundances
-    
-        Args:
-            mapping_file (str): Path to the mapping file
-            gene_abundances (Frame): Path to the gene abundances file
-    
-        Returns:
-            dt.Frame: The aggregated gene abundances
-    """
     mappings = dt.fread(
         mapping_file, sep="\t", columns=["reference", "group"]
     ).to_pandas()
@@ -746,6 +828,16 @@ def aggregate_gene_abundances(mapping_file, gene_abundances, threads=1):
 
 
 def convert_to_anvio(df, annotation_source):
+    """
+    Converts a pandas dataframe to an Anvio-compatible format.
+
+    Args:
+        df (pandas.DataFrame): The input dataframe to convert.
+        annotation_source (str): The source of the annotation.
+
+    Returns:
+        pandas.DataFrame: The converted dataframe.
+    """
     # gene_id	enzyme_accession	source	coverage	detection
     # Select and rename columns from pandas dataframe
     df = df.copy()

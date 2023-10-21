@@ -17,6 +17,7 @@ from x_filter.utils import (
     get_arguments,
     create_output_files,
     create_filter_conditions,
+    get_open_func,
 )
 from x_filter.filter import (
     resolve_multimaps,
@@ -75,13 +76,33 @@ def main():
             "bitScore",
             "qlen",
             "slen",
+            "cigar",
+            "qaln",
+            "taln",
         ],
     )
 
     # Read in aln file and filter
     logging.info(
-        f"Reading and filtering alignments [evalue: {str(args.evalue)}; bitscore: {str(args.bitscore)}]"
+        f"Reading and filtering alignments [evalue: {str(args.evalue)}; "
+        f"bitscore: {str(args.bitscore)}]"
     )
+    # Guess number of columns
+    # open file, get first line and count number of columns
+    with get_open_func(args.input)(args.input, "rt") as f:
+        first_line = f.readline()
+        ncol = len(first_line.split("\t"))
+
+    if ncol == 14 or ncol == 17:
+        pass
+    else:
+        logging.error(
+            f"Input file has {ncol} columns. It should have either 14 or 17 columns."
+        )
+        exit(1)
+
+    logging.info(f"::: Detected {ncol} columns in the blastx results.")
+    col_names = col_names[0][:ncol]
 
     alns = read_and_filter_alns(
         aln=args.input,
@@ -111,7 +132,7 @@ def main():
 
     results = get_coverage_stats(alns, trim=args.trim)
     # Filter results
-    logging.info(f"Filtering references")
+    logging.info("Filtering references")
     logging.info(f"::: [Filter:{args.filter}; Value:{filter_conditions[args.filter]}]")
     dt_filter_conditions = create_filter_conditions(
         filter_type=args.filter, filter_conditions=filter_conditions
@@ -152,7 +173,7 @@ def main():
 
     # Process multimapping reads
     # initialize the dataframe
-    logging.info(f"::: Initializing data")
+    logging.info("::: Initializing data")
     alns_mp = alns[:, ["queryId", "subjectId", "bitScore", "slen"]]
     alns_mp = initialize_subject_weights(alns_mp)
     # print(
@@ -170,9 +191,9 @@ def main():
             iters=args.iters,
         )
         alns_filtered = alns_filtered[:, ["queryId", "subjectId"]]
-        logging.info(f"Garbage collection")
+        logging.info("Garbage collection")
         gc.collect()
-        logging.info(f"Removing multimapping queries")
+        logging.info("Removing multimapping queries")
         alns = alns_filtered[:, :, dt.join(alns)]
     else:
         logging.info("No multimapping reads found.")
@@ -196,7 +217,7 @@ def main():
     results = get_coverage_stats(df, trim=args.trim)
 
     # Filter results
-    logging.info(f"Filtering references")
+    logging.info("Filtering references")
     logging.info(f"::: [Filter:{args.filter}; Value:{filter_conditions[args.filter]}]")
     dt_filter_conditions = create_filter_conditions(
         filter_type=args.filter, filter_conditions=filter_conditions
@@ -229,8 +250,9 @@ def main():
     # write stats to file
     logging.info(f"Writing filtered alignments to {out_files['multimap']}")
     alns[dt.bool8] = dt.int32
-    alns = alns.to_pandas()[col_names[0]]
-    alns.to_csv(out_files["multimap"], sep="\t", index=False, compression="gzip")
+    # alns = alns[:, col_names].to_pandas()
+
+    alns[:, col_names].to_csv(out_files["multimap"], sep="\t")
 
     logging.info(f"Writing coverage statistics to {out_files['coverage']}")
     results_filtered.to_pandas().to_csv(
@@ -247,7 +269,7 @@ def main():
 
         if gene_abundances is None:
             logging.info("Couldn't map anything to the references.")
-            logging.info(f"ALL DONE.")
+            logging.info("ALL DONE.")
             exit(0)
         logging.info(f"Writing group abundances to {out_files['group_abundances']}")
         gene_abundances.to_csv(

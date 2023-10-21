@@ -3,12 +3,12 @@ import versioneer
 
 requirements = [
     "pandas>=1.3.4",
-    "scipy>=1.7.3",
+    "scipy>=1.10.0",
     "tqdm>=4.62.3",
     "numpy>=1.21.4",
     "pyrle>=0.0.33",
     "pyranges>=0.0.112",
-    "datatable>=1.0.0",
+    "python-datatable",
     "psutil",
 ]
 

@@ -4,9 +4,5 @@ channels:
   - bioconda
   - defaults
 dependencies:
-  - python>=3.7,<3.10
-  - Cython>=0.29.24
-  - pip
-  - pip:
-      - pyrle>=0.0.31
-      - pyranges>=0.0.112
+  - python>=3.8,<=3.9
+  - Cython
