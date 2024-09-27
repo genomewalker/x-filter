@@ -1,22 +1,23 @@
-from setuptools import setup
+from setuptools import setup, Extension
+from Cython.Build import cythonize
 import versioneer
 
+# Your package requirements
 requirements = [
-    "pandas>=1.3.4",
-    "scipy>=1.10.0",
+    "pandas>=2.2.3",
     "tqdm>=4.62.3",
-    "numpy>=1.21.4",
-    "pyrle>=0.0.33",
-    "pyranges>=0.0.112",
-    "python-datatable",
+    "numpy>=2.0.0",
     "psutil",
+    "duckdb",
+    "numba",
+    "pyarrow",
 ]
 
 setup(
     setup_requires=[
-        # Setuptools 18.0 properly handles Cython extensions.
         "setuptools>=39.1.0",
         "Cython>=0.29.24",
+        "numpy>=1.21.2",
     ],
     name="x-filter",
     version=versioneer.get_version(),
