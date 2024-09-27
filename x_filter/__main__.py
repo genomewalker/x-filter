@@ -26,6 +26,7 @@ def setup_logging(debug_mode: bool) -> None:
     )
 
 
+@profile
 def process_data(
     args: Any, filters: List[Dict[str, Any]], tmp_dir: str, tmp_files: Dict[str, str]
 ) -> Tuple[pd.DataFrame, np.ndarray, np.ndarray, Dict[str, np.ndarray], str]:
@@ -130,7 +131,11 @@ def analyze_alignments(df: pd.DataFrame) -> Dict[str, np.ndarray]:
 
 
 def save_results(
-    final_stats: pd.DataFrame, df: pd.DataFrame, out_files: Dict[str, str], args: Any
+    final_stats: pd.DataFrame,
+    df: pd.DataFrame,
+    out_files: Dict[str, str],
+    args: Any,
+    tmp_files: Dict[str, str],
 ) -> None:
     unique_subjects = df[["subjectId", "subject_numeric_id"]].drop_duplicates()
     final_stats = final_stats.merge(
@@ -224,6 +229,8 @@ def save_results(
         gene_abundances, gene_abundances_agg = aggregate_gene_abundances(
             mapping_file=args.mapping_file,
             gene_abundances=final_stats,
+            num_threads=args.threads,
+            temp_dir=tmp_files["db"],
         )
 
         if gene_abundances is None:
@@ -268,8 +275,9 @@ def main() -> None:
     final_stats, unique_subjects, inverse_indices, numpy_arrays, parquet_file = (
         process_data(args, filters, tmp_dir, tmp_files)
     )
-    log.info(f"Total alignments: {final_stats.shape[0]:,}")
+    log.info(f"Kept references: {final_stats.shape[0]:,}")
 
+    log.info("Filtering alignments")
     filtered_ids_df = filter_arrays(
         final_stats, unique_subjects, inverse_indices, numpy_arrays, tmp_files, args
     )
@@ -289,7 +297,7 @@ def main() -> None:
     log.info(f"References kept: {final_stats.shape[0]:,}")
     df = df[df["subject_numeric_id"].isin(final_stats["subject_numeric_id"])]
 
-    save_results(final_stats, df, out_files, args)
+    save_results(final_stats, df, out_files, args, tmp_files)
     log.info("ALL DONE.")
 
 

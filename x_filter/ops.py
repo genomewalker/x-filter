@@ -99,7 +99,7 @@ def db_to_memory_mapped_arrays_optimized(
         futures = []
         with tqdm(
             total=len(column_data_types),
-            desc="Processing columns",
+            desc="Saving columns",
             unit="column",
             ncols=80,
             disable=is_debug(),
@@ -180,7 +180,7 @@ def process_input_data(
     elif num_columns != 14:
         raise ValueError(f"Invalid number of columns: {num_columns}")
 
-    schema = ", ".join([f"{col} {dtype}" for col, dtype in duckdb_column_types.items()])
+    # schema = ", ".join([f"{col} {dtype}" for col, dtype in duckdb_column_types.items()])
 
     db_file = os.path.join(db_dir, "blast.db")
     blast_parquet_file = os.path.join(parquet_dir, "blast.parquet")
@@ -198,8 +198,7 @@ def process_input_data(
         connection.execute(f"SET memory_limit='{formatted_memory}';")
         connection.execute(f"SET max_memory = '{formatted_memory}';")
 
-    log.info("Processing input data")
-    connection.execute(f"CREATE OR REPLACE TABLE blast_table ({schema});")
+    log.info("Reading alignments")
     connection.execute(
         f"""
         COPY '{input_file}'

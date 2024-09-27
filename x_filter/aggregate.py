@@ -4,7 +4,7 @@ import duckdb
 
 
 def aggregate_gene_abundances(
-    mapping_file: str, gene_abundances: pd.DataFrame
+    mapping_file: str, gene_abundances: pd.DataFrame, num_threads: int, temp_dir: str
 ) -> Tuple[Optional[pd.DataFrame], Optional[pd.DataFrame]]:
     """
     Aggregates gene abundances based on mapping file and gene abundance data using DuckDB.
@@ -21,9 +21,14 @@ def aggregate_gene_abundances(
     """
     # Create a DuckDB connection
     con = duckdb.connect(":memory:")
-
+    
     # Register the gene_abundances DataFrame as a table in DuckDB
     con.register("gene_abundances", gene_abundances)
+    con.execute(f"SET threads={num_threads};")
+    con.execute(f"SET temp_directory='{temp_dir}';")
+    con.execute("SET enable_progress_bar=true;")
+    con.execute("SET preserve_insertion_order=false;")
+    con.execute("SET force_compression='auto';")
 
     # Read the mapping file and perform the merge operation in DuckDB
     columns = {"reference": "VARCHAR", "group": "VARCHAR"}

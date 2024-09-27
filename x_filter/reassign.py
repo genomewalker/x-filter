@@ -155,7 +155,7 @@ def resolve_multimaps_return_indices(
             reads_to_process = total_reads - global_uniques
 
             log.info(
-                f"Iter: {current_iter + 1} - New uniques: {new_uniques:,}|Total uniques: {global_uniques:,}|Reads to process: {reads_to_process:,}"
+                f"Iter: {current_iter + 1} - New uniques: {new_uniques:,} | Total uniques: {global_uniques:,} | Reads to process: {reads_to_process:,}"
             )
 
             if np.sum(mask) == 0:
