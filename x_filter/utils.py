@@ -11,6 +11,7 @@ from itertools import chain
 from typing import List, Dict, Tuple, Union, Any, Optional
 import numpy as np
 import pandas as pd
+import psutil
 
 from x_filter import __version__
 
@@ -68,7 +69,7 @@ HELP_MESSAGES = {
     "version": "Print program version",
     "anvio": "Create output compatible with anvi'o",
     "trim": "Deactivate the trimming for the coverage calculations",
-    "max_memory": "Maximum memory to use for the EM algorithm",
+    "max_memory": "Maximum memory to use. If not provided will use 80% of the available memory",
     "tmp_dir": "Temporary directory to store intermediate files",
     "duplicates": "Keep duplicated reads in the output",
 }
@@ -76,6 +77,42 @@ HELP_MESSAGES = {
 
 def is_debug() -> bool:
     return log.getEffectiveLevel() == logging.DEBUG
+
+
+def get_available_memory():
+    """
+    Get the available system memory in bytes.
+    """
+    return psutil.virtual_memory().available
+
+
+def get_default_max_memory():
+    """
+    Calculate the default max memory as 80% of available memory.
+    Returns the value in bytes.
+    """
+    available_memory = get_available_memory()
+    return int(available_memory * 0.8)
+
+
+def format_memory(memory_bytes):
+    """
+    Format memory size from bytes to a human-readable string with appropriate unit.
+    """
+    for unit in ["", "K", "M", "G"]:
+        if memory_bytes < 1024:
+            return f"{memory_bytes:.0f}{unit}"
+        memory_bytes /= 1024
+    return f"{memory_bytes:.0f}T"
+
+
+def check_memory(value):
+    """
+    Check and convert the memory value.
+    """
+    if value is None:
+        return get_default_max_memory()
+    return check_suffix(value, parser, "--max-memory")
 
 
 def is_integer(n: Any) -> bool:
@@ -277,7 +314,7 @@ def get_arguments(
         "--max-memory",
         type=lambda x: check_suffix(x, parser=parser, var="--max-memory"),
         default=None,
-        metavar="INT",
+        metavar="STR",
         help=HELP_MESSAGES["max_memory"],
     )
     parser.add_argument(
@@ -299,6 +336,9 @@ def get_arguments(
     )
 
     args = parser.parse_args(None if sys.argv[1:] else ["-h"])
+
+    if args.max_memory is None:
+        args.max_memory = get_default_max_memory()
 
     filters = []
     if args.filters:

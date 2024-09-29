@@ -8,6 +8,7 @@ from tqdm import tqdm
 import tempfile
 import pyarrow.parquet as pq
 import pandas as pd
+from memory_profiler import profile
 
 from x_filter.utils import is_debug
 
@@ -81,6 +82,11 @@ def process_db_column_to_memmap_optimized(
         )
         memmap_array[row_index : row_index + len(chunk_numpy)] = chunk_numpy
         row_index += len(chunk_numpy)
+
+    memmap_array.flush()
+    del memmap_array
+
+    memmap_array = np.memmap(memmap_file_path, mode="r", dtype=dtype)
 
     return column_name, memmap_array
 
@@ -180,82 +186,81 @@ def process_input_data(
     elif num_columns != 14:
         raise ValueError(f"Invalid number of columns: {num_columns}")
 
-    # schema = ", ".join([f"{col} {dtype}" for col, dtype in duckdb_column_types.items()])
-
     db_file = os.path.join(db_dir, "blast.db")
     blast_parquet_file = os.path.join(parquet_dir, "blast.parquet")
     blast_unique_parquet_file = os.path.join(parquet_dir, "filtered_uniques.parquet")
-    connection = duckdb.connect(database=db_file)
-    connection.execute(f"SET threads={num_threads};")
-    connection.execute(f"SET temp_directory='{temp_dir}';")
-    connection.execute("SET enable_progress_bar=true;")
-    connection.execute("SET preserve_insertion_order=false;")
-    connection.execute("SET force_compression='auto';")
 
-    if max_memory:
-        formatted_memory = set_memory_limit(max_memory)
-        log.info(f"Setting memory limit to {formatted_memory}")
-        connection.execute(f"SET memory_limit='{formatted_memory}';")
-        connection.execute(f"SET max_memory = '{formatted_memory}';")
+    with duckdb.connect(database=db_file) as connection:
+        connection.execute(f"SET threads={num_threads};")
+        connection.execute(f"SET temp_directory='{temp_dir}';")
+        connection.execute("SET enable_progress_bar=true;")
+        connection.execute("SET preserve_insertion_order=true;")
+        connection.execute("SET force_compression='auto';")
 
-    log.info("Reading alignments")
-    connection.execute(
-        f"""
-        COPY '{input_file}'
-        TO '{blast_parquet_file}' (FORMAT 'parquet', CODEC 'ZSTD', ROW_GROUP_SIZE '100000');
-    """
-    )
+        if max_memory:
+            formatted_memory = set_memory_limit(max_memory)
+            log.info(f"Setting memory limit to {formatted_memory}")
+            connection.execute(f"SET memory_limit='{formatted_memory}';")
+            connection.execute(f"SET max_memory = '{formatted_memory}';")
 
-    total_rows = pq.ParquetFile(blast_parquet_file).metadata.num_rows
-    log.info(f"Number of alignments: {total_rows:,}")
-
-    log.info(
-        f"Filtering data with e-value <= {evalue_threshold} and bit-score >= {bitscore_threshold}"
-    )
-
-    additional_columns = (
+        log.info("Reading alignments")
+        connection.execute(
+            f"""
+            COPY '{input_file}'
+            TO '{blast_parquet_file}' (FORMAT 'parquet', CODEC 'ZSTD', ROW_GROUP_SIZE '100000');
         """
-        (column14) AS cigar,
-        (column15) AS qaln,
-        (column16) AS saln,
-    """
-        if num_columns == 17
-        else ""
-    )
+        )
 
-    hash_columns = ", ".join(
-        [f"CAST(column{i:02d} AS VARCHAR)" for i in range(1, num_columns)]
-    )
+        total_rows = pq.ParquetFile(blast_parquet_file).metadata.num_rows
+        log.info(f"Number of alignments: {total_rows:,}")
 
-    connection.execute(
-        f"""
-            COPY (
-                SELECT
-                    (column00) AS queryId,
-                    hash((column01)) % 9223372036854775807 AS subject_numeric_id,
-                    hash((column00)) % 9223372036854775807 AS query_numeric_id,
-                    (column01) AS subjectId,
-                    (column02) AS percIdentity,
-                    (column03) AS alnLength,
-                    (column04) AS mismatchCount,
-                    (column05) AS gapOpenCount,
-                    (column06) AS queryStart,
-                    (column07) AS queryEnd,
-                    (column08) AS subjectStart,
-                    (column09) AS subjectEnd,
-                    (column10) AS eVal,
-                    (column11) AS bitScore,
-                    (column12) AS qlen,
-                    (column13) AS slen,
-                    {additional_columns}
-                    hash(
-                        {hash_columns}
-                    ) % 9223372036854775807 AS row_hash
-                FROM '{blast_parquet_file}'
-                WHERE column10 <= {evalue_threshold} AND column11 >= {bitscore_threshold}
-            ) TO '{blast_unique_parquet_file}' (FORMAT 'parquet', CODEC 'ZSTD', ROW_GROUP_SIZE '100000');
+        log.info(
+            f"Filtering data with e-value <= {evalue_threshold} and bit-score >= {bitscore_threshold}"
+        )
+
+        additional_columns = (
             """
-    )
+            (column14) AS cigar,
+            (column15) AS qaln,
+            (column16) AS saln,
+        """
+            if num_columns == 17
+            else ""
+        )
+
+        hash_columns = ", ".join(
+            [f"CAST(column{i:02d} AS VARCHAR)" for i in range(1, num_columns)]
+        )
+
+        connection.execute(
+            f"""
+                COPY (
+                    SELECT
+                        (column00) AS queryId,
+                        hash((column01)) % 9223372036854775807 AS subject_numeric_id,
+                        hash((column00)) % 9223372036854775807 AS query_numeric_id,
+                        (column01) AS subjectId,
+                        (column02) AS percIdentity,
+                        (column03) AS alnLength,
+                        (column04) AS mismatchCount,
+                        (column05) AS gapOpenCount,
+                        (column06) AS queryStart,
+                        (column07) AS queryEnd,
+                        (column08) AS subjectStart,
+                        (column09) AS subjectEnd,
+                        (column10) AS eVal,
+                        (column11) AS bitScore,
+                        (column12) AS qlen,
+                        (column13) AS slen,
+                        {additional_columns}
+                        hash(
+                            {hash_columns}
+                        ) % 9223372036854775807 AS row_hash
+                    FROM '{blast_parquet_file}'
+                    WHERE column10 <= {evalue_threshold} AND column11 >= {bitscore_threshold}
+                ) TO '{blast_unique_parquet_file}' (FORMAT 'parquet', CODEC 'ZSTD', ROW_GROUP_SIZE '100000');
+                """
+        )
 
     os.remove(blast_parquet_file)
     total_rows = pq.ParquetFile(blast_unique_parquet_file).metadata.num_rows

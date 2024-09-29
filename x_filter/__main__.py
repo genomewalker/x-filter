@@ -26,7 +26,6 @@ def setup_logging(debug_mode: bool) -> None:
     )
 
 
-@profile
 def process_data(
     args: Any, filters: List[Dict[str, Any]], tmp_dir: str, tmp_files: Dict[str, str]
 ) -> Tuple[pd.DataFrame, np.ndarray, np.ndarray, Dict[str, np.ndarray], str]:
@@ -44,10 +43,16 @@ def process_data(
     final_stats, unique_subjects, inverse_indices, numpy_arrays = calculate_statistics(
         np_arrays, tmp_files, num_threads=args.threads
     )
+    # sort by breadth descending
+    final_stats = final_stats.sort_values("breadth", ascending=True)
 
     if filters:
         log.info("Applying filters")
         final_stats = apply_filters(final_stats, filters)
+        # final_stats = final_stats[final_stats["breadth"] >= 0.25]
+        final_stats = final_stats.sort_values(
+            ["breadth", "subject_numeric_id"], ascending=True
+        )
 
     return final_stats, unique_subjects, inverse_indices, numpy_arrays, parquet_file
 
@@ -68,7 +73,6 @@ def filter_arrays(
             raise ValueError(
                 "None of the target subjects were found in unique_subjects."
             )
-
         filtered_arrays = parallel_slice_mmap(
             numpy_arrays,
             target_subjects,
@@ -134,8 +138,11 @@ def save_results(
     final_stats: pd.DataFrame,
     df: pd.DataFrame,
     out_files: Dict[str, str],
-    args: Any,
+    mapping_file: str,
+    anvio: bool,
+    annotation_source: str,
     tmp_files: Dict[str, str],
+    threads: int = 1,
 ) -> None:
     unique_subjects = df[["subjectId", "subject_numeric_id"]].drop_duplicates()
     final_stats = final_stats.merge(
@@ -224,12 +231,12 @@ def save_results(
     df = df.rename(columns=column_mapping)
     df[new_column_order].to_csv(out_files["multimap"], sep="\t", index=False)
 
-    if args.mapping_file:
+    if mapping_file:
         log.info("Aggregating gene abundances")
         gene_abundances, gene_abundances_agg = aggregate_gene_abundances(
-            mapping_file=args.mapping_file,
+            mapping_file=mapping_file,
             gene_abundances=final_stats,
-            num_threads=args.threads,
+            num_threads=threads,
             temp_dir=tmp_files["db"],
         )
 
@@ -242,9 +249,9 @@ def save_results(
             out_files["group_abundances"], sep="\t", index=False, compression="gzip"
         )
 
-        if args.anvio:
+        if anvio:
             gene_abundances_agg_anvio = convert_to_anvio(
-                df=gene_abundances, annotation_source=args.annotation_source
+                df=gene_abundances, annotation_source=annotation_source
             )
             log.info(
                 f"Writing abundances with anvi'o format to {out_files['group_abundances_anvio']}"
@@ -264,7 +271,6 @@ def save_results(
         )
 
 
-@profile
 def main() -> None:
     args, filters = get_arguments()
     setup_logging(args.debug)
@@ -275,12 +281,12 @@ def main() -> None:
     final_stats, unique_subjects, inverse_indices, numpy_arrays, parquet_file = (
         process_data(args, filters, tmp_dir, tmp_files)
     )
-    log.info(f"Kept references: {final_stats.shape[0]:,}")
 
     log.info("Filtering alignments")
     filtered_ids_df = filter_arrays(
         final_stats, unique_subjects, inverse_indices, numpy_arrays, tmp_files, args
     )
+
     df = process_filtered_data(filtered_ids_df, parquet_file, tmp_files, args)
 
     np_arrays = analyze_alignments(df)
@@ -297,7 +303,15 @@ def main() -> None:
     log.info(f"References kept: {final_stats.shape[0]:,}")
     df = df[df["subject_numeric_id"].isin(final_stats["subject_numeric_id"])]
 
-    save_results(final_stats, df, out_files, args, tmp_files)
+    save_results(
+        final_stats=final_stats,
+        df=df,
+        out_files=out_files,
+        tmp_files=tmp_files,
+        mapping_file=args.mapping_file,
+        anvio=args.anvio,
+        annotation_source=args.annotation_source,
+    )
     log.info("ALL DONE.")
 
 

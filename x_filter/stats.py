@@ -1,11 +1,13 @@
+import logging
+import os
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
+from functools import partial
+from typing import Dict, List, Tuple
+
 import numpy as np
 import pandas as pd
-import logging
-from numba import njit, prange, set_num_threads
-from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor
-import os
 import tqdm
-import multiprocessing as mp
+from numba import njit, prange, set_num_threads
 
 # Set up logging
 log = logging.getLogger("my_logger")
@@ -33,25 +35,31 @@ def trim_coverage_by_subject(
         flattened_coverage[end_idx - trim_length : end_idx] = 0
 
 
-@njit(parallel=True, cache=True)
+@njit(cache=True, fastmath=True)
 def compute_coverage_statistics(
     flattened_coverage: np.ndarray,
     start_positions: np.ndarray,
     subject_lengths: np.ndarray,
 ) -> tuple[np.ndarray, np.ndarray]:
     n_subjects = len(start_positions)
-    mean_coverage = np.zeros(n_subjects, dtype=np.float32)
-    std_coverage = np.zeros(n_subjects, dtype=np.float32)
+    end_positions = start_positions + subject_lengths
 
-    for i in prange(n_subjects):
-        start_idx, end_idx = start_positions[i], start_positions[i] + subject_lengths[i]
-        subject_coverage = flattened_coverage[start_idx:end_idx]
-        mean = np.sum(subject_coverage) / subject_lengths[i]
-        mean_coverage[i] = mean
-        variance = np.sum((subject_coverage - mean) ** 2) / subject_lengths[i]
-        std_coverage[i] = np.sqrt(variance)
+    # Calculate cumulative sums
+    cumsum = np.zeros(len(flattened_coverage) + 1, dtype=np.float64)
+    sq_cumsum = np.zeros(len(flattened_coverage) + 1, dtype=np.float64)
+    for i in range(len(flattened_coverage)):
+        cumsum[i + 1] = cumsum[i] + flattened_coverage[i]
+        sq_cumsum[i + 1] = sq_cumsum[i] + flattened_coverage[i] ** 2
 
-    return mean_coverage, std_coverage
+    # Calculate mean coverage
+    mean_coverage = (cumsum[end_positions] - cumsum[start_positions]) / subject_lengths
+
+    # Calculate variance
+    variance = (
+        sq_cumsum[end_positions] - sq_cumsum[start_positions]
+    ) / subject_lengths - mean_coverage**2
+
+    return mean_coverage.astype(np.float32), np.sqrt(variance).astype(np.float32)
 
 
 @njit(parallel=True, fastmath=True, cache=True)
@@ -61,44 +69,50 @@ def compute_alignment_statistics(
     percent_identity: np.ndarray,
     inverse_indices: np.ndarray,
     n_subjects: int,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    sum_aln_len = np.zeros(n_subjects, dtype=np.float64)
-    sum_sq_aln_len = np.zeros(n_subjects, dtype=np.float64)
-    sum_read_len = np.zeros(n_subjects, dtype=np.float64)
-    sum_sq_read_len = np.zeros(n_subjects, dtype=np.float64)
-    sum_identity = np.zeros(n_subjects, dtype=np.float64)
-    sum_sq_identity = np.zeros(n_subjects, dtype=np.float64)
-    counts = np.zeros(n_subjects, dtype=np.int64)
+    num_threads: int = 1,
+) -> Tuple[
+    np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray
+]:
+    chunk_size = (len(inverse_indices) + num_threads - 1) // num_threads
 
-    for i in prange(len(inverse_indices)):
-        subject_idx = inverse_indices[i]
-        aln_len = alignment_lengths[i]
-        read_len = query_lengths[i]
-        identity = percent_identity[i]
+    results = np.zeros((num_threads, n_subjects, 7), dtype=np.float64)
 
-        sum_aln_len[subject_idx] += aln_len
-        sum_sq_aln_len[subject_idx] += aln_len * aln_len
-        sum_read_len[subject_idx] += read_len
-        sum_sq_read_len[subject_idx] += read_len * read_len
-        sum_identity[subject_idx] += identity
-        sum_sq_identity[subject_idx] += identity * identity
-        counts[subject_idx] += 1
+    for thread_id in prange(num_threads):
+        start = thread_id * chunk_size
+        end = min(start + chunk_size, len(inverse_indices))
+
+        for i in range(start, end):
+            subject_idx = inverse_indices[i]
+            aln_len = alignment_lengths[i]
+            read_len = query_lengths[i]
+            identity = percent_identity[i]
+
+            results[thread_id, subject_idx, 0] += aln_len
+            results[thread_id, subject_idx, 1] += aln_len * aln_len
+            results[thread_id, subject_idx, 2] += read_len
+            results[thread_id, subject_idx, 3] += read_len * read_len
+            results[thread_id, subject_idx, 4] += identity
+            results[thread_id, subject_idx, 5] += identity * identity
+            results[thread_id, subject_idx, 6] += 1
+
+    # Combine results from all threads
+    final_results = results.sum(axis=0)
 
     return (
-        sum_aln_len,
-        sum_sq_aln_len,
-        sum_read_len,
-        sum_sq_read_len,
-        sum_identity,
-        sum_sq_identity,
-        counts,
+        final_results[:, 0],  # sum_aln_len
+        final_results[:, 1],  # sum_sq_aln_len
+        final_results[:, 2],  # sum_read_len
+        final_results[:, 3],  # sum_sq_read_len
+        final_results[:, 4],  # sum_identity
+        final_results[:, 5],  # sum_sq_identity
+        final_results[:, 6].astype(np.int64),  # counts
     )
 
 
 @njit(fastmath=True, cache=True)
 def finalize_statistics(
     sum_vals: np.ndarray, sum_sq_vals: np.ndarray, counts: np.ndarray
-) -> tuple[np.ndarray, np.ndarray]:
+) -> Tuple[np.ndarray, np.ndarray]:
     mean = np.zeros_like(sum_vals)
     std = np.zeros_like(sum_vals)
     mask = counts > 0
@@ -132,7 +146,7 @@ def update_coverage_array(
             flattened_coverage[end] -= 1
 
 
-@njit(parallel=True, cache=True)
+@njit(parallel=True, cache=True, fastmath=True)
 def perform_cumulative_sum(
     flattened_coverage: np.ndarray,
     start_positions: np.ndarray,
@@ -148,12 +162,12 @@ def perform_cumulative_sum(
         )
 
 
-@njit(parallel=True, cache=True)
+@njit(parallel=True, cache=True, fastmath=True)
 def compute_global_coverage_statistics(
     flattened_coverage: np.ndarray,
     start_positions: np.ndarray,
     subject_lengths: np.ndarray,
-) -> tuple[np.ndarray, np.ndarray]:
+) -> Tuple[np.ndarray, np.ndarray]:
     total_coverage = np.zeros(len(start_positions), dtype=np.int64)
     nonzero_coverage_counts = np.zeros(len(start_positions), dtype=np.int32)
 
@@ -167,69 +181,22 @@ def compute_global_coverage_statistics(
     return total_coverage, nonzero_coverage_counts
 
 
-# def get_representative_indices(row_hashes: np.ndarray, num_threads: int) -> np.ndarray:
-#     log.debug("Finding representative indices for unique hashes")
-#     _, representative_indices = np.unique(row_hashes, return_index=True)
-#     representative_indices.sort(kind="mergesort")
-#     log.debug(f"Found {len(representative_indices)} unique hashes")
-#     return representative_indices
-
-
-@njit
-def _find_unique_indices(chunk):
-    seen = set()
-    indices = np.empty(len(chunk), dtype=np.int64)
-    count = 0
-    for i in range(len(chunk)):
-        if chunk[i] not in seen:
-            seen.add(chunk[i])
-            indices[count] = i
-            count += 1
-    return indices[:count]
-
-
-def process_chunk(args):
-    chunk, start_index = args
-    local_indices = _find_unique_indices(chunk)
-    return local_indices + start_index
-
-
 def get_representative_indices(row_hashes: np.ndarray, num_threads: int) -> np.ndarray:
-    chunk_size = len(row_hashes) // num_threads
-    chunks = [
-        (row_hashes[i : i + chunk_size], i)
-        for i in range(0, len(row_hashes), chunk_size)
-    ]
-
-    with mp.Pool(num_threads) as pool:
-        results = pool.map(process_chunk, chunks)
-
-    representative_indices = np.concatenate(results)
+    log.debug("Finding representative indices for unique hashes")
+    _, representative_indices = np.unique(row_hashes, return_index=True)
     representative_indices.sort(kind="mergesort")
-
+    log.debug(f"Found {len(representative_indices)} unique hashes")
     return representative_indices
 
 
-# Alternative implementation using only Numba
-@njit(parallel=True)
-def get_representative_indices_numba(row_hashes: np.ndarray) -> np.ndarray:
-    seen = set()
-    indices = np.empty(len(row_hashes), dtype=np.int64)
-    count = 0
-    for i in prange(len(row_hashes)):
-        if row_hashes[i] not in seen:
-            seen.add(row_hashes[i])
-            indices[count] = i
-            count += 1
-    return np.sort(indices[:count])
-
-
-def write_and_flush(mmap_array, data):
+def write_and_flush(mmap_array: np.memmap, data: np.ndarray) -> None:
     mmap_array[:] = data
     mmap_array.flush()
 
 
-def initialize_mmap_arrays(mmap_folder, unique_subjects, max_subject_lengths):
+def initialize_mmap_arrays(
+    mmap_folder: str, unique_subjects: np.ndarray, max_subject_lengths: np.ndarray
+) -> Tuple[np.memmap, np.memmap]:
     log.debug("Initializing optimized memory-mapped arrays")
     os.makedirs(mmap_folder, exist_ok=True)
     cumsum = np.concatenate(([0], np.cumsum(max_subject_lengths[:-1])))
@@ -255,21 +222,31 @@ def initialize_mmap_arrays(mmap_folder, unique_subjects, max_subject_lengths):
     return start_positions, subject_lengths_mmap
 
 
-def slice_mmap(arr, arr_name, indices, mmap_folder, dtype, shape):
+def slice_mmap(
+    arr: np.ndarray,
+    arr_name: str,
+    indices: np.ndarray,
+    mmap_folder: str,
+    dtype: np.dtype,
+    shape: Tuple[int, ...],
+) -> None:
     mmap_path = os.path.join(mmap_folder, f"{arr_name}.npy")
-    sliced_arr = np.memmap(mmap_path, dtype=dtype, mode="w+", shape=(shape,))
+    sliced_arr = np.memmap(mmap_path, dtype=dtype, mode="w+", shape=shape)
     np.take(arr, indices, out=sliced_arr)
     del sliced_arr  # Close the memmap file
 
 
-def slice_mmap_wrapper(args):
+def slice_mmap_wrapper(args: Tuple) -> None:
     arr, arr_name, dtype, indices, mmap_folder, shape = args
     return slice_mmap(arr, arr_name, indices, mmap_folder, dtype, shape)
 
 
 def parallel_slice_mmap(
-    numpy_arrays, representative_indices, mmap_folder, num_threads=1
-):
+    numpy_arrays: Dict[str, np.ndarray],
+    representative_indices: np.ndarray,
+    mmap_folder: str,
+    num_threads: int = 1,
+) -> Dict[str, np.ndarray]:
     os.makedirs(mmap_folder, exist_ok=True)
 
     arrays_to_process = [
@@ -302,9 +279,9 @@ def parallel_slice_mmap(
             tqdm.tqdm(
                 executor.map(slice_mmap_wrapper, args_list),
                 total=len(arrays_to_process),
-                desc="Removing duplicates",
-                leave=False,
+                desc="Arrays sliced",
                 ncols=80,
+                leave=False,
             )
         )
 
@@ -322,7 +299,8 @@ def calculate_alignment_statistics(
     percent_identity: np.ndarray,
     inverse_indices: np.ndarray,
     n_subjects: int,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    num_threads: int = 1,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     log.debug("Calculating alignment statistics")
     (
         sum_aln_len,
@@ -333,7 +311,12 @@ def calculate_alignment_statistics(
         sum_sq_identity,
         counts,
     ) = compute_alignment_statistics(
-        alignment_lengths, query_lengths, percent_identity, inverse_indices, n_subjects
+        alignment_lengths,
+        query_lengths,
+        percent_identity,
+        inverse_indices,
+        n_subjects,
+        num_threads=num_threads,
     )
 
     avg_aln_len, std_aln_len = finalize_statistics(sum_aln_len, sum_sq_aln_len, counts)
@@ -355,8 +338,11 @@ def calculate_alignment_statistics(
 
 
 def calculate_statistics(
-    numpy_arrays: dict, temp_files: dict, num_threads: int = 1, rm_dups: bool = True
-) -> pd.DataFrame:
+    numpy_arrays: Dict[str, np.ndarray],
+    temp_files: Dict[str, str],
+    num_threads: int = 1,
+    rm_dups: bool = True,
+) -> Tuple[pd.DataFrame, np.ndarray, np.ndarray, Dict[str, np.ndarray]]:
     mmap_folder = temp_files["mmap"]
     set_num_threads(num_threads)
 
@@ -391,7 +377,7 @@ def calculate_statistics(
     steps = steps[: len(steps) - 1] if rm_dups else steps
 
     with tqdm.tqdm(
-        total=len(steps), desc="Processing steps", leave=False, ncols=80
+        total=len(steps), desc="Processing steps", ncols=80, leave=False
     ) as pbar:
         if rm_dups:
             log.debug(
@@ -421,7 +407,7 @@ def calculate_statistics(
         pbar.update(1)
 
         log.debug("Step 3: Finding unique subjects and inverse indices")
-        unique_subjects, inverse_indices = np.unique(subject_ids, return_inverse=True)
+        inverse_indices, unique_subjects = pd.factorize(subject_ids, sort=False)
         pbar.update(1)
 
         log.debug("Step 4: Calculating maximum subject length for each unique subject")
@@ -476,6 +462,7 @@ def calculate_statistics(
             percent_identity,
             inverse_indices,
             n_subjects,
+            num_threads=num_threads,
         )
         pbar.update(1)
 

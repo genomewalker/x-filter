@@ -2,9 +2,9 @@ import numpy as np
 import pandas as pd
 import logging
 import os
-import tqdm
 from contextlib import contextmanager
-from memory_profiler import profile
+from typing import List, Tuple, Dict, Any, Generator
+from tqdm import tqdm
 
 log = logging.getLogger("my_logger")
 numba_logger = logging.getLogger("numba")
@@ -12,7 +12,10 @@ numba_logger.setLevel(logging.WARNING)
 
 
 @contextmanager
-def temp_memmap(filename, dtype, mode, shape):
+def temp_memmap(
+    filename: str, dtype: np.dtype, mode: str, shape: Tuple[int, ...]
+) -> Generator[np.memmap, None, None]:
+    """Create a temporary memory-mapped array."""
     try:
         memmap_array = np.memmap(filename, dtype=dtype, mode=mode, shape=shape)
         yield memmap_array
@@ -23,157 +26,119 @@ def temp_memmap(filename, dtype, mode, shape):
             os.remove(filename)
 
 
-def initialize_subject_weights(subject_inverse_indices, bitScore, mmap_dir):
-    prob_filename = os.path.join(mmap_dir, "prob.mmap")
-    prob = np.memmap(
-        prob_filename, dtype="float64", mode="w+", shape=subject_inverse_indices.shape
-    )
+def initialize_subject_weights(
+    subject_inverse_indices: np.ndarray, bitScore: np.ndarray
+) -> np.ndarray:
+    """Initialize subject weights based on bitScore."""
     total_weights = np.bincount(subject_inverse_indices, weights=bitScore)
-    prob[:] = bitScore / total_weights[subject_inverse_indices]
-    return prob
-
-
-def cleanup_iter_files(mmap_dir, current_iter):
-    for filename in os.listdir(mmap_dir):
-        if filename.endswith(f"_{current_iter}.mmap"):
-            os.remove(os.path.join(mmap_dir, filename))
+    return bitScore / total_weights[subject_inverse_indices]
 
 
 def resolve_multimaps_return_indices(
-    subject_inverse_indices,
-    query_inverse_indices,
-    prob,
-    slen,
-    iter_array,
-    scale=0.9,
-    iters=10,
-    mmap_dir=None,
-):
-    try:
-        current_iter = 0
-        prev_num_alignments = np.inf
-        mask = np.ones(subject_inverse_indices.shape, dtype=bool)
-        global_uniques = 0
-        total_reads = len(np.unique(query_inverse_indices))
+    subject_inverse_indices: np.ndarray,
+    query_inverse_indices: np.ndarray,
+    prob: np.ndarray,
+    slen: np.ndarray,
+    iter_array: np.ndarray,
+    scale: float = 0.9,
+    iters: int = 10,
+) -> np.ndarray:
+    """Resolve multimaps and return indices."""
+    mask = np.ones(subject_inverse_indices.shape, dtype=bool)
+    total_reads = len(np.unique(query_inverse_indices))
+    max_query = query_inverse_indices.max()
 
-        steps = [
-            "Calculate subject weights",
-            "Update probabilities",
-            "Calculate alignments per query",
-            "Calculate max_prob",
-            "Remove low-probability alignments",
-            "Update mask",
-        ]
-        total_steps = len(steps)
+    steps = [
+        "Calculate weights",
+        "Update probs",
+        "Calc alignments",
+        "Max prob",
+        "Remove low-prob",
+        "Update mask",
+    ]
+    total_steps = len(steps)
 
-        while current_iter < iters:
-            n_alns = np.sum(mask)
-            log.info(f"Iter: {current_iter + 1} - Total alignments: {n_alns:,}")
+    prev_num_alignments = np.inf
 
-            if n_alns == prev_num_alignments:
-                log.info("No more alignments removed. Stopping iterations.")
+    for current_iter in range(iters):
+        n_alns = mask.sum()
+        log.info(f"Iter: {current_iter + 1} - Total alignments: {n_alns:,}")
+
+        if n_alns == prev_num_alignments:
+            log.info("No more alignments removed. Stopping iterations.")
+            break
+
+        prev_num_alignments = n_alns
+
+        with tqdm(
+            total=total_steps,
+            desc=f"Iteration {current_iter + 1}",
+            unit="step",
+            ncols=80,
+            leave=False,
+        ) as pbar:
+            # Step 1: Calculate subject weights
+            s_W = prob[mask] / slen[mask]
+            pbar.update(1)
+
+            # Step 2: Update probabilities
+            new_prob = prob[mask] * s_W
+            prob_sum_array = np.zeros(max_query + 1, dtype=np.float64)
+            np.add.at(prob_sum_array, query_inverse_indices[mask], new_prob)
+            prob[mask] = new_prob / prob_sum_array[query_inverse_indices[mask]]
+            pbar.update(1)
+
+            # Step 3: Calculate number of alignments per query
+            n_aln = np.zeros(max_query + 1, dtype=np.int64)
+            np.add.at(n_aln, query_inverse_indices[mask], 1)
+            n_aln = n_aln[query_inverse_indices]
+            pbar.update(1)
+
+            unique_mask = n_aln == 1
+            non_unique_mask = n_aln > 1
+            unique_mask &= mask
+            non_unique_mask &= mask
+
+            if unique_mask.all():
+                log.info("No more multimapping reads. Early stopping.")
                 break
 
-            prev_num_alignments = n_alns
+            # Step 4: Calculate max_prob
+            max_prob = np.zeros(max_query + 1, dtype=np.float64)
+            np.maximum.at(max_prob, query_inverse_indices[mask], prob[mask])
+            max_prob_scaled = max_prob[query_inverse_indices] * scale
+            pbar.update(1)
 
-            with tqdm.tqdm(
-                total=total_steps,
-                desc=f"Iteration {current_iter + 1}",
-                unit="step",
-                ncols=80,
-                leave=False,
-            ) as pbar:
-                # Step 1: Calculate subject weights
-                with temp_memmap(
-                    os.path.join(mmap_dir, f"subject_weights_{current_iter}.mmap"),
-                    dtype="float64",
-                    mode="w+",
-                    shape=subject_inverse_indices.shape,
-                ) as subject_weights:
-                    subject_weights[mask] = prob[mask]
-                    s_W = subject_weights[mask] / slen[mask]
-                pbar.update(1)
+            # Step 5: Remove low-probability alignments
+            final_mask = (prob >= max_prob_scaled) & non_unique_mask
+            pbar.update(1)
 
-                # Step 2: Update probabilities
-                new_prob = prob[mask] * s_W
-                max_query = np.max(query_inverse_indices[mask])
-                with temp_memmap(
-                    os.path.join(mmap_dir, f"prob_sum_array_{current_iter}.mmap"),
-                    dtype="float64",
-                    mode="w+",
-                    shape=(max_query + 1,),
-                ) as prob_sum_array:
-                    np.add.at(prob_sum_array, query_inverse_indices[mask], new_prob)
-                    prob[mask] = new_prob / prob_sum_array[query_inverse_indices[mask]]
-                pbar.update(1)
+            # Step 6: Update mask
+            iter_array[final_mask] = current_iter + 1
+            mask &= unique_mask | final_mask
+            pbar.update(1)
 
-                # Step 3: Calculate number of alignments per query
-                with temp_memmap(
-                    os.path.join(mmap_dir, f"query_counts_array_{current_iter}.mmap"),
-                    dtype="int64",
-                    mode="w+",
-                    shape=(max_query + 1,),
-                ) as query_counts:
-                    np.add.at(query_counts, query_inverse_indices[mask], 1)
-                    n_aln = query_counts[query_inverse_indices]
-                pbar.update(1)
+        # Calculate and print summary
+        global_uniques = unique_mask.sum()
+        new_uniques = global_uniques - (total_reads - prev_num_alignments)
+        reads_to_process = total_reads - global_uniques
 
-                unique_mask = n_aln == 1
-                non_unique_mask = n_aln > 1
-                unique_mask = unique_mask & mask
-                non_unique_mask = non_unique_mask & mask
+        log.info(
+            f"Iter: {current_iter + 1} - New uniques: {new_uniques:,} | "
+            f"Total uniques: {global_uniques:,} | Reads to process: {reads_to_process:,}"
+        )
 
-                if np.all(unique_mask):
-                    log.info("No more multimapping reads. Early stopping.")
-                    break
+        if mask.sum() == 0:
+            log.info("No more alignments to remove. Stopping.")
+            break
 
-                # Step 4: Calculate max_prob
-                with temp_memmap(
-                    os.path.join(mmap_dir, f"max_prob_{current_iter}.mmap"),
-                    dtype="float64",
-                    mode="w+",
-                    shape=(max_query + 1,),
-                ) as max_prob:
-                    np.maximum.at(max_prob, query_inverse_indices[mask], prob[mask])
-                    max_prob_scaled = max_prob[query_inverse_indices] * scale
-                pbar.update(1)
-
-                # Step 5: Remove low-probability alignments
-                final_mask = (prob >= max_prob_scaled) & non_unique_mask
-                to_remove = np.sum(mask) - np.sum(final_mask)
-                total_n_unique = np.sum(unique_mask)
-                pbar.update(1)
-
-                # Step 6: Update mask
-                iter_array[final_mask] = current_iter + 1
-                mask = mask & (unique_mask | final_mask)
-                pbar.update(1)
-
-            # Calculate and print summary
-            new_uniques = np.sum(unique_mask) - global_uniques
-            global_uniques = np.sum(unique_mask)
-            reads_to_process = total_reads - global_uniques
-
-            log.info(
-                f"Iter: {current_iter + 1} - New uniques: {new_uniques:,} | Total uniques: {global_uniques:,} | Reads to process: {reads_to_process:,}"
-            )
-
-            if np.sum(mask) == 0:
-                log.info("No more alignments to remove. Stopping.")
-                break
-
-            current_iter += 1
-            cleanup_iter_files(mmap_dir, current_iter)
-
-        return mask
-    finally:
-        prob_filename = prob.filename
-        del prob
-        if os.path.exists(prob_filename):
-            os.remove(prob_filename)
+    return mask
 
 
-def reassign(np_arrays, tmp_files):
+def reassign(
+    np_arrays: Dict[str, np.ndarray], tmp_files: Dict[str, Any]
+) -> pd.DataFrame:
+    """Reassign and filter alignments."""
     mmap_folder = tmp_files["mmap"]
 
     filtered_subjectStart = np_arrays["subjectStart"]
@@ -187,7 +152,7 @@ def reassign(np_arrays, tmp_files):
     filtered_bitScore = np_arrays["bitScore"]
     filtered_row_hash = np_arrays["row_hash"]
 
-    # log.info("Factorizing subject and query IDs")
+    log.info("Factorizing subject and query IDs")
     subject_inverse_indices, unique_subjects = pd.factorize(
         filtered_subject_numeric_id, sort=False
     )
@@ -204,25 +169,16 @@ def reassign(np_arrays, tmp_files):
         mode="w+",
         shape=(filtered_subject_numeric_id.shape[0],),
     ) as iter_array:
-        prob = initialize_subject_weights(
-            subject_inverse_indices, filtered_bitScore, mmap_dir=mmap_folder
+        prob = initialize_subject_weights(subject_inverse_indices, filtered_bitScore)
+        final_mask = resolve_multimaps_return_indices(
+            subject_inverse_indices,
+            query_inverse_indices,
+            prob,
+            filtered_slen,
+            iter_array,
+            scale=0.9,
+            iters=25,
         )
-        try:
-            final_mask = resolve_multimaps_return_indices(
-                subject_inverse_indices,
-                query_inverse_indices,
-                prob,
-                filtered_slen,
-                iter_array,
-                scale=0.9,
-                iters=25,
-                mmap_dir=mmap_folder,
-            )
-        finally:
-            prob_filename = prob.filename
-            del prob
-            if os.path.exists(prob_filename):
-                os.remove(prob_filename)
 
     filtered_ids_df = pd.DataFrame(
         {
@@ -236,10 +192,5 @@ def reassign(np_arrays, tmp_files):
             "row_hash": filtered_row_hash[final_mask],
         }
     )
-
-    # Clean up any remaining temporary files
-    for filename in os.listdir(mmap_folder):
-        if filename.endswith(".mmap"):
-            os.remove(os.path.join(mmap_folder, filename))
 
     return filtered_ids_df
