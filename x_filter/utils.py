@@ -95,26 +95,6 @@ def get_default_max_memory():
     return int(available_memory * 0.8)
 
 
-def format_memory(memory_bytes):
-    """
-    Format memory size from bytes to a human-readable string with appropriate unit.
-    """
-    for unit in ["", "K", "M", "G"]:
-        if memory_bytes < 1024:
-            return f"{memory_bytes:.0f}{unit}"
-        memory_bytes /= 1024
-    return f"{memory_bytes:.0f}T"
-
-
-def check_memory(value):
-    """
-    Check and convert the memory value.
-    """
-    if value is None:
-        return get_default_max_memory()
-    return check_suffix(value, parser, "--max-memory")
-
-
 def is_integer(n: Any) -> bool:
     try:
         float(n)
