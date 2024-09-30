@@ -1,5 +1,4 @@
-from setuptools import setup, Extension
-from Cython.Build import cythonize
+from setuptools import setup
 import versioneer
 
 # Your package requirements
