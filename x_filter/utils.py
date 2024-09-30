@@ -319,7 +319,6 @@ def get_arguments(
     )
 
     args = parser.parse_args(None if sys.argv[1:] else ["-h"])
-    print(args)
 
     if args.max_memory is None:
         args.max_memory = get_default_max_memory()
