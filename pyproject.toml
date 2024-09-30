@@ -1,2 +1,14 @@
 [build-system]
-requires = ["setuptools", "wheel", "Cython"]
+requires = ["setuptools>=39.1.0", "wheel", "Cython>=0.29.24", "numpy>=2.0.0", "versioneer"]
+build-backend = "setuptools.build_meta"
+
+[tool.cython]
+language_level = "3"
+
+[tool.versioneer]
+VCS = "git"
+style = "pep440"
+versionfile_source = "x_filter/_version.py"
+versionfile_build = "x_filter/_version.py"
+tag_prefix = "v"
+parentdir_prefix = "x-filter-"
