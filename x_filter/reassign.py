@@ -6,6 +6,7 @@ from contextlib import contextmanager
 from typing import List, Tuple, Dict, Any, Generator
 from tqdm import tqdm
 
+
 log = logging.getLogger("my_logger")
 numba_logger = logging.getLogger("numba")
 numba_logger.setLevel(logging.WARNING)
@@ -26,12 +27,14 @@ def temp_memmap(
             os.remove(filename)
 
 
+
 def initialize_subject_weights(
     subject_inverse_indices: np.ndarray, bitScore: np.ndarray
 ) -> np.ndarray:
     """Initialize subject weights based on bitScore."""
     total_weights = np.bincount(subject_inverse_indices, weights=bitScore)
     return bitScore / total_weights[subject_inverse_indices]
+
 
 
 def resolve_multimaps_return_indices(
@@ -132,6 +135,7 @@ def resolve_multimaps_return_indices(
             break
 
     return mask
+
 
 
 def reassign(

@@ -1,4 +1,4 @@
-from typing import Dict, List, Tuple, Any, Optional
+from typing import Dict, List, Tuple, Any
 import logging
 import duckdb
 import pandas as pd

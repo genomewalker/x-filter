@@ -1,4 +1,4 @@
-from typing import Dict, Tuple, Any, Optional
+from typing import Dict, Tuple, Optional
 import duckdb
 import numpy as np
 import os
@@ -129,7 +129,23 @@ def db_to_memory_mapped_arrays_optimized(
                 memory_mapped_paths[column_name] = memmap_array
                 progress_bar.update(1)
 
-    return memory_mapped_paths, parquet_file
+    # Flush all memory-mapped arrays
+    for memmap_array in memory_mapped_paths.values():
+        memmap_array.flush()
+
+    # Delete references to original memmap objects
+    del memory_mapped_paths
+
+    # Reopen memory-mapped arrays
+    reopened_memory_mapped_arrays = {}
+    for column_name, memmap_file_path in column_data_types.items():
+        reopened_memory_mapped_arrays[column_name] = np.memmap(
+            f"{mmap_folder}/{column_name}.npy",
+            dtype=column_data_types[column_name],
+            mode="r+",
+        )
+
+    return reopened_memory_mapped_arrays, parquet_file
 
 
 def process_input_data(

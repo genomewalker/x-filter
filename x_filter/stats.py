@@ -1,8 +1,8 @@
 import logging
 import os
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
-from functools import partial
-from typing import Dict, List, Tuple
+from typing import Dict, Tuple
+
 
 import numpy as np
 import pandas as pd
