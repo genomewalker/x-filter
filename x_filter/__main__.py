@@ -3,7 +3,6 @@ import logging
 import duckdb
 import pandas as pd
 import numpy as np
-from memory_profiler import profile
 
 from x_filter.ops import setup_temporary_directory, process_input_data
 from x_filter.utils import get_arguments, apply_filters, create_output_files

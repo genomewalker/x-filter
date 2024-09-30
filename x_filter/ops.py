@@ -8,7 +8,6 @@ from tqdm import tqdm
 import tempfile
 import pyarrow.parquet as pq
 import pandas as pd
-from memory_profiler import profile
 
 from x_filter.utils import is_debug
 

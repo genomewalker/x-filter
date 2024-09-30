@@ -62,7 +62,7 @@ def resolve_multimaps_return_indices(
 
     for current_iter in range(iters):
         n_alns = mask.sum()
-        log.info(f"Iter: {current_iter + 1} - Total alignments: {n_alns:,}")
+        # log.info(f"Iter: {current_iter + 1} - Total alignments: {n_alns:,}")
 
         if n_alns == prev_num_alignments:
             log.info("No more alignments removed. Stopping iterations.")
@@ -120,11 +120,10 @@ def resolve_multimaps_return_indices(
 
         # Calculate and print summary
         global_uniques = unique_mask.sum()
-        new_uniques = global_uniques - (total_reads - prev_num_alignments)
+        # new_uniques = global_uniques - (total_reads - prev_num_alignments)
         reads_to_process = total_reads - global_uniques
-
         log.info(
-            f"Iter: {current_iter + 1} - New uniques: {new_uniques:,} | "
+            f"Iter: {current_iter + 1} - Alignments: {n_alns:,} | "
             f"Total uniques: {global_uniques:,} | Reads to process: {reads_to_process:,}"
         )
 
