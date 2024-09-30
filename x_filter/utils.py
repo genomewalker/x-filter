@@ -69,7 +69,7 @@ HELP_MESSAGES = {
     "version": "Print program version",
     "anvio": "Create output compatible with anvi'o",
     "trim": "Deactivate the trimming for the coverage calculations",
-    "max_memory": "Maximum memory to use. If not provided will use 80% of the available memory",
+    "max_memory": "Maximum memory to use. If not provided will use 80%% of the available memory",
     "tmp_dir": "Temporary directory to store intermediate files",
     "duplicates": "Keep duplicated reads in the output",
 }
@@ -117,6 +117,10 @@ def check_suffix(
 ) -> Union[str, int]:
     unit = val[-1]
     value = val[:-1]
+
+    # check if its None
+    if value is None:
+        return None
 
     if not (is_integer(value) and unit in UNITS and int(value) > 0):
         parser.error(
@@ -290,7 +294,6 @@ def get_arguments(
         help=HELP_MESSAGES["annotation_source"],
     )
     parser.add_argument(
-        "-M",
         "--max-memory",
         type=lambda x: check_suffix(x, parser=parser, var="--max-memory"),
         default=None,
@@ -316,6 +319,7 @@ def get_arguments(
     )
 
     args = parser.parse_args(None if sys.argv[1:] else ["-h"])
+    print(args)
 
     if args.max_memory is None:
         args.max_memory = get_default_max_memory()
