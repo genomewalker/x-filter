@@ -237,7 +237,7 @@ def process_input_data(
             """
             (column14) AS cigar,
             (column15) AS qaln,
-            (column16) AS saln,
+            (column16) AS taln,
         """
             if num_columns == 17
             else ""

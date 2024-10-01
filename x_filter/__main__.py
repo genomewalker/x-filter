@@ -205,7 +205,7 @@ def save_results(
         "slen": "slen",
         "cigar": "cigar",
         "qaln": "qaln",
-        "saln": "saln",
+        "taln": "taln",
     }
 
     new_column_order = [
@@ -225,7 +225,7 @@ def save_results(
         "slen",
     ]
     if "cigar" in df.columns:
-        new_column_order.extend(["cigar", "qaln", "saln"])
+        new_column_order.extend(["cigar", "qaln", "taln"])
 
     df = df.rename(columns=column_mapping)
     df[new_column_order].to_csv(out_files["multimap"], sep="\t", index=False)
