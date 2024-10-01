@@ -27,14 +27,12 @@ def temp_memmap(
             os.remove(filename)
 
 
-
 def initialize_subject_weights(
     subject_inverse_indices: np.ndarray, bitScore: np.ndarray
 ) -> np.ndarray:
     """Initialize subject weights based on bitScore."""
     total_weights = np.bincount(subject_inverse_indices, weights=bitScore)
     return bitScore / total_weights[subject_inverse_indices]
-
 
 
 def resolve_multimaps_return_indices(
@@ -50,6 +48,11 @@ def resolve_multimaps_return_indices(
     mask = np.ones(subject_inverse_indices.shape, dtype=bool)
     total_reads = len(np.unique(query_inverse_indices))
     max_query = query_inverse_indices.max()
+
+    if iters == 0:
+        log.info("Resolving multimaps until convergence.")
+    else:
+        log.info(f"Resolving multimaps for {iters} iterations.")
 
     steps = [
         "Calculate weights",
@@ -133,13 +136,14 @@ def resolve_multimaps_return_indices(
         if mask.sum() == 0:
             log.info("No more alignments to remove. Stopping.")
             break
-
+        if current_iter == iters - 1:
+            log.info(f"Reached the maximum number of iterations ({iters}). Stopping.")
+            break
     return mask
 
 
-
 def reassign(
-    np_arrays: Dict[str, np.ndarray], tmp_files: Dict[str, Any]
+    np_arrays: Dict[str, np.ndarray], tmp_files: Dict[str, Any], iters: int = 25
 ) -> pd.DataFrame:
     """Reassign and filter alignments."""
     mmap_folder = tmp_files["mmap"]
@@ -180,7 +184,7 @@ def reassign(
             filtered_slen,
             iter_array,
             scale=0.9,
-            iters=25,
+            iters=iters,
         )
 
     filtered_ids_df = pd.DataFrame(

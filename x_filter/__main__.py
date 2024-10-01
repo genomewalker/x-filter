@@ -82,7 +82,7 @@ def filter_arrays(
         )
 
     log.info("Resolve multimappings...")
-    return reassign(filtered_arrays, tmp_files)
+    return reassign(filtered_arrays, tmp_files, iters=args.n_iters)
 
 
 def process_filtered_data(
