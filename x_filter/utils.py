@@ -14,6 +14,7 @@ import pandas as pd
 import psutil
 
 from x_filter import __version__
+from x_filter.common import detect_input_type, validate_mmap_folder, get_open_func
 
 # Logger setup
 log = logging.getLogger("my_logger")
@@ -31,7 +32,7 @@ USER_FRIENDLY_FILTER_MAPPING = {
     "avgReadLength": ("avg_read_length", ">="),
     "avgIdentity": ("avg_identity", ">="),
     "breadth": ("breadth", ">="),
-    "covMean": ("cov_mean", ">="),
+    "covMean": ("depth_mean", ">="),
     "depthEvenness": ("depth_evenness", "<="),
 }
 
@@ -53,7 +54,11 @@ DEFAULTS = {
 }
 
 HELP_MESSAGES = {
-    "input": "A blastx m8 formatted file containing aligned reads to references. It has to contain query and subject lengths",
+    "input": "Input file/directory containing the data. Can be:\n"
+    "  - A blastx m8 formatted TSV file containing aligned reads to references\n"
+    "  - A Parquet file or directory containing Parquet files\n"
+    "  - A DuckDB database with 'filtered_blast' table\n"
+    "The input must contain query and subject lengths",
     "threads": "Number of threads to use",
     "prefix": "Prefix used for the output files",
     "bitscore": "Bitscore where to filter the results",
@@ -72,6 +77,9 @@ HELP_MESSAGES = {
     "max_memory": "Maximum memory to use. If not provided will use 80%% of the available memory",
     "tmp_dir": "Temporary directory to store intermediate files",
     "duplicates": "Keep duplicated reads in the output",
+    "keep_db": "Save the exported Parquet file in the working directory instead of temp directory",
+    "disable_initial_filtering": "Disable initial filtering before reassignment",
+    "mmap_folder_dir": "Path to folder containing memory-mapped arrays. If provided, skips mmap export",
 }
 
 
@@ -175,32 +183,9 @@ def check_values(
     return value
 
 
-def get_compression_type(filename: str) -> str:
-    magic_dict = {
-        "gz": (b"\x1f", b"\x8b", b"\x08"),
-        "bz2": (b"\x42", b"\x5a", b"\x68"),
-        "zip": (b"\x50", b"\x4b", b"\x03", b"\x04"),
-    }
-    max_len = max(len(x) for x in magic_dict)
-
-    with open(filename, "rb") as unknown_file:
-        file_start = unknown_file.read(max_len)
-
-    for file_type, magic_bytes in magic_dict.items():
-        if file_start.startswith(magic_bytes):
-            if file_type in ["bz2", "zip"]:
-                sys.exit(f"Error: cannot use {file_type} format - use gzip instead")
-            return file_type
-    return "plain"
-
-
-def get_open_func(filename: str) -> Union[gzip.open, open]:
-    return gzip.open if get_compression_type(filename) == "gz" else open
-
-
 def is_valid_file(parser: argparse.ArgumentParser, arg: str, var: str) -> str:
     if not os.path.exists(arg):
-        parser.error(f"argument {var}: The file {arg} does not exist!")
+        parser.error(f"argument {var}: The file/directory {arg} does not exist!")
     return arg
 
 
@@ -208,7 +193,8 @@ def get_arguments(
     argv: Optional[List[str]] = None,
 ) -> Tuple[argparse.Namespace, List[Dict[str, Union[str, float]]]]:
     parser = argparse.ArgumentParser(
-        description="A simple tool to filter BLASTx m8 files using the FAMLI algorithm",
+        description="A simple tool to filter BLASTx results using the FAMLI algorithm. "
+        "Supports TSV, Parquet, and DuckDB input formats.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
 
@@ -216,6 +202,7 @@ def get_arguments(
         "-i",
         "--input",
         type=lambda x: is_valid_file(parser, x, "--input"),
+        required=True,
         help=HELP_MESSAGES["input"],
     )
     parser.add_argument(
@@ -271,7 +258,7 @@ def get_arguments(
         "-n",
         "--n-iters",
         type=lambda x: int(
-            check_values(x, minval=1, maxval=100000, parser=parser, var="--n-iters")
+            check_values(x, minval=0, maxval=100000, parser=parser, var="--n-iters")
         ),
         default=DEFAULTS["iters"],
         help=HELP_MESSAGES["iters"],
@@ -286,6 +273,13 @@ def get_arguments(
     parser.add_argument(
         "--no-trim", dest="trim", action="store_false", help=HELP_MESSAGES["trim"]
     )
+    parser.add_argument(
+        "--skip-reassign",
+        dest="skip_reassign",
+        action="store_true",
+        help="Skip the reassignment step",
+    )
+
     parser.add_argument("--anvio", action="store_true", help=HELP_MESSAGES["anvio"])
     parser.add_argument(
         "--annotation-source",
@@ -308,7 +302,23 @@ def get_arguments(
         help=HELP_MESSAGES["tmp_dir"],
     )
     parser.add_argument(
-        "--keep-duplicates", action="store_true", help=HELP_MESSAGES["duplicates"]
+        "--mmap-folder-dir",
+        type=str,
+        default=None,
+        help="Path to folder containing memory-mapped arrays. If provided, skips mmap export.",
+    )
+    parser.add_argument(
+        "--keep-duplicates", action="store_false", help=HELP_MESSAGES["duplicates"]
+    )
+    parser.add_argument(
+        "--keep-db",
+        action="store_true",
+        help="Save the exported Parquet file in the working directory instead of temp directory",
+    )
+    parser.add_argument(
+        "--disable-initial-filtering",
+        action="store_true",
+        help=HELP_MESSAGES["disable_initial_filtering"],
     )
     parser.add_argument("--debug", action="store_true", help=HELP_MESSAGES["debug"])
     parser.add_argument(
@@ -336,6 +346,27 @@ def get_arguments(
 
     validate_filters(filters, USER_FRIENDLY_FILTER_MAPPING)
 
+    # Validate mmap folder if provided
+    if args.mmap_folder_dir:
+        # First detect input type
+        try:
+            input_type = detect_input_type(args.input)
+        except ValueError as e:
+            parser.error(str(e))
+
+        if input_type not in ["parquet", "duckdb"]:
+            parser.error("--mmap-folder can only be used with Parquet or DuckDB inputs")
+
+        if not os.path.isdir(args.mmap_folder_dir):
+            parser.error(
+                f"mmap-folder {args.mmap_folder_dir} does not exist or is not a directory"
+            )
+
+        try:
+            validate_mmap_folder(args.mmap_folder_dir)
+        except ValueError as e:
+            parser.error(str(e))
+
     return args, filters
 
 
@@ -360,7 +391,18 @@ def concat_df(frames: List[pd.DataFrame]) -> pd.DataFrame:
 
 def create_output_files(prefix: Optional[str], input_file: str) -> Dict[str, str]:
     if prefix is None:
-        prefix = Path(input_file).resolve().stem.split(".")[0]
+        # Handle both parquet folder and regular file cases
+        input_path = Path(input_file).resolve()
+        if input_path.is_dir() and input_path.name.endswith(".parquet"):
+            # For parquet folder, use the folder name without .parquet extension
+            # But ensure we're using just the name, not the full path
+            prefix = Path(input_path.name).stem
+        else:
+            # For regular files, use the stem (filename without extension)
+            prefix = input_path.stem.split(".")[0]
+
+    # get timestamp
+    timestamp = time.strftime("%Y%m%d-%H%M%S")
 
     return {
         "multimap": f"{prefix}_no-multimap.tsv.gz",
@@ -369,6 +411,8 @@ def create_output_files(prefix: Optional[str], input_file: str) -> Dict[str, str
         "group_abundances": f"{prefix}_group-abundances.tsv.gz",
         "group_abundances_anvio": f"{prefix}_group-abundances-anvio.tsv.gz",
         "group_abundances_agg": f"{prefix}_group-abundances-agg.tsv.gz",
+        "parquet": f"{prefix}_filtered_blast-{timestamp}.parquet",
+        "mmap": f"{prefix}_filtered_blast-{timestamp}-mmap",
     }
 
 
