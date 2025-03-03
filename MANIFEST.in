@@ -1,2 +1,6 @@
+include LICENSE
+include README.md
+include pyproject.toml
+include setup.cfg
 include versioneer.py
 include x_filter/_version.py

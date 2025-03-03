@@ -14,7 +14,7 @@ from x_filter.core.io import setup_temporary_directory, cleanup_temp_files
 from x_filter.core.preprocessing import process_input_data
 from x_filter.core.filtering import filter_arrays, apply_filters
 from x_filter.core.coverage import calculate_coverage_statistics
-from x_filter.core.aggregation import aggregate_results, save_results
+from x_filter.core.aggregation import save_results
 
 log = get_logger(__name__)
 
