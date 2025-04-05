@@ -19,6 +19,7 @@ from x_filter.core_processing import (
     get_representative_indices,
     memory_efficient_factorize,
 )
+from tqdm import tqdm
 
 log = get_logger()
 
@@ -173,6 +174,12 @@ def calculate_statistics(
     active_memmaps = {}
 
     try:
+        # Setup progress bar - main progress bar at position 0
+        total_steps = 7  # Total number of major processing steps
+        pbar = tqdm(
+            total=total_steps, desc="Computing statistics", leave=False, ncols=80
+        )
+
         # Initialize resource manager
         resource_mgr = ResourceManager(max_memory=max_memory, max_threads=num_threads)
 
@@ -198,19 +205,23 @@ def calculate_statistics(
             }
         )
 
-        # Handle deduplication
+        # Handle deduplication with nested progress bars
         if rm_dups:
-            log.info("Deduplicating arrays")
+            pbar.set_description("Deduplicating arrays")
+            log.debug("Deduplicating arrays")
             row_hashes = numpy_arrays["row_hash"]
             active_memmaps["row_hashes"] = row_hashes
 
-            # Get representative indices
+            # Get representative indices - creates nested progress bars
             representative_indices = get_representative_indices(
                 row_hashes,
                 num_threads=num_threads,
                 max_memory=max_memory,
                 mmap_folder=mmap_folder,
             )
+
+            # Print a newline for proper spacing after nested progress bars
+            print("")
 
             # Slice arrays using representative indices
             numpy_arrays = resource_mgr.slice_arrays(
@@ -225,9 +236,10 @@ def calculate_statistics(
             query_lengths = numpy_arrays["qlen"]
             percent_identity = numpy_arrays["percIdentity"]
             subject_lengths = numpy_arrays["slen"]
+            pbar.update(1)
 
         # Create inverse mapping
-        log.info("Creating inverse subject mapping")
+        log.debug("Creating inverse subject mapping")
         inverse_indices = initialize_mmap_array(
             total_positions=len(subject_ids),
             dtype=np.int64,
@@ -235,6 +247,7 @@ def calculate_statistics(
             array_name="inverse_indices",
         )
 
+        # This function will create nested progress bars
         inverse_indices, unique_subjects = memory_efficient_factorize(
             subject_ids,
             mmap_folder=mmap_folder,
@@ -251,25 +264,21 @@ def calculate_statistics(
         strategy = resource_mgr.calculate_chunk_size(arr_info)
 
         # Calculate maximum subject lengths
-        log.info("Calculating maximum subject lengths")
+        pbar.set_description("Calculating maximum subject lengths")
+        log.debug("Calculating maximum subject lengths")
         max_subject_lengths, total_positions = calculate_max_subject_lengths(
             unique_subjects, inverse_indices, subject_lengths, mmap_folder
         )
         active_memmaps["max_subject_lengths"] = max_subject_lengths
+        pbar.update(1)
 
         # Initialize coverage arrays
-        log.info("Initializing coverage arrays")
-
-        # decide if on memory or on disk based on max_memory
-        # calculate the size of the array
-        # if size is less than max_memory, then use memory
-        # else use disk
-        # if on disk, then use memmap
-        # if on memory, then use numpy array
+        pbar.set_description("Initializing coverage arrays")
+        log.debug("Initializing coverage arrays")
 
         array_size = total_positions * np.dtype(np.int32).itemsize
         if array_size < resource_mgr.max_memory:
-            log.warning(f"Using memory for flattened_coverage: {array_size:,} bytes")
+            log.debug(f"Using memory for flattened_coverage: {array_size:,} bytes")
             flattened_coverage = np.zeros(total_positions, dtype=np.int32)
         else:
             flattened_coverage = np.memmap(
@@ -278,10 +287,6 @@ def calculate_statistics(
                 mode="w+",
                 shape=(total_positions,),
             )
-
-            # flattened_coverage = initialize_mmap_array(
-            #     total_positions, np.int32, mmap_folder, "flattened_coverage"
-            # )
             active_memmaps["flattened_coverage"] = flattened_coverage
 
         start_positions, subject_lengths_mmap = initialize_mmap_arrays(
@@ -293,9 +298,11 @@ def calculate_statistics(
                 "subject_lengths_mmap": subject_lengths_mmap,
             }
         )
+        pbar.update(1)
 
         # Update coverage
-        log.info(f"Computing coverage with {num_threads} threads")
+        log.debug(f"Computing coverage with {num_threads} threads")
+        pbar.set_description(f"Computing coverage with {num_threads} threads")
         update_coverage_array(
             flattened_coverage,
             inverse_indices,
@@ -306,15 +313,19 @@ def calculate_statistics(
             n_partitions=num_threads,
             num_threads=num_threads,
         )
+        pbar.update(1)
 
         # Perform cumulative sum
-        log.info("Computing cumulative sums")
+        pbar.set_description("Computing cumulative sums")
+        log.debug("Computing cumulative sums")
         perform_cumulative_sum(
             flattened_coverage, start_positions, subject_lengths_mmap
         )
+        pbar.update(1)
 
         # Calculate alignment statistics
-        log.info("Computing alignment statistics")
+        pbar.set_description("Computing alignment statistics")
+        log.debug("Computing alignment statistics")
         n_subjects = len(unique_subjects)
         alignment_stats = compute_alignment_statistics(
             alignment_lengths,
@@ -326,22 +337,25 @@ def calculate_statistics(
         )
 
         # Count alignments per subject
-        # log.info("Counting alignments per subject")
-        # num_alignments = np.bincount(inverse_indices, minlength=n_subjects)
+        log.debug("Counting alignments per subject")
         num_alignments = chunk_bincount(
             inverse_indices, n_subjects, chunk_size=10_000_000, num_threads=num_threads
         )
+
         # Trim coverage
-        log.info("Trimming coverage")
+        pbar.set_description("Trimming coverage")
+        log.debug("Trimming coverage")
         trim_coverage_by_subject(
             flattened_coverage,
             start_positions,
             subject_lengths_mmap,
             alignment_stats["avg_aln_len"],
         )
+        pbar.update(1)
 
         # Calculate coverage statistics
-        log.info("Computing coverage statistics")
+        pbar.set_description("Computing coverage statistics")
+        log.debug("Computing coverage statistics")
         total_coverage = initialize_mmap_array(
             total_positions=len(start_positions),
             dtype=np.int64,
@@ -368,9 +382,11 @@ def calculate_statistics(
                 "nonzero_coverage_counts": nonzero_coverage_counts,
             }
         )
+        pbar.update(1)
 
         # Calculate mean coverage and depth statistics
-        log.info("Computing depth statistics")
+        pbar.set_description("Computing depth statistics")
+        log.debug("Computing depth statistics")
         mean_coverage, std_coverage = compute_coverage_statistics(
             flattened_coverage, start_positions, subject_lengths_mmap
         )
@@ -391,7 +407,8 @@ def calculate_statistics(
         depth_evenness[~valid_coverage_mask] = np.nan
 
         # Create final statistics DataFrame
-        log.info("Creating final statistics DataFrame")
+        pbar.set_description("Creating final statistics DataFrame")
+        log.debug("Creating final statistics DataFrame")
         final_stats = pd.DataFrame(
             {
                 "subject_numeric_id": unique_subjects,
@@ -411,13 +428,39 @@ def calculate_statistics(
             }
         )
 
+        # Ensure the final update happens AFTER the DataFrame creation is complete
+        pbar.update(1)
+
+        # Add a small delay to ensure the progress bar updates visually
+        import time
+
+        time.sleep(0.1)
+
+        # Force the progress bar to show 100%
+        pbar.refresh()
+
+        # Close the progress bar after the final update
+        pbar.close()
+
+        # Add a debug message to confirm completion
+        log.debug("Statistics calculation completed successfully")
+
         return final_stats, unique_subjects, inverse_indices, numpy_arrays
 
     except Exception as e:
+        # Close the progress bar in case of error
+        if "pbar" in locals():
+            pbar.close()
         log.error(f"Error in calculate_statistics: {e}")
         raise
 
     finally:
+        # Make sure the progress bar is closed if it exists
+        if "pbar" in locals():
+            try:
+                pbar.close()
+            except:
+                pass
         # Clean up memory-mapped arrays
         cleanup_memmaps(active_memmaps)
         gc.collect()

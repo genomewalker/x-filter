@@ -1,59 +1,18 @@
 import os
 import gc
+from threading import Lock
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
+from typing import Dict, Tuple, Union, Optional
+from multiprocessing import shared_memory
+
 import numpy as np
 import tqdm
-from numba import njit, prange
-from typing import Dict, Tuple, Union, Optional, List
-from concurrent.futures import (
-    ProcessPoolExecutor,
-    ThreadPoolExecutor,
-    as_completed,
-)
+import numba
+from numba import njit, prange, set_num_threads
+
 from x_filter.logging_setup import get_logger
-from x_filter.utils import is_debug
 from x_filter.memory_tracker import track_memory
 from x_filter.resource_management import ResourceManager
-from collections import defaultdict
-from threading import Lock
-import numba
-import time
-
-log = get_logger()
-import os
-import gc
-import numpy as np
-import tqdm
-from numba import njit, prange
-from typing import Dict, Tuple, Union, Optional, List
-from concurrent.futures import (
-    ProcessPoolExecutor,
-    ThreadPoolExecutor,
-    as_completed,
-)
-from x_filter.logging_setup import get_logger
-from x_filter.utils import is_debug
-from x_filter.memory_tracker import track_memory
-from x_filter.resource_management import ResourceManager
-from collections import defaultdict
-from threading import Lock
-import numba
-import time
-
-log = get_logger()
-
-import os
-import numpy as np
-import numba
-from numba import njit, prange
-import tqdm
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from threading import Lock
-from typing import Union, Optional, Tuple, List
-from queue import Queue
-import threading
-from enum import Enum
-from dataclasses import dataclass
-from x_filter.logging_setup import get_logger
 
 log = get_logger()
 
@@ -318,7 +277,9 @@ def get_representative_indices(
 
         # First pass: count bucket sizes
         log.info("Counting bucket sizes...")
-        with tqdm.tqdm(total=len(row_hashes), desc="Counting", ncols=80) as pbar:
+        with tqdm.tqdm(
+            total=len(row_hashes), desc="Counting", ncols=80, leave=False
+        ) as pbar:
             for start in range(0, len(row_hashes), chunk_size):
                 end = min(start + chunk_size, len(row_hashes))
                 chunk_hashes = row_hashes[start:end].copy()
@@ -333,7 +294,12 @@ def get_representative_indices(
 
         # Second pass: distribute elements
         log.info("Distributing elements...")
-        with tqdm.tqdm(total=len(row_hashes), desc="Distributing", ncols=80) as pbar:
+        with tqdm.tqdm(
+            total=len(row_hashes),
+            desc="Distributing",
+            ncols=80,
+            leave=False,
+        ) as pbar:
             for start in range(0, len(row_hashes), chunk_size):
                 end = min(start + chunk_size, len(row_hashes))
 
@@ -376,7 +342,12 @@ def get_representative_indices(
         total_unique = 0
 
         # Process buckets
-        with tqdm.tqdm(total=num_buckets, desc="Processing buckets", ncols=80) as pbar:
+        with tqdm.tqdm(
+            total=num_buckets,
+            desc="Processing buckets",
+            ncols=80,
+            leave=False,
+        ) as pbar:
             for bucket_id in range(num_buckets):
                 try:
                     bucket_data = bucket_mgr.get_bucket_data(bucket_id)
@@ -415,87 +386,69 @@ def get_representative_indices(
             bucket_mgr.cleanup()
 
 
-# @track_memory(name="update_coverage_array", detailed=True)
-# @njit(parallel=True, cache=True, fastmath=True)
-# def update_coverage_array(
-#     flattened_coverage: np.ndarray,
-#     inverse_subject_indices: np.ndarray,
-#     subject_start_positions: np.ndarray,
-#     subject_end_positions: np.ndarray,
-#     start_positions: np.ndarray,
-#     subject_lengths: np.ndarray,
-#     n_partitions: int = 16,
-# ) -> None:
-#     """
-#     Fast and memory efficient parallel implementation using sweep line within partitions.
+def calculate_parallel_distribution(
+    chunk_data: np.ndarray, num_buckets: int
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Calculate distribution of data across buckets."""
+    n = len(chunk_data)
+    indices = np.arange(n, dtype=np.int64)
 
-#     Args:
-#         flattened_coverage: Array to store coverage values
-#         inverse_subject_indices: Array mapping to subject indices
-#         subject_start_positions: Start positions within subjects
-#         subject_end_positions: End positions within subjects
-#         start_positions: Global start positions
-#         subject_lengths: Subject lengths
-#         n_partitions: Number of partitions for parallel processing
-#     """
-#     n_intervals = len(inverse_subject_indices)
-#     total_length = len(flattened_coverage)
-#     partition_size = (total_length + n_partitions - 1) // n_partitions
+    # Compute hash-based bucket assignments
+    hash_vals = chunk_data.copy()
+    bucket_ids = (hash_vals ^ (hash_vals >> 16) ^ (hash_vals >> 32)) & (num_buckets - 1)
 
-#     # Pre-calculate absolute positions
-#     abs_starts = np.empty(n_intervals, dtype=np.int64)
-#     abs_ends = np.empty(n_intervals, dtype=np.int64)
-#     for i in range(n_intervals):
-#         subj_idx = inverse_subject_indices[i]
-#         abs_starts[i] = start_positions[subj_idx] + subject_start_positions[i]
-#         abs_ends[i] = start_positions[subj_idx] + min(
-#             subject_end_positions[i], subject_lengths[subj_idx] - 1
-#         )
+    # Count elements per bucket
+    bucket_counts = np.bincount(bucket_ids, minlength=num_buckets)
 
-#     # Process each partition in parallel
-#     for p_id in prange(n_partitions):
-#         p_start = p_id * partition_size
-#         p_end = min(p_start + partition_size, total_length)
-
-#         # Count events in this partition
-#         n_events = 0
-#         for i in range(n_intervals):
-#             if (abs_starts[i] >= p_start and abs_starts[i] < p_end) or (
-#                 abs_ends[i] >= p_start and abs_ends[i] < p_end
-#             ):
-#                 n_events += 1
-
-#         if n_events == 0:
-#             continue
-
-#         # Allocate arrays for this partition's events
-#         positions = np.empty(n_events * 2, dtype=np.int64)
-#         changes = np.empty(n_events * 2, dtype=np.int32)
-
-#         # Fill event arrays
-#         event_idx = 0
-#         for i in range(n_intervals):
-#             if abs_starts[i] >= p_start and abs_starts[i] < p_end:
-#                 positions[event_idx] = abs_starts[i]
-#                 changes[event_idx] = 1
-#                 event_idx += 1
-#             if abs_ends[i] >= p_start and abs_ends[i] < p_end:
-#                 positions[event_idx] = abs_ends[i]
-#                 changes[event_idx] = -1
-#                 event_idx += 1
-
-#         # Sort events
-#         sort_idx = np.argsort(positions[:event_idx])
-#         positions = positions[:event_idx][sort_idx]
-#         changes = changes[:event_idx][sort_idx]
+    return indices, bucket_ids, bucket_counts
 
 
-#         # Process events
-#         for i in range(event_idx):
-#             pos = positions[i]
-#             if pos < total_length:
-#                 flattened_coverage[pos] += changes[i]
-from numba import njit, prange, set_num_threads
+def process_chunk_worker(
+    args: Tuple,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, int, int]:
+    """Worker function for parallel chunk processing."""
+    start, end, shm_name, array_length, num_buckets, num_threads = args
+
+    # Attach to shared memory
+    shm = shared_memory.SharedMemory(name=shm_name)
+    shared_array = np.ndarray((array_length,), dtype=np.int64, buffer=shm.buf)
+
+    try:
+        # Get chunk data
+        chunk_data = shared_array[start:end]
+
+        # Set number of threads for numba functions
+        set_num_threads(num_threads)
+
+        # Process chunk
+        indices, assignments, counts = calculate_parallel_distribution(
+            chunk_data, num_buckets
+        )
+
+        return indices, assignments, counts, start, end
+    finally:
+        # Clean up shared memory attachment
+        shm.close()
+
+
+def find_bucket_unique_worker(args: Tuple) -> np.ndarray:
+    """Worker function for finding unique values in bucket."""
+    bucket_data, shm_name, array_length, num_threads = args
+
+    # Attach to shared memory
+    shm = shared_memory.SharedMemory(name=shm_name)
+    shared_array = np.ndarray((array_length,), dtype=np.int64, buffer=shm.buf)
+
+    try:
+        # Set number of threads for numba operations
+        set_num_threads(num_threads)
+
+        # Get unique values from bucket
+        bucket_values = shared_array[bucket_data]
+        return find_unique_sorted(bucket_values, bucket_data)
+    finally:
+        # Clean up shared memory attachment
+        shm.close()
 
 
 @njit(parallel=True, cache=False, fastmath=True)
@@ -720,16 +673,6 @@ def trim_coverage_by_subject(
         flattened_coverage[end_idx - trim_length : end_idx] = 0
 
 
-from typing import Optional, Tuple, Union
-import numpy as np
-from numba import njit, prange
-import os
-from tqdm import tqdm
-import gc
-from concurrent.futures import ProcessPoolExecutor, as_completed
-import logging as log
-
-
 @njit(parallel=True)
 def parallel_unique_sort(arr: np.ndarray) -> np.ndarray:
     """Find unique values using parallel sorting."""
@@ -746,28 +689,6 @@ def process_chunk(chunk_data):
     """Process a single chunk using numpy operations."""
     chunk_sorted = np.sort(chunk_data)
     return chunk_sorted[np.concatenate(([True], chunk_sorted[1:] != chunk_sorted[:-1]))]
-
-
-@njit(parallel=True, cache=True)
-def create_inverse_chunk(chunk_data, unique_vals, output):
-    """Numba-accelerated chunk processing"""
-    # set number of threads
-
-    # Pre-sort unique_vals to enable binary search
-    for i in prange(len(chunk_data)):
-        # Binary search implementation
-        left, right = 0, len(unique_vals) - 1
-        target = chunk_data[i]
-
-        while left <= right:
-            mid = (left + right) // 2
-            if unique_vals[mid] == target:
-                output[i] = mid
-                break
-            elif unique_vals[mid] < target:
-                left = mid + 1
-            else:
-                right = mid - 1
 
 
 def memory_efficient_factorize(
@@ -806,7 +727,9 @@ def memory_efficient_factorize(
             future = executor.submit(process_chunk, subject_ids[chunk_start:chunk_end])
             futures.append(future)
 
-        with tqdm(total=len(futures), desc="Finding unique values", ncols=80) as pbar:
+        with tqdm.tqdm(
+            total=len(futures), desc="Finding unique values", ncols=80
+        ) as pbar:
             for future in as_completed(futures):
                 chunk_unique = future.result()
                 temp_unique[current_pos : current_pos + len(chunk_unique)] = (
@@ -842,7 +765,7 @@ def memory_efficient_factorize(
     all_unique.sort()  # In-place sort
 
     # Process inverse mapping with Numba acceleration
-    for chunk_start in tqdm(
+    for chunk_start in tqdm.tqdm(
         range(0, len(subject_ids), chunk_size),
         desc="Creating inverse indices",
         ncols=80,
@@ -855,7 +778,10 @@ def memory_efficient_factorize(
 
         # Process chunk using Numba
         create_inverse_chunk(
-            subject_ids[chunk_start:chunk_end], all_unique, chunk_output
+            subject_ids[chunk_start:chunk_end],
+            all_unique,
+            chunk_output,
+            num_threads,
         )
 
         # Write results back to memmap
@@ -930,3 +856,45 @@ def write_and_flush(mmap_array: np.memmap, data: np.ndarray) -> None:
                 os.close(fd)
         except (OSError, IOError) as e:
             log.warning(f"Failed to sync file {mmap_array.filename}: {e}")
+
+
+@njit(parallel=True, cache=False)  # Disable caching since it's causing warnings
+def create_inverse_chunk(chunk_data, unique_vals, output, num_threads=1):
+    """Numba-accelerated chunk processing with thread control"""
+    # Set number of threads for this function
+    set_num_threads(num_threads)
+
+    # Process in parallel with explicit thread control
+    chunk_size = (len(chunk_data) + num_threads - 1) // num_threads
+
+    for thread_id in prange(num_threads):
+        start_idx = thread_id * chunk_size
+        end_idx = min(start_idx + chunk_size, len(chunk_data))
+
+        for i in range(start_idx, end_idx):
+            # Binary search implementation
+            left, right = 0, len(unique_vals) - 1
+            target = chunk_data[i]
+
+            # Fast path for common case
+            if target >= unique_vals[right]:
+                output[i] = right
+                continue
+            elif target < unique_vals[0]:
+                output[i] = 0
+                continue
+
+            # Binary search for the value
+            while left <= right:
+                mid = (left + right) // 2
+                if unique_vals[mid] == target:
+                    output[i] = mid
+                    break
+                elif unique_vals[mid] < target:
+                    left = mid + 1
+                else:
+                    right = mid - 1
+
+            # If we exited without finding an exact match, use the closest value
+            if left > right:
+                output[i] = left if left < len(unique_vals) else right

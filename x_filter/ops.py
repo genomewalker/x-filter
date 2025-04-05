@@ -249,6 +249,7 @@ def setup_temporary_directory(
     temp_subdirectories = {
         "mmap": os.path.join(temp_dir_path, "mmap"),
         "db": os.path.join(temp_dir_path, "db"),
+        "tmp": os.path.join(temp_dir_path),
     }
 
     for path in temp_subdirectories.values():
@@ -500,7 +501,7 @@ def calculate_optimal_row_group_size(
 
     # Log the decision
     group_size_mb = (row_group_size * row_size) / (1024 * 1024)
-    log.info(
+    log.debug(
         f"""
         Row group size calculation:
         - Row size: {row_size} bytes
@@ -527,6 +528,7 @@ def export_to_parquet(
     temp_dir: Optional[str] = None,
     keep_db: bool = False,
     output_files: Optional[Dict[str, str]] = None,
+    table_name: str = "filtered_blast",
 ) -> str:
     """Export DuckDB table to optimized Parquet file with recommended row group sizes"""
 
@@ -562,7 +564,7 @@ def export_to_parquet(
 
     # Export query with optimized settings
     export_sql = f"""
-        COPY filtered_blast TO '{output_path}'
+        COPY {table_name} TO '{output_path}'
             (
                 FORMAT PARQUET,
                 ROW_GROUP_SIZE {chunk_size},
@@ -572,7 +574,7 @@ def export_to_parquet(
             )
     """
 
-    log.info(
+    log.debug(
         f"""
         Parquet export settings:
         - Row group size: {chunk_size:,} rows ({(chunk_size * sum(np.dtype(ci.numpy_type).itemsize for ci in columns_info.values())) / (1024*1024):.2f} MB)
@@ -823,7 +825,7 @@ def process_parquet_to_memmap(
     ]
 
     # Process in parallel
-    pbar = tqdm(total=total_rows, desc="Converting to memmap")
+    pbar = tqdm(total=total_rows, desc="Converting to memmap", leave=False, ncols=80)
 
     try:
         with ThreadPoolExecutor(max_workers=num_threads) as exe:

@@ -92,7 +92,7 @@ class MemoryTracker:
         final_mem = stats.rss
         mem_change = final_mem - initial_mem
 
-        log.info(
+        log.debug(
             f"Memory tracking for {name}:\n"
             f"  Execution time: {execution_time:.2f}s\n"
             f"  Initial memory: {initial_mem:.1f}MB\n"

@@ -15,9 +15,9 @@ from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor
 
 from x_filter.core_processing import (
     BucketManager,
-    # calculate_parallel_distribution,
-    # process_chunk_worker,
-    # find_bucket_unique_worker,
+    calculate_parallel_distribution,
+    process_chunk_worker,
+    find_bucket_unique_worker,
     memory_efficient_factorize,
     initialize_mmap_array,
 )
@@ -359,7 +359,6 @@ def chunked_initialize_weights(
                 chunk_scores = bitScore[start:end]
                 result[start:end] = chunk_scores / total_weights[chunk_indices]
                 pbar.update(end - start)
-        # for start in range(0, len(bitScore), chunk_size):
 
         return result
 
@@ -373,16 +372,34 @@ def chunked_initialize_weights(
 
 
 def validate_probabilities(
-    prob: np.ndarray, query_indices: np.ndarray, max_query: int
+    prob: np.ndarray, query_indices: np.ndarray, max_query: int, mmap_folder: str
 ) -> bool:
     """Validate probability array for numerical stability."""
     if np.any(prob < 0):
         return False
 
-    prob_sum = np.zeros(max_query + 1, dtype=np.float64)
-    np.add.at(prob_sum, query_indices, prob)
+    # Use memmap for large temporary array
+    prob_sum_file = os.path.join(mmap_folder, "prob_sum_temp.mmap")
+    try:
+        prob_sum = np.memmap(
+            prob_sum_file, dtype=np.float64, mode="w+", shape=(max_query + 1,)
+        )
+        prob_sum.fill(0)
 
-    return not np.any(prob_sum == 0)
+        # Process in chunks to reduce memory usage
+        chunk_size = 1_000_000
+        for i in range(0, len(query_indices), chunk_size):
+            chunk_end = min(i + chunk_size, len(query_indices))
+            np.add.at(prob_sum, query_indices[i:chunk_end], prob[i:chunk_end])
+
+        result = not np.any(prob_sum == 0)
+        return result
+    finally:
+        try:
+            if os.path.exists(prob_sum_file):
+                os.unlink(prob_sum_file)
+        except OSError:
+            pass
 
 
 def chunked_fixed_point_map(
@@ -450,11 +467,10 @@ def chunked_squarem_step(
     step_min: float = -1.0,
     step_max: float = -1.0,
     mstep: int = 4,
-    resource_manager: Optional[
-        ResourceManager
-    ] = None,  # Make resource_manager last optional parameter
+    resource_manager: Optional[ResourceManager] = None,
 ) -> np.ndarray:
     """SQUAREM implementation using chunked processing."""
+    # First fixed point evaluation
     q = chunked_fixed_point_map(
         prob,
         mask,
@@ -464,23 +480,37 @@ def chunked_squarem_step(
         mmap_folder,
         resource_manager,
     )
+
+    # First difference
     r = q - prob
     sr2 = (r**2).sum()
 
+    # Check early convergence
     if sr2 < 1e-10:
         return q
 
+    # Second fixed point evaluation
     q2 = chunked_fixed_point_map(
         q, mask, slen, query_inverse_indices, max_query, mmap_folder, resource_manager
     )
+
+    # Second difference
     r2 = q2 - q
     v = r2 - r
     sv2 = (v**2).sum()
     srv = (r * v).sum()
 
+    # Check stability
     if sv2 < 1e-10:
         return q2
 
+    # Calculate step length with bounds
+    if step_min < 0:
+        step_min = 0.001
+    if step_max < step_min:
+        step_max = 1.0
+
+    # SQUAREM step length
     alpha = np.sqrt(sr2 / sv2)
     alpha = np.clip(alpha, step_min, step_max)
 
@@ -488,10 +518,15 @@ def chunked_squarem_step(
 
     try:
         p_new = np.memmap(p_new_file, dtype=np.float64, mode="w+", shape=prob.shape)
-        p_new[:] = prob + 2 * alpha * r + alpha**2 * v
 
-        if validate_probabilities(p_new[mask], query_inverse_indices[mask], max_query):
-            return chunked_fixed_point_map(
+        # SQUAREM update
+        p_new[:] = prob + 2 * alpha * r + alpha * alpha * v
+
+        # Validate and try step halving if needed
+        if validate_probabilities(
+            p_new[mask], query_inverse_indices[mask], max_query, mmap_folder
+        ):
+            result = chunked_fixed_point_map(
                 p_new,
                 mask,
                 slen,
@@ -500,14 +535,21 @@ def chunked_squarem_step(
                 mmap_folder,
                 resource_manager,
             )
+            # Additional validation of result
+            if validate_probabilities(
+                result[mask], query_inverse_indices[mask], max_query, mmap_folder
+            ):
+                return result
 
+        # Step halving if initial step fails
         for m in range(mstep):
             alpha = alpha / 2
-            p_new[:] = prob + 2 * alpha * r + alpha**2 * v
+            p_new[:] = prob + 2 * alpha * r + alpha * alpha * v
+
             if validate_probabilities(
-                p_new[mask], query_inverse_indices[mask], max_query
+                p_new[mask], query_inverse_indices[mask], max_query, mmap_folder
             ):
-                return chunked_fixed_point_map(
+                result = chunked_fixed_point_map(
                     p_new,
                     mask,
                     slen,
@@ -516,7 +558,12 @@ def chunked_squarem_step(
                     mmap_folder,
                     resource_manager,
                 )
+                if validate_probabilities(
+                    result[mask], query_inverse_indices[mask], max_query, mmap_folder
+                ):
+                    return result
 
+        # If all steps fail, return last valid iteration
         return q2
 
     finally:
@@ -539,12 +586,16 @@ def resolve_multimaps_return_indices(
     step_max: float = -1.0,
     mstep: int = 4,
     scale: float = 0.9,
-    resource_manager: Optional[
-        ResourceManager
-    ] = None,  # Add resource_manager parameter
+    resource_manager: Optional[ResourceManager] = None,
 ) -> np.ndarray:
     """Resolve multimapped reads using chunked processing."""
-    mask = np.ones(subject_inverse_indices.shape, dtype=bool)
+    # Create memory-mapped mask array instead of in-memory
+    mask_file = os.path.join(mmap_folder, "mask.dat")
+    mask = np.memmap(
+        mask_file, dtype=np.bool_, mode="w+", shape=subject_inverse_indices.shape
+    )
+    mask.fill(1)  # Initialize all to True
+
     total_reads = len(np.unique(query_inverse_indices))
     max_query = query_inverse_indices.max()
     current_iter = 0
@@ -555,7 +606,14 @@ def resolve_multimaps_return_indices(
         if iters > 0
         else "Resolving multimaps until convergence"
     )
-    log.info(f"Initial alignments: {mask.sum():,}")
+
+    # Calculate initial alignments using chunked processing
+    chunk_size = min(100_000_000, len(mask))
+    total_alignments = 0
+    for start in range(0, len(mask), chunk_size):
+        end = min(start + chunk_size, len(mask))
+        total_alignments += np.sum(mask[start:end])
+    log.info(f"Initial alignments: {total_alignments:,}")
 
     prob_working_file = os.path.join(mmap_folder, "prob_working.mmap")
     prob_working = np.memmap(
@@ -565,7 +623,12 @@ def resolve_multimaps_return_indices(
 
     try:
         while iters == 0 or current_iter < iters:
-            n_alns = mask.sum()
+            # Count alignments in chunks
+            n_alns = 0
+            for start in range(0, len(mask), chunk_size):
+                end = min(start + chunk_size, len(mask))
+                n_alns += np.sum(mask[start:end])
+
             if n_alns == prev_num_alignments:
                 log.info("Convergence reached - no more alignments removed")
                 break
@@ -584,37 +647,85 @@ def resolve_multimaps_return_indices(
                     step_min,
                     step_max,
                     mstep,
-                    resource_manager=resource_manager,  # Pass resource_manager
+                    resource_manager=resource_manager,
                 )
                 pbar.update(1)
 
-                # Calculate alignments per read
-                n_aln = np.zeros(max_query + 1, dtype=np.int64)
-                np.add.at(n_aln, query_inverse_indices[mask], 1)
-                n_aln_per_read = n_aln[query_inverse_indices]
-                pbar.update(1)
+                # Use memmap for large temporary arrays
+                n_aln_file = os.path.join(
+                    mmap_folder, f"n_aln_temp_{current_iter}.mmap"
+                )
+                max_prob_file = os.path.join(
+                    mmap_folder, f"max_prob_temp_{current_iter}.mmap"
+                )
 
-                # Rest of the implementation remains the same
-                unique_mask = n_aln_per_read == 1
-                non_unique_mask = n_aln_per_read > 1
-                unique_mask &= mask
-                non_unique_mask &= mask
+                try:
+                    n_aln = np.memmap(
+                        n_aln_file, dtype=np.int64, mode="w+", shape=(max_query + 1,)
+                    )
+                    n_aln.fill(0)
 
-                if unique_mask.all():
-                    log.info("All reads uniquely mapped - stopping early")
-                    break
+                    # Process in chunks
+                    chunk_size = min(100_000_000, len(mask))
+                    for start in range(0, len(mask), chunk_size):
+                        end = min(start + chunk_size, len(mask))
+                        chunk_mask = mask[start:end]
+                        if not np.any(chunk_mask):
+                            continue
+                        chunk_queries = query_inverse_indices[start:end][chunk_mask]
+                        np.add.at(n_aln, chunk_queries, 1)
 
-                max_prob = np.zeros(max_query + 1, dtype=np.float64)
-                np.maximum.at(max_prob, query_inverse_indices[mask], prob_working[mask])
-                max_prob_scaled = max_prob[query_inverse_indices] * scale
-                pbar.update(1)
+                    n_aln_per_read = n_aln[query_inverse_indices]
+                    pbar.update(1)
 
-                final_mask = (prob_working >= max_prob_scaled) & non_unique_mask
-                pbar.update(1)
+                    unique_mask = n_aln_per_read == 1
+                    non_unique_mask = n_aln_per_read > 1
+                    unique_mask &= mask
+                    non_unique_mask &= mask
 
-                iter_array[final_mask] = current_iter + 1
-                mask &= unique_mask | final_mask
-                pbar.update(1)
+                    if unique_mask.all():
+                        log.info("All reads uniquely mapped - stopping early")
+                        break
+
+                    max_prob = np.memmap(
+                        max_prob_file,
+                        dtype=np.float64,
+                        mode="w+",
+                        shape=(max_query + 1,),
+                    )
+                    max_prob.fill(0)
+
+                    # Process in chunks
+                    for start in range(0, len(mask), chunk_size):
+                        end = min(start + chunk_size, len(mask))
+                        chunk_mask = mask[start:end]
+                        if not np.any(chunk_mask):
+                            continue
+                        chunk_queries = query_inverse_indices[start:end][chunk_mask]
+                        chunk_probs = prob_working[start:end][chunk_mask]
+                        np.maximum.at(max_prob, chunk_queries, chunk_probs)
+
+                    if scale == 0:
+                        max_prob_scaled = max_prob[query_inverse_indices]
+                    else:
+                        max_prob_scaled = max_prob[query_inverse_indices] * scale
+                    pbar.update(1)
+
+                    final_mask = (prob_working >= max_prob_scaled) & non_unique_mask
+                    pbar.update(1)
+
+                    iter_array[final_mask] = current_iter + 1
+                    mask &= unique_mask | final_mask
+                    pbar.update(1)
+
+                finally:
+                    # Cleanup temporary files
+                    for temp_file in [n_aln_file, max_prob_file]:
+                        try:
+                            if os.path.exists(temp_file):
+                                os.unlink(temp_file)
+                        except OSError:
+                            pass
 
             global_uniques = unique_mask.sum()
             reads_to_process = total_reads - global_uniques
@@ -632,12 +743,20 @@ def resolve_multimaps_return_indices(
         if iters > 0 and current_iter == iters:
             log.info(f"Reached maximum iterations ({iters})")
 
-        return mask.copy()
+        final_mask = np.zeros(len(mask), dtype=np.bool_)
+        for start in range(0, len(mask), chunk_size):
+            end = min(start + chunk_size, len(mask))
+            final_mask[start:end] = mask[start:end]
+
+        return final_mask
 
     finally:
         try:
-            if os.path.exists(prob_working_file):
-                os.unlink(prob_working_file)
+            os.unlink(mask_file)
+        except OSError:
+            pass
+        try:
+            os.unlink(prob_working_file)
         except OSError:
             pass
 
@@ -821,14 +940,6 @@ def reassign(
 
     mmap_folder = tmp_files["mmap"]
 
-    # Process unique values and get inverse indices
-    # unique_subjects, subject_inverse_indices = bucket_process_unique_values(
-    #     np_arrays["subject_numeric_id"], mmap_folder, "subject", resource_manager
-    # )
-
-    # unique_queries, query_inverse_indices = bucket_process_unique_values(
-    #     np_arrays["query_numeric_id"], mmap_folder, "query", resource_manager
-    # )
     log.info("Creating inverse subject mapping")
     subject_inverse_indices = initialize_mmap_array(
         total_positions=len(np_arrays["subject_numeric_id"]),
@@ -895,7 +1006,7 @@ def reassign(
                 step_min=step_min,
                 step_max=step_max,
                 mstep=mstep,
-                resource_manager=resource_manager,  # Pass resource_manager
+                resource_manager=resource_manager,
             )
 
             return pd.DataFrame(
