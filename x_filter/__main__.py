@@ -194,7 +194,8 @@ def efficient_filter_arrays(
 
     # Create temporary chunk files
     chunk_files = []
-    match_counts = [0] * total_chunks
+    match_counts = [np.int64(0)] * total_chunks  # Use np.int64 for match counts
+    current_pos = np.int64(0)  # Explicitly use 64-bit integer
 
     def filter_and_write_chunk(chunk_idx):
         start = chunk_idx * chunk_size
@@ -290,7 +291,7 @@ def efficient_filter_arrays(
                 )
 
         # Process chunks to build filtered arrays
-        current_pos = 0
+        current_pos = np.int64(0)  # Explicitly use 64-bit integer
         chunk_size = min(chunk_size, 10_000_000)  # Smaller chunks for memory efficiency
 
         def build_filtered_chunk(chunk_idx):
@@ -301,12 +302,12 @@ def efficient_filter_arrays(
             # Get chunk and find matches
             chunk_subjects = numpy_arrays["subject_numeric_id"][start:end]
             mask = np.isin(chunk_subjects, target_subjects)
-            chunk_matches = np.sum(mask)
+            chunk_matches = np.int64(np.sum(mask))  # Explicitly use 64-bit integer
 
             if chunk_matches > 0:
                 # Use atomic operation for thread safety
                 with executor._shutdown_lock:
-                    pos = current_pos
+                    pos = np.int64(current_pos)  # Explicitly use 64-bit integer
                     current_pos += chunk_matches
 
                 # Copy filtered data to memory-mapped arrays
@@ -320,11 +321,11 @@ def efficient_filter_arrays(
                     arr.flush()
 
                 return chunk_matches
-            return 0
+            return np.int64(0)  # Return 64-bit zero
 
         # Reset match counts for better tracking
-        match_counts = [0] * total_chunks
-        current_pos = 0
+        match_counts = [np.int64(0)] * total_chunks  # Use np.int64 for match counts
+        current_pos = np.int64(0)
 
         # Process chunks in parallel
         with ThreadPoolExecutor(max_workers=num_threads) as executor:
@@ -340,7 +341,7 @@ def efficient_filter_arrays(
                     pbar.update(1)
 
         # Verify we got the expected number of matches
-        actual_matches = sum(match_counts)
+        actual_matches = np.int64(sum(match_counts))  # Explicitly use 64-bit sum
         if actual_matches != total_matches:
             log.warning(f"Expected {total_matches} matches but got {actual_matches}")
             # Resize memory-mapped arrays
