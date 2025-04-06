@@ -214,7 +214,7 @@ def efficient_filter_arrays(
     def filter_and_write_chunk(chunk_idx):
         start = chunk_idx * chunk_size
         end = min(start + chunk_size, len(numpy_arrays["subject_numeric_id"]))
-
+        
         # Get chunk and find matches
         chunk_subjects = numpy_arrays["subject_numeric_id"][start:end]
         mask = np.isin(chunk_subjects, target_subjects)
@@ -223,7 +223,7 @@ def efficient_filter_arrays(
         if chunk_matches > 0:
             # Use proper lock for thread safety
             with position_lock:
-                pos = current_pos  # Get current position
+                nonlocal current_pos  # Explicitly state we're using the outer current_pos
                 current_pos += chunk_matches  # Update position atomically
 
             accumulated_matches[chunk_idx] = chunk_matches  # Store for debugging
