@@ -336,7 +336,7 @@ def efficient_filter_arrays(
                     current_pos += chunk_matches  # Update position atomically
                     
                 # Log more debug info for very large chunks
-                if chunk_matches > 10_000_000:
+                if chunk_matches > max_chunk_size:
                     log.debug(f"Chunk {chunk_idx}: Processing {chunk_matches:,} matches at position {pos:,}")
 
                 # Copy filtered data to memory-mapped arrays
@@ -357,7 +357,7 @@ def efficient_filter_arrays(
         current_pos = np.int64(0)  # Reset position counter
 
         # Process chunks in parallel with fewer workers for big data
-        max_workers = min(num_threads, 8) if total_matches > 10_000_000_000 else num_threads
+        max_workers = max(num_threads, 8) if total_matches > 100_000_000_000 else num_threads
         log.info(f"Using {max_workers} parallel workers for building filtered arrays")
         
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
@@ -1131,7 +1131,7 @@ def main() -> None:
             numpy_arrays, 
             tmp_files, 
             args,
-            max_chunk_size=10_000_000,  # Can be adjusted based on dataset size and memory
+            max_chunk_size=100_000_000,  # Can be adjusted based on dataset size and memory
         )
         if filtered_ids_path is None:
             log.warning("No matching IDs found. Exiting.")
