@@ -597,11 +597,7 @@ def chunked_squarem_step(
         if q2 is None:
             log.error("Second fixed point calculation returned None")
             return q
-        
-        # Free memory
-        del q
-        gc.collect()
-        
+                
         # Re-open r for reading only to save memory
         r = np.memmap(r_file, dtype=np.float64, mode="r", shape=prob.shape)
         
@@ -667,25 +663,38 @@ def chunked_squarem_step(
         alpha = np.clip(alpha, step_min, step_max)
         log.info(f"SQUAREM step length: alpha = {alpha:.6f}")
         
-        # Free memory before creating p_new
-        del r
-        gc.collect()
-        
-        # Create and calculate p_new in chunks
+        # Calculate p_new more efficiently using streaming updates
         log.info("Computing accelerated point")
-        # First ensure v is read-only to save memory
+        
+        # Use read-only memmaps for input arrays
         v = np.memmap(v_file, dtype=np.float64, mode="r", shape=prob.shape)
         r = np.memmap(r_file, dtype=np.float64, mode="r", shape=prob.shape)
-        
         p_new = np.memmap(p_new_file, dtype=np.float64, mode="w+", shape=prob.shape)
-        for start in range(0, len(prob), chunk_size):
-            end = min(start + chunk_size, len(prob))
-            p_new[start:end] = prob[start:end] + 2 * alpha * r[start:end] + alpha * alpha * v[start:end]
-            if start % (chunk_size * 5) == 0:
-                p_new.flush()
-                gc.collect()
         
-        # Free memory before validation
+        # Use larger chunks with less frequent garbage collection
+        mega_chunk = chunk_size * 50  # Process 50x more data per iteration
+        
+        # Pre-calculate coefficients
+        alpha2 = alpha * alpha
+        two_alpha = 2 * alpha
+        
+        # Process in mega-chunks with minimal GC
+        for start in range(0, len(prob), mega_chunk):
+            end = min(start + mega_chunk, len(prob))
+            
+            # Process sub-chunks within each mega-chunk
+            for sub_start in range(start, end, chunk_size):
+                sub_end = min(sub_start + chunk_size, end)
+                # Vectorized operation without temporary arrays
+                p_new[sub_start:sub_end] = (prob[sub_start:sub_end] + 
+                                          two_alpha * r[sub_start:sub_end] + 
+                                          alpha2 * v[sub_start:sub_end])
+            
+            # Flush only after each mega-chunk
+            if start % (mega_chunk * 2) == 0:
+                p_new.flush()
+                
+        # Single cleanup after all processing
         del r, v
         gc.collect()
         
