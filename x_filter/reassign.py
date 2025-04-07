@@ -522,14 +522,24 @@ def chunked_squarem_step(
     available_mem_gb = resource_manager.available_memory / (1024**3)
     log.info(f"Available memory before SQUAREM: {available_mem_gb:.2f} GB")
     
-    # First fixed point evaluation
-    log.info("Computing first fixed point map")
-    q = chunked_fixed_point_map(
-        prob, mask, slen, query_inverse_indices, max_query, mmap_folder, resource_manager
-    )
+    # First fixed point evaluation - initialize q to default value
+    q = None  # Initialize q to ensure it's in scope
+    try:
+        log.info("Computing first fixed point map")
+        q = chunked_fixed_point_map(
+            prob, mask, slen, query_inverse_indices, max_query, mmap_folder, resource_manager
+        )
+        
+        # Force cleanup
+        gc.collect()
+    except Exception as e:
+        log.error(f"Failed to compute first fixed point map: {str(e)}")
+        # If fixed point calculation fails, return the original probabilities
+        return prob
     
-    # Force cleanup
-    gc.collect()
+    if q is None:
+        log.error("First fixed point calculation returned None")
+        return prob
     
     # Process each step with careful memory management
     r_file = os.path.join(mmap_folder, "r_temp.mmap")
@@ -574,9 +584,19 @@ def chunked_squarem_step(
         del r  # Delete to free memory
         gc.collect()
         
-        q2 = chunked_fixed_point_map(
-            q, mask, slen, query_inverse_indices, max_query, mmap_folder, resource_manager
-        )
+        # Initialize q2 to a default value
+        q2 = None
+        try:
+            q2 = chunked_fixed_point_map(
+                q, mask, slen, query_inverse_indices, max_query, mmap_folder, resource_manager
+            )
+        except Exception as e:
+            log.error(f"Failed to compute second fixed point map: {str(e)}")
+            return q  # Return the first iteration result if second fails
+            
+        if q2 is None:
+            log.error("Second fixed point calculation returned None")
+            return q
         
         # Free memory
         del q
@@ -604,7 +624,7 @@ def chunked_squarem_step(
             if start % (chunk_size * 5) == 0:
                 v.flush()
                 gc.collect()
-        
+
         # Free memory
         del r2
         gc.collect()
@@ -800,9 +820,11 @@ def chunked_squarem_step(
 
     except Exception as e:
         log.error(f"Error in SQUAREM step: {str(e)}")
-        # In case of error, try to return q2 if available, otherwise return prob
-        if 'q2' in locals():
+        # In case of error, try to return q2 if available, otherwise return q if available, finally return prob
+        if 'q2' in locals() and q2 is not None:
             return q2
+        elif q is not None:
+            return q
         return prob
     
     finally:
