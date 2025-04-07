@@ -429,9 +429,62 @@ def chunked_fixed_point_map(
     mmap_folder: str,
     resource_manager: ResourceManager,
 ) -> np.memmap:
-    """Fixed point map implementation using chunked processing."""
-    # Implementation details omitted for brevity
-    pass
+    """Process fixed point mapping using chunked processing."""
+    # Get chunking strategy from resource manager
+    arr_info = resource_manager.analyze_array(input_prob)
+    strategy = resource_manager.calculate_chunk_size(arr_info)
+    chunk_size = strategy.chunk_size
+
+    new_prob_file = os.path.join(mmap_folder, "new_prob_temp.mmap")
+    prob_sum_file = os.path.join(mmap_folder, "prob_sum_temp.mmap")
+
+    try:
+        new_prob = np.memmap(
+            new_prob_file, dtype=np.float64, mode="w+", shape=input_prob.shape
+        )
+        new_prob[:] = input_prob[:]
+
+        # Copy masked elements for safe manipulation
+        masked_prob = input_prob[mask].copy()
+        masked_slen = slen[mask].copy()
+        masked_slen[masked_slen == 0] = np.finfo(np.float64).tiny
+
+        # Calculate s_w and update
+        s_w = masked_prob / masked_slen
+        new_prob[mask] = masked_prob * s_w
+
+        # Create prob_sum as memory-mapped array
+        prob_sum = np.memmap(
+            prob_sum_file, dtype=np.float64, mode="w+", shape=(max_query + 1,)
+        )
+        prob_sum.fill(0)
+
+        # Accumulate probabilities in chunks
+        for start in range(0, len(mask), chunk_size):
+            end = min(start + chunk_size, len(mask))
+            chunk_mask = mask[start:end]
+            if not np.any(chunk_mask):
+                continue
+            chunk_queries = query_inverse_indices[start:end][chunk_mask]
+            chunk_probs = new_prob[start:end][chunk_mask]
+            np.add.at(prob_sum, chunk_queries, chunk_probs)
+
+        # Normalize probabilities
+        mask_sum = prob_sum[query_inverse_indices[mask]]
+        mask_sum[mask_sum == 0] = np.finfo(np.float64).tiny
+        new_prob[mask] = new_prob[mask] / mask_sum
+
+        return new_prob
+
+    finally:
+        # Clean up temporary files
+        try:
+            if os.path.exists(new_prob_file):
+                os.unlink(new_prob_file)
+            if os.path.exists(prob_sum_file):
+                os.unlink(prob_sum_file)
+        except OSError:
+            pass
 
 
 def chunked_squarem_step(
