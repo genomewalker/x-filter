@@ -479,20 +479,46 @@ def validate_probabilities(
 
 
 def check_memory_requirements(prob_size_bytes: int, resource_manager: ResourceManager) -> bool:
-    """Check if there's enough memory to run the SQUAREM algorithm safely."""
-    # We need at least 5x the prob array size (for prob, q, r, v, p_new)
-    required_mem = prob_size_bytes * 5
+    """
+    Check if there's enough memory to run the SQUAREM algorithm safely,
+    taking into account our chunking strategy.
+    """
+    # Calculate max chunk size based on array size and dtype
+    array_size = prob_size_bytes // 8  # Assuming float64 (8 bytes)
+    dtype_size = 8  # float64
+    
+    # Get the optimal chunk size we would use
+    chunk_size = calculate_optimal_chunk_size(
+        array_size=array_size,
+        dtype_size=dtype_size,
+        available_memory=resource_manager.available_memory
+    )
+    
+    # Calculate memory needed for a single chunk processing
+    # We need memory for several arrays: q, r, r2, v, p_new chunks plus overhead
+    chunk_bytes = chunk_size * dtype_size
+    required_mem_per_chunk = chunk_bytes * 5  # 5 arrays in memory
+    
+    # Add memory for other operations and Python overhead
+    overhead_factor = 1.5
+    total_required = required_mem_per_chunk * overhead_factor
+    
     available_mem = resource_manager.available_memory
+    safe_ratio = available_mem / total_required
     
-    safe_ratio = available_mem / required_mem
+    log.info(f"Memory check for chunked processing:")
+    log.info(f"  - Chunk size: {chunk_size:,} elements ({chunk_bytes/(1024*1024):.2f} MB)")
+    log.info(f"  - Required per chunk: {required_mem_per_chunk/(1024*1024*1024):.2f} GB")
+    log.info(f"  - Available memory: {available_mem/(1024*1024*1024):.2f} GB")
+    log.info(f"  - Safety ratio: {safe_ratio:.2f}")
     
-    log.info(f"Memory check: Required={required_mem/(1024**3):.2f}GB, "
-             f"Available={available_mem/(1024**3):.2f}GB, Safety ratio={safe_ratio:.2f}")
-    
+    # We want at least 20% headroom
     if safe_ratio < 1.2:
-        log.warning(f"Available memory ({available_mem/(1024**3):.2f}GB) may be insufficient "
-                   f"for SQUAREM algorithm. Need ~{required_mem/(1024**3):.2f}GB plus overhead.")
+        log.warning(f"Available memory ({available_mem/(1024**3):.2f} GB) may be insufficient "
+                   f"for SQUAREM algorithm with current chunk size.")
+        log.warning(f"Consider reducing chunk size further or increasing available memory.")
         return False
+    
     return True
 
 
