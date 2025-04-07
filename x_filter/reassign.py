@@ -328,6 +328,52 @@ def compute_dot_product(arr1: np.ndarray, arr2: np.ndarray) -> float:
     return result
 
 
+def calculate_optimal_chunk_size(array_size: int, dtype_size: int, available_memory: int, 
+                                overhead_factor: float = 0.7) -> int:
+    """
+    Calculate optimal chunk size based on array size and available memory.
+    
+    Args:
+        array_size: Total number of elements in array
+        dtype_size: Size of each element in bytes
+        available_memory: Available memory in bytes
+        overhead_factor: Factor to account for Python overhead (0.0-1.0)
+        
+    Returns:
+        Optimal chunk size (number of elements)
+    """
+    # Calculate how much memory we can use (accounting for overhead)
+    usable_memory = int(available_memory * overhead_factor)
+    
+    # For very large arrays (billions of elements), we want fewer, larger chunks
+    # to reduce overhead of chunk processing
+    if array_size > 1_000_000_000:  # More than 1 billion elements
+        # Target fewer chunks for very large arrays
+        target_chunks = 100 if array_size > 10_000_000_000 else 500
+        
+        # Calculate base chunk size from array size
+        base_chunk_size = max(array_size // target_chunks, 1_000_000)
+        
+        # But ensure it fits in memory
+        memory_based_chunk_size = usable_memory // dtype_size
+        
+        # Use the smaller of the two
+        chunk_size = min(base_chunk_size, memory_based_chunk_size)
+    else:
+        # For smaller arrays, calculate based on memory and ensure reasonable minimum
+        chunk_size = max(usable_memory // dtype_size, 1_000_000)
+        
+    # Ensure we don't exceed array size
+    chunk_size = min(chunk_size, array_size)
+    
+    # Log the calculation
+    chunk_size_mb = (chunk_size * dtype_size) / (1024 * 1024)
+    log.info(f"Calculated optimal chunk size: {chunk_size:,} elements "
+             f"({chunk_size_mb:.2f} MB) for {array_size:,} total elements")
+    
+    return chunk_size
+
+
 def chunked_initialize_weights(
     subject_inverse_indices: np.memmap,
     bitScore: np.memmap,
@@ -535,19 +581,21 @@ def chunked_squarem_step(
     array_size_gb = prob.nbytes / (1024**3)
     log.info(f"SQUAREM processing array of size: {array_size_gb:.2f} GB")
     
-    # Use more conservative chunking for very large arrays
-    arr_info = resource_manager.analyze_array(prob)
+    # Calculate optimal chunk size based on array size and available memory
+    chunk_size = calculate_optimal_chunk_size(
+        array_size=len(prob),
+        dtype_size=prob.dtype.itemsize,
+        available_memory=resource_manager.available_memory
+    )
     
-    # Use larger chunks for better I/O performance when possible
-    chunk_size = min(5_000_000, len(prob) // 100)  
-    
-    # For very large arrays (>1B elements), adjust chunk size
-    if len(prob) > 1_000_000_000:
-        chunk_size = min(chunk_size, 500_000)
-        log.info(f"Using reduced chunk size for large array: {chunk_size:,}")
-    
-    # Use mega-chunks for bulk operations
-    mega_chunk = chunk_size * 20  # Process 20x more data per I/O operation
+    # Use mega-chunks for bulk operations - adjust based on array size
+    if len(prob) > 10_000_000_000:  # > 10 billion elements
+        mega_chunk_factor = 5  # Less aggressive for extremely large arrays
+    else:
+        mega_chunk_factor = 20  # More aggressive for smaller arrays
+        
+    mega_chunk = chunk_size * mega_chunk_factor
+    log.info(f"Using chunk size: {chunk_size:,}, mega chunk: {mega_chunk:,}")
     
     # Track and log memory usage
     available_mem_gb = resource_manager.available_memory / (1024**3)
