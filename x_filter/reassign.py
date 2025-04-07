@@ -300,6 +300,34 @@ def parallel_accumulate_weights(
                 output[j] += local_outputs[i, j]
 
 
+@njit
+def compute_p_new(prob_chunk: np.ndarray, r_chunk: np.ndarray, v_chunk: np.ndarray, 
+                  two_alpha: float, alpha2: float) -> np.ndarray:
+    """JIT-compiled function to compute p_new efficiently."""
+    result = np.empty_like(prob_chunk)
+    for i in range(len(prob_chunk)):
+        result[i] = prob_chunk[i] + two_alpha * r_chunk[i] + alpha2 * v_chunk[i]
+    return result
+
+
+@njit
+def compute_squared_sum(arr: np.ndarray) -> float:
+    """JIT-compiled efficient sum of squares without temporary arrays."""
+    result = 0.0
+    for i in range(len(arr)):
+        result += arr[i] * arr[i]
+    return result
+
+
+@njit
+def compute_dot_product(arr1: np.ndarray, arr2: np.ndarray) -> float:
+    """JIT-compiled efficient dot product without temporary arrays."""
+    result = 0.0
+    for i in range(len(arr1)):
+        result += arr1[i] * arr2[i]
+    return result
+
+
 def chunked_initialize_weights(
     subject_inverse_indices: np.memmap,
     bitScore: np.memmap,
@@ -510,13 +538,16 @@ def chunked_squarem_step(
     # Use more conservative chunking for very large arrays
     arr_info = resource_manager.analyze_array(prob)
     
-    # Set chunk size based on array size and available memory
-    chunk_size = min(1_000_000, len(prob) // 1000)  # Start with a conservative value
+    # Use larger chunks for better I/O performance when possible
+    chunk_size = min(5_000_000, len(prob) // 100)  
     
-    # For very large arrays (>1B elements), use even smaller chunks
+    # For very large arrays (>1B elements), adjust chunk size
     if len(prob) > 1_000_000_000:
         chunk_size = min(chunk_size, 500_000)
         log.info(f"Using reduced chunk size for large array: {chunk_size:,}")
+    
+    # Use mega-chunks for bulk operations
+    mega_chunk = chunk_size * 20  # Process 20x more data per I/O operation
     
     # Track and log memory usage
     available_mem_gb = resource_manager.available_memory / (1024**3)
@@ -529,12 +560,8 @@ def chunked_squarem_step(
         q = chunked_fixed_point_map(
             prob, mask, slen, query_inverse_indices, max_query, mmap_folder, resource_manager
         )
-        
-        # Force cleanup
-        gc.collect()
     except Exception as e:
         log.error(f"Failed to compute first fixed point map: {str(e)}")
-        # If fixed point calculation fails, return the original probabilities
         return prob
     
     if q is None:
@@ -553,26 +580,19 @@ def chunked_squarem_step(
         log.info("Computing first difference vector r")
         r = np.memmap(r_file, dtype=np.float64, mode="w+", shape=prob.shape)
         
-        # Process in small chunks with periodic flush
-        for start in range(0, len(prob), chunk_size):
-            end = min(start + chunk_size, len(prob))
+        # Process in mega-chunks for better I/O performance
+        for start in range(0, len(prob), mega_chunk):
+            end = min(start + mega_chunk, len(prob))
             r[start:end] = q[start:end] - prob[start:end]
-            # Flush to disk more aggressively
-            if start % (chunk_size * 5) == 0:
+            # Flush to disk less frequently
+            if start % (mega_chunk * 2) == 0:
                 r.flush()
         
-        # Calculate sr2 in small chunks
+        # Calculate sr2 using JIT-compiled function in mega-chunks
         sr2 = 0.0
-        for start in range(0, len(r), chunk_size):
-            end = min(start + chunk_size, len(r))
-            # Use smaller sub-chunks to avoid large temporary arrays
-            sub_chunk = min(chunk_size, 100_000)
-            for sub_start in range(start, end, sub_chunk):
-                sub_end = min(sub_start + sub_chunk, end)
-                sr2 += np.sum(r[sub_start:sub_end] ** 2)
-                # Free memory more aggressively
-                if sub_start % (sub_chunk * 5) == 0:
-                    gc.collect()
+        for start in range(0, len(r), mega_chunk):
+            end = min(start + mega_chunk, len(r))
+            sr2 += compute_squared_sum(r[start:end])
         
         # Early convergence check
         if sr2 < 1e-10:
@@ -581,18 +601,9 @@ def chunked_squarem_step(
 
         # Second fixed point evaluation
         log.info("Computing second fixed point map")
-        del r  # Delete to free memory
-        gc.collect()
-        
-        # Initialize q2 to a default value
-        q2 = None
-        try:
-            q2 = chunked_fixed_point_map(
-                q, mask, slen, query_inverse_indices, max_query, mmap_folder, resource_manager
-            )
-        except Exception as e:
-            log.error(f"Failed to compute second fixed point map: {str(e)}")
-            return q  # Return the first iteration result if second fails
+        q2 = chunked_fixed_point_map(
+            q, mask, slen, query_inverse_indices, max_query, mmap_folder, resource_manager
+        )
             
         if q2 is None:
             log.error("Second fixed point calculation returned None")
@@ -601,56 +612,39 @@ def chunked_squarem_step(
         # Re-open r for reading only to save memory
         r = np.memmap(r_file, dtype=np.float64, mode="r", shape=prob.shape)
         
-        # Calculate r2 = q2 - q in chunks
-        log.info("Computing second difference vector r2")
+        # Calculate r2 = q2 - q and v = r2 - r in a single mega-chunk pass
+        log.info("Computing difference vectors")
         r2 = np.memmap(r2_file, dtype=np.float64, mode="w+", shape=prob.shape)
-        for start in range(0, len(prob), chunk_size):
-            end = min(start + chunk_size, len(prob))
-            r2[start:end] = q2[start:end] - q[start:end]
-            if start % (chunk_size * 5) == 0:
-                r2.flush()
-                gc.collect()
-        
-        # Calculate v = r2 - r in chunks
-        log.info("Computing acceleration vector v")
         v = np.memmap(v_file, dtype=np.float64, mode="w+", shape=prob.shape)
-        for start in range(0, len(prob), chunk_size):
-            end = min(start + chunk_size, len(prob))
-            v[start:end] = r2[start:end] - r[start:end]
-            if start % (chunk_size * 5) == 0:
+        
+        for start in range(0, len(prob), mega_chunk):
+            end = min(start + mega_chunk, len(prob))
+            # Calculate both in one pass to reduce memory operations
+            r2_chunk = q2[start:end] - q[start:end]
+            r2[start:end] = r2_chunk
+            v[start:end] = r2_chunk - r[start:end]
+            
+            if start % (mega_chunk * 2) == 0:
+                r2.flush()
                 v.flush()
-                gc.collect()
 
         # Free memory
-        del r2
-        gc.collect()
+        del r2_chunk
         
-        # Calculate sv2 and srv in small chunks
+        # Calculate sv2 and srv using JIT-compiled functions
         log.info("Computing acceleration parameters")
         sv2 = 0.0
         srv = 0.0
-        for start in range(0, len(v), chunk_size):
-            end = min(start + chunk_size, len(v))
-            sub_chunk = min(chunk_size, 100_000)
-            for sub_start in range(start, end, sub_chunk):
-                sub_end = min(sub_start + sub_chunk, end)
-                v_chunk = v[sub_start:sub_end]
-                r_chunk = r[sub_start:sub_end]
-                sv2 += np.sum(v_chunk ** 2)
-                srv += np.sum(r_chunk * v_chunk)
-                del v_chunk, r_chunk  # Free memory immediately
-                if sub_start % (sub_chunk * 5) == 0:
-                    gc.collect()
+        for start in range(0, len(v), mega_chunk):
+            end = min(start + mega_chunk, len(v))
+            v_chunk = v[start:end]
+            r_chunk = r[start:end]
+            sv2 += compute_squared_sum(v_chunk)
+            srv += compute_dot_product(r_chunk, v_chunk)
         
         # Check stability
         if sv2 < 1e-10:
             log.info("Acceleration numerically unstable, returning second iterate")
-            for fp in [r_file, v_file]:
-                try:
-                    if os.path.exists(fp):
-                        os.unlink(fp)
-                except OSError:
-                    pass
             return q2
         
         # Calculate step length
@@ -663,41 +657,24 @@ def chunked_squarem_step(
         alpha = np.clip(alpha, step_min, step_max)
         log.info(f"SQUAREM step length: alpha = {alpha:.6f}")
         
-        # Calculate p_new more efficiently using streaming updates
-        log.info("Computing accelerated point")
-        
-        # Use read-only memmaps for input arrays
-        v = np.memmap(v_file, dtype=np.float64, mode="r", shape=prob.shape)
-        r = np.memmap(r_file, dtype=np.float64, mode="r", shape=prob.shape)
-        p_new = np.memmap(p_new_file, dtype=np.float64, mode="w+", shape=prob.shape)
-        
-        # Use larger chunks with less frequent garbage collection
-        mega_chunk = chunk_size * 50  # Process 50x more data per iteration
-        
-        # Pre-calculate coefficients
+        # Pre-calculate coefficients for JIT function
         alpha2 = alpha * alpha
         two_alpha = 2 * alpha
         
-        # Process in mega-chunks with minimal GC
+        # Calculate p_new using JIT-compiled function
+        log.info("Computing accelerated point")
+        p_new = np.memmap(p_new_file, dtype=np.float64, mode="w+", shape=prob.shape)
+        
         for start in range(0, len(prob), mega_chunk):
             end = min(start + mega_chunk, len(prob))
+            p_new[start:end] = compute_p_new(
+                prob[start:end], r[start:end], v[start:end], two_alpha, alpha2
+            )
             
-            # Process sub-chunks within each mega-chunk
-            for sub_start in range(start, end, chunk_size):
-                sub_end = min(sub_start + chunk_size, end)
-                # Vectorized operation without temporary arrays
-                p_new[sub_start:sub_end] = (prob[sub_start:sub_end] + 
-                                          two_alpha * r[sub_start:sub_end] + 
-                                          alpha2 * v[sub_start:sub_end])
-            
-            # Flush only after each mega-chunk
+            # Flush less frequently
             if start % (mega_chunk * 2) == 0:
                 p_new.flush()
                 
-        # Single cleanup after all processing
-        del r, v
-        gc.collect()
-        
         # Validate probabilities
         log.info("Validating accelerated point")
         valid = validate_probabilities(
