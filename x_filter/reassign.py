@@ -402,271 +402,22 @@ def validate_probabilities(
             pass
 
 
-def chunked_fixed_point_map(
-    input_prob: np.memmap,
-    mask: np.memmap,
-    slen: np.memmap,
-    query_inverse_indices: np.memmap,
-    max_query: int,
-    mmap_folder: str,
-    resource_manager: ResourceManager,
-) -> np.memmap:
-    """Process fixed point mapping using chunked processing."""
-    # Get chunking strategy from resource manager
-    arr_info = resource_manager.analyze_array(input_prob)
-    strategy = resource_manager.calculate_chunk_size(arr_info)
-    chunk_size = strategy.chunk_size
-
-    new_prob_file = os.path.join(mmap_folder, "new_prob_temp.mmap")
-    prob_sum_file = os.path.join(mmap_folder, "prob_sum_temp.mmap")
-
-    try:
-        new_prob = np.memmap(
-            new_prob_file, dtype=np.float64, mode="w+", shape=input_prob.shape
-        )
-        new_prob[:] = input_prob[:]
-
-        masked_prob = input_prob[mask].copy()
-        masked_slen = slen[mask].copy()
-        masked_slen[masked_slen == 0] = np.finfo(np.float64).tiny
-
-        s_w = masked_prob / masked_slen
-        new_prob[mask] = masked_prob * s_w
-
-        # Replace np.zeros with memmap
-        prob_sum = np.memmap(
-            prob_sum_file, dtype=np.float64, mode="w+", shape=(max_query + 1,)
-        )
-        prob_sum.fill(0)
-
-        for start in range(0, len(mask), chunk_size):
-            end = min(start + chunk_size, len(mask))
-            chunk_mask = mask[start:end]
-            if not np.any(chunk_mask):
-                continue
-            chunk_queries = query_inverse_indices[start:end][chunk_mask]
-            chunk_probs = new_prob[start:end][chunk_mask]
-            np.add.at(prob_sum, chunk_queries, chunk_probs)
-
-        mask_sum = prob_sum[query_inverse_indices[mask]]
-        mask_sum[mask_sum == 0] = np.finfo(np.float64).tiny
-        new_prob[mask] = new_prob[mask] / mask_sum
-
-        return new_prob
-
-    finally:
-        try:
-            if os.path.exists(new_prob_file):
-                os.unlink(new_prob_file)
-            if os.path.exists(prob_sum_file):
-                os.unlink(prob_sum_file)
-        except OSError:
-            pass
-
-
-def chunked_squarem_step(
-    prob: np.memmap,
-    mask: np.memmap,
-    slen: np.memmap,
-    query_inverse_indices: np.memmap,
-    max_query: int,
-    mmap_folder: str,
-    step_min: float = -1.0,
-    step_max: float = -1.0,
-    mstep: int = 4,
-    resource_manager: Optional[ResourceManager] = None,
-) -> np.ndarray:
-    """SQUAREM implementation using chunked processing."""
-    # First fixed point evaluation
-    q = chunked_fixed_point_map(
-        prob,
-        mask,
-        slen,
-        query_inverse_indices,
-        max_query,
-        mmap_folder,
-        resource_manager,
-    )
-
-    # Create memory-mapped arrays for differences
-    r_file = os.path.join(mmap_folder, "r_temp.mmap")
-    r = np.memmap(r_file, dtype=np.float64, mode="w+", shape=prob.shape)
+def check_memory_requirements(prob_size_bytes: int, resource_manager: ResourceManager) -> bool:
+    """Check if there's enough memory to run the SQUAREM algorithm safely."""
+    # We need at least 5x the prob array size (for prob, q, r, v, p_new)
+    required_mem = prob_size_bytes * 5
+    available_mem = resource_manager.available_memory
     
-    # Calculate first difference in chunks
-    chunk_size = min(100_000_000, len(prob))
-    for start in range(0, len(prob), chunk_size):
-        end = min(start + chunk_size, len(prob))
-        r[start:end] = q[start:end] - prob[start:end]
+    safe_ratio = available_mem / required_mem
     
-    # Calculate sr2 in chunks
-    sr2 = 0.0
-    for start in range(0, len(r), chunk_size):
-        end = min(start + chunk_size, len(r))
-        sr2 += np.sum(r[start:end] ** 2)
-
-    # Check early convergence
-    if sr2 < 1e-10:
-        try:
-            os.unlink(r_file)
-        except OSError:
-            pass
-        return q
-
-    # Second fixed point evaluation
-    q2 = chunked_fixed_point_map(
-        q, mask, slen, query_inverse_indices, max_query, mmap_folder, resource_manager
-    )
+    log.info(f"Memory check: Required={required_mem/(1024**3):.2f}GB, "
+             f"Available={available_mem/(1024**3):.2f}GB, Safety ratio={safe_ratio:.2f}")
     
-    # Create memory-mapped array for second difference
-    r2_file = os.path.join(mmap_folder, "r2_temp.mmap")
-    v_file = os.path.join(mmap_folder, "v_temp.mmap")
-    
-    r2 = np.memmap(r2_file, dtype=np.float64, mode="w+", shape=prob.shape)
-    v = np.memmap(v_file, dtype=np.float64, mode="w+", shape=prob.shape)
-    
-    # Calculate differences in chunks
-    for start in range(0, len(q2), chunk_size):
-        end = min(start + chunk_size, len(q2))
-        r2[start:end] = q2[start:end] - q[start:end]
-        v[start:end] = r2[start:end] - r[start:end]
-    
-    # Calculate sums in chunks
-    sv2 = 0.0
-    srv = 0.0
-    for start in range(0, len(v), chunk_size):
-        end = min(start + chunk_size, len(v))
-        sv2 += np.sum(v[start:end] ** 2)
-        srv += np.sum(r[start:end] * v[start:end])
-
-    # Check stability
-    if sv2 < 1e-10:
-        # Clean up temporary files
-        for file_path in [r_file, r2_file, v_file]:
-            try:
-                if os.path.exists(file_path):
-                    os.unlink(file_path)
-            except OSError:
-                pass
-        return q2
-
-    # Calculate step length with bounds
-    if step_min < 0:
-        step_min = 0.001
-    if step_max < step_min:
-        step_max = 1.0
-
-    # SQUAREM step length
-    alpha = np.sqrt(sr2 / sv2)
-    alpha = np.clip(alpha, step_min, step_max)
-
-    p_new_file = os.path.join(mmap_folder, "p_new_temp.mmap")
-    result_file = os.path.join(mmap_folder, "squarem_result.mmap")
-
-    try:
-        p_new = np.memmap(p_new_file, dtype=np.float64, mode="w+", shape=prob.shape)
-
-        # SQUAREM update in chunks
-        for start in range(0, len(prob), chunk_size):
-            end = min(start + chunk_size, len(prob))
-            p_new[start:end] = prob[start:end] + 2 * alpha * r[start:end] + alpha * alpha * v[start:end]
-
-        # Validate and try step halving if needed
-        if validate_probabilities(
-            p_new[mask], query_inverse_indices[mask], max_query, mmap_folder
-        ):
-            result = chunked_fixed_point_map(
-                p_new,
-                mask,
-                slen,
-                query_inverse_indices,
-                max_query,
-                mmap_folder,
-                resource_manager,
-            )
-            
-            # Create final result as memory-mapped array
-            final_result = np.memmap(
-                result_file, dtype=np.float64, mode="w+", shape=prob.shape
-            )
-            
-            # Copy in chunks
-            for start in range(0, len(result), chunk_size):
-                end = min(start + chunk_size, len(result))
-                final_result[start:end] = result[start:end]
-                
-            # Delete original result to save memory
-            del result
-            gc.collect()
-            
-            # Additional validation of result
-            if validate_probabilities(
-                final_result[mask], query_inverse_indices[mask], max_query, mmap_folder
-            ):
-                return final_result
-
-        # Step halving if initial step fails
-        for m in range(mstep):
-            alpha = alpha / 2
-            # Update p_new in chunks
-            for start in range(0, len(prob), chunk_size):
-                end = min(start + chunk_size, len(prob))
-                p_new[start:end] = prob[start:end] + 2 * alpha * r[start:end] + alpha * alpha * v[start:end]
-
-            if validate_probabilities(
-                p_new[mask], query_inverse_indices[mask], max_query, mmap_folder
-            ):
-                result = chunked_fixed_point_map(
-                    p_new,
-                    mask,
-                    slen,
-                    query_inverse_indices,
-                    max_query,
-                    mmap_folder,
-                    resource_manager,
-                )
-                
-                # Create final result as memory-mapped array
-                final_result = np.memmap(
-                    result_file, dtype=np.float64, mode="w+", shape=prob.shape
-                )
-                
-                # Copy in chunks
-                for start in range(0, len(result), chunk_size):
-                    end = min(start + chunk_size, len(result))
-                    final_result[start:end] = result[start:end]
-                    
-                # Delete original result to save memory
-                del result
-                gc.collect()
-                
-                if validate_probabilities(
-                    final_result[mask], query_inverse_indices[mask], max_query, mmap_folder
-                ):
-                    return final_result
-
-        # If all steps fail, return last valid iteration
-        final_result = np.memmap(
-            result_file, dtype=np.float64, mode="w+", shape=prob.shape
-        )
-        
-        # Copy in chunks
-        for start in range(0, len(q2), chunk_size):
-            end = min(start + chunk_size, len(q2))
-            final_result[start:end] = q2[start:end]
-            
-        return final_result
-
-    finally:
-        # Clean up all temporary files
-        for file_path in [r_file, r2_file, v_file, p_new_file]:
-            try:
-                if os.path.exists(file_path):
-                    os.unlink(file_path)
-            except OSError:
-                pass
-        
-        # Force garbage collection
-        gc.collect()
+    if safe_ratio < 1.2:
+        log.warning(f"Available memory ({available_mem/(1024**3):.2f}GB) may be insufficient "
+                   f"for SQUAREM algorithm. Need ~{required_mem/(1024**3):.2f}GB plus overhead.")
+        return False
+    return True
 
 
 def resolve_multimaps_return_indices(
@@ -684,6 +435,11 @@ def resolve_multimaps_return_indices(
     resource_manager: Optional[ResourceManager] = None,
 ) -> np.ndarray:
     """Resolve multimapped reads using chunked processing."""
+    # Add memory check before starting iterations
+    if resource_manager is not None and not check_memory_requirements(prob.nbytes, resource_manager):
+        log.warning("Memory check failed. Proceeding with extra caution.")
+        # Reduce chunk size further or take other measures
+
     # Create memory-mapped mask array instead of in-memory
     mask_file = os.path.join(mmap_folder, "mask.dat")
     mask = np.memmap(
@@ -957,186 +713,12 @@ def resolve_multimaps_return_indices(
 
     finally:
         # Clean up all temporary files
-        for file_path in [mask_file, prob_working_file, final_result_file]:
+        for file_path in [mask_file, prob_working_file]:
             try:
-                if 'final_result' in locals() and file_path == final_result_file:
-                    continue
                 if os.path.exists(file_path):
                     os.unlink(file_path)
             except OSError:
                 pass
-
-
-def bucket_process_unique_values(
-    input_array: np.memmap,
-    mmap_folder: str,
-    prefix: str,
-    resource_manager: ResourceManager,
-) -> Tuple[np.memmap, np.memmap]:
-    """Process array to get unique values using process pool parallelism."""
-    if len(input_array) == 0:
-        return np.array([], dtype=input_array.dtype), np.array([], dtype=np.int64)
-
-    os.makedirs(mmap_folder, exist_ok=True)
-
-    # Calculate optimal process and thread distribution
-    total_cores = resource_manager.max_threads
-    num_processes = max(2, total_cores // 2)  # Use half cores for processes
-    num_threads = 2  # Keep threads per process fixed at 2
-    log.info(f"CPU cores available: {total_cores}")
-    log.info(f"Using {num_processes} processes with {num_threads} threads each")
-
-    # Initialize parameters
-    num_buckets = min(2**8, len(input_array) // 1_000_000 + 1)
-    if num_buckets < num_processes:
-        num_buckets = num_processes
-    bucket_mgr = BucketManager(num_buckets, mmap_folder)
-
-    try:
-        # Create shared memory for input array
-        shm = shared_memory.SharedMemory(create=True, size=input_array.nbytes)
-        shared_array = np.ndarray(
-            input_array.shape, dtype=input_array.dtype, buffer=shm.buf
-        )
-        shared_array[:] = input_array[:]
-
-        # Calculate chunk size
-        chunk_size = min(1_000_000, len(input_array) // (num_processes * 2))
-        chunks = [
-            (i, min(i + chunk_size, len(input_array)))
-            for i in range(0, len(input_array), chunk_size)
-        ]
-
-        # First pass: count bucket sizes using process pool
-        bucket_sizes_file = os.path.join(mmap_folder, "bucket_sizes_temp.dat")
-        bucket_sizes = np.memmap(
-            bucket_sizes_file, 
-            dtype=np.int64, 
-            mode="w+", 
-            shape=(num_buckets,)
-        )
-        bucket_sizes.fill(0)  # Initialize with zeros
-
-        with Pool(processes=num_processes) as pool:
-            with tqdm(total=len(input_array), desc="Counting", ncols=80) as pbar:
-                worker_args = [
-                    (start, end, shm.name, len(input_array), num_buckets, num_threads)
-                    for start, end in chunks
-                ]
-
-                for indices, assignments, counts, start, end in pool.imap(
-                    process_chunk_worker, worker_args
-                ):
-                    bucket_sizes += counts
-                    pbar.update(end - start)
-
-        # Create bucket arrays
-        bucket_mgr.create_bucket_arrays(bucket_sizes)
-
-        # Second pass: distribute elements using process pool
-        with Pool(processes=num_processes) as pool:
-            with tqdm(total=len(input_array), desc="Distributing", ncols=80) as pbar:
-                worker_args = [
-                    (start, end, shm.name, len(input_array), num_buckets, num_threads)
-                    for start, end in chunks
-                ]
-
-                for indices, assignments, counts, start, end in pool.imap(
-                    process_chunk_worker, worker_args
-                ):
-                    # Write to buckets
-                    offset = 0
-                    for bucket_id in range(num_buckets):
-                        mask = assignments == bucket_id
-                        count = np.sum(mask)
-                        if count > 0:
-                            bucket_data = indices[offset : offset + count]
-                            pos = bucket_mgr.bucket_positions[bucket_id]
-                            bucket_mgr.write_to_bucket(bucket_id, bucket_data, pos)
-                            bucket_mgr.bucket_positions[bucket_id] += count
-                        offset += count
-                    pbar.update(end - start)
-
-        # Process buckets in parallel for finding uniques
-        log.info("Finding unique elements with parallel processing...")
-        unique_values_file = os.path.join(mmap_folder, f"{prefix}_unique_values.dat")
-        result = np.memmap(
-            unique_values_file,
-            dtype=input_array.dtype,
-            mode="w+",
-            shape=(len(input_array),),
-        )
-        total_unique = 0
-
-        # Get active buckets
-        active_buckets = [
-            (bucket_mgr.get_bucket_data(i), i)
-            for i in range(num_buckets)
-            if bucket_mgr.get_bucket_data(i) is not None
-        ]
-
-        # Process buckets in parallel using process pool
-        with Pool(processes=num_processes) as pool:
-            with tqdm(
-                total=len(active_buckets), desc="Processing buckets", ncols=80
-            ) as pbar:
-                worker_args = [
-                    (bucket_data, shm.name, len(input_array), num_threads)
-                    for bucket_data, _ in active_buckets
-                ]
-
-                for unique_indices in pool.imap(find_bucket_unique_worker, worker_args):
-                    if len(unique_indices) > 0:
-                        result[total_unique : total_unique + len(unique_indices)] = (
-                            unique_indices
-                        )
-                        total_unique += len(unique_indices)
-                    pbar.update(1)
-
-        # Cleanup shared memory and finalize
-        shm.close()
-        shm.unlink()
-
-        # Create inverse indices array
-        log.info("Creating inverse indices...")
-        inverse_indices_file = os.path.join(
-            mmap_folder, f"{prefix}_inverse_indices.dat"
-        )
-        inverse_indices = np.memmap(
-            inverse_indices_file,
-            dtype=np.int64,
-            mode="w+",
-            shape=(len(input_array),),
-        )
-
-        # Sort and create inverse indices
-        result = result[:total_unique]
-        result.sort()
-        for i in range(len(input_array)):
-            inverse_indices[i] = np.searchsorted(result, input_array[i])
-
-        dedup_ratio = total_unique / len(input_array)
-        log.info(f"\nFound {total_unique:,} unique elements ({dedup_ratio:.2%} unique)")
-
-        return result, inverse_indices
-
-    except Exception as e:
-        log.error(f"Error in bucket_process_unique_values: {e}")
-        raise
-    finally:
-        if "bucket_mgr" in locals():
-            bucket_mgr.cleanup()
-        if "shm" in locals():
-            try:
-                shm.close()
-                shm.unlink()
-            except:
-                pass
-        try:
-            if os.path.exists(bucket_sizes_file):
-                os.unlink(bucket_sizes_file)
-        except OSError:
-            pass
 
 
 def reassign(
@@ -1155,9 +737,7 @@ def reassign(
     if isinstance(max_memory, str):
         max_memory = resource_manager.parse_memory_limit(max_memory)
     resource_manager = ResourceManager(max_memory=max_memory, max_threads=num_threads)
-
     mmap_folder = tmp_files["mmap"]
-
     log.info("Creating inverse subject mapping")
     subject_inverse_indices = initialize_mmap_array(
         total_positions=len(np_arrays["subject_numeric_id"]),
@@ -1165,7 +745,6 @@ def reassign(
         mmap_folder=mmap_folder,
         array_name="subject_inverse_indices",
     )
-
     subject_inverse_indices, unique_subjects = memory_efficient_factorize(
         np_arrays["subject_numeric_id"],
         mmap_folder=mmap_folder,
@@ -1173,6 +752,7 @@ def reassign(
         inverse=subject_inverse_indices,
         num_threads=num_threads,
     )
+
     log.info("Starting factorization of reads")
     query_inverse_indices = initialize_mmap_array(
         total_positions=len(np_arrays["query_numeric_id"]),
