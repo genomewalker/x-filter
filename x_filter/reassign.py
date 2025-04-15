@@ -521,7 +521,6 @@ def reassign(
         mmap_folder=mmap_folder,
         max_memory=resource_manager.max_memory,
         num_threads=num_threads,
-        array_name_prefix="subject_"
     )
 
     log.info("Starting factorization of reads")
@@ -530,7 +529,6 @@ def reassign(
         mmap_folder=mmap_folder,
         max_memory=resource_manager.max_memory,
         num_threads=num_threads,
-        array_name_prefix="query_"
     )
 
     log.info(f"Number of references: {len(unique_subjects):,}")
