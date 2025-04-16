@@ -301,8 +301,13 @@ def parallel_accumulate_weights(
 
 
 @njit
-def compute_p_new(prob_chunk: np.ndarray, r_chunk: np.ndarray, v_chunk: np.ndarray, 
-                  two_alpha: float, alpha2: float) -> np.ndarray:
+def compute_p_new(
+    prob_chunk: np.ndarray,
+    r_chunk: np.ndarray,
+    v_chunk: np.ndarray,
+    two_alpha: float,
+    alpha2: float,
+) -> np.ndarray:
     """JIT-compiled function to compute p_new efficiently."""
     result = np.empty_like(prob_chunk)
     for i in range(len(prob_chunk)):
@@ -328,51 +333,59 @@ def compute_dot_product(arr1: np.ndarray, arr2: np.ndarray) -> float:
     return result
 
 
-def calculate_optimal_chunk_size(array_size: int, dtype_size: int, available_memory: int, 
-                                overhead_factor: float = 0.6) -> int:
+def calculate_optimal_chunk_size(
+    array_size: int,
+    dtype_size: int,
+    available_memory: int,
+    overhead_factor: float = 0.6,
+) -> int:
     """
     Calculate optimal chunk size based on array size and available memory,
     with stricter memory constraints.
-    
+
     Args:
         array_size: Total number of elements in array
         dtype_size: Size of each element in bytes
         available_memory: Available memory in bytes
         overhead_factor: Factor to account for Python overhead (0.0-1.0)
-        
+
     Returns:
         Optimal chunk size (number of elements)
     """
     # Calculate how much memory we can safely use (lower overhead factor for safety)
     usable_memory = int(available_memory * overhead_factor)
-    
+
     # Enforce absolute maximum chunk size of 100M elements
     MAX_CHUNK_SIZE = 100_000_000
-    
+
     # Calculate memory-based chunk size
-    memory_based_size = usable_memory // (dtype_size * 3)  # Account for multiple array copies
-    
+    memory_based_size = usable_memory // (
+        dtype_size * 3
+    )  # Account for multiple array copies
+
     # For very large arrays, limit chunks based on number of elements
     if array_size > 1_000_000_000:  # More than 1 billion elements
         # Use fewer chunks for very large arrays, but still cap at MAX_CHUNK_SIZE
         min_chunks = 1000 if array_size > 10_000_000_000 else 500
         array_based_size = min(array_size // min_chunks, MAX_CHUNK_SIZE)
-        
+
         # Use the smaller of the two sizes to ensure we don't use too much memory
         chunk_size = min(memory_based_size, array_based_size)
     else:
         # For smaller arrays, still respect memory constraints and max size
         chunk_size = min(memory_based_size, MAX_CHUNK_SIZE)
-    
+
     # Ensure minimum reasonable size and don't exceed array size
     chunk_size = max(min(chunk_size, array_size), 100_000)
-    
+
     # Log the calculation details
     memory_usage_gb = (chunk_size * dtype_size) / (1024 * 1024 * 1024)
-    log.info(f"Calculated chunk size: {chunk_size:,} elements "
-             f"({memory_usage_gb:.2f} GB) for {array_size:,} total elements")
+    log.info(
+        f"Calculated chunk size: {chunk_size:,} elements "
+        f"({memory_usage_gb:.2f} GB) for {array_size:,} total elements"
+    )
     log.info(f"This will process the array in {array_size/chunk_size:.1f} chunks")
-    
+
     return chunk_size
 
 
@@ -478,50 +491,6 @@ def validate_probabilities(
             pass
 
 
-def check_memory_requirements(prob_size_bytes: int, resource_manager: ResourceManager) -> bool:
-    """
-    Check if there's enough memory to run the SQUAREM algorithm safely,
-    taking into account our chunking strategy.
-    """
-    # Calculate max chunk size based on array size and dtype
-    array_size = prob_size_bytes // 8  # Assuming float64 (8 bytes)
-    dtype_size = 8  # float64
-    
-    # Get the optimal chunk size we would use
-    chunk_size = calculate_optimal_chunk_size(
-        array_size=array_size,
-        dtype_size=dtype_size,
-        available_memory=resource_manager.available_memory
-    )
-    
-    # Calculate memory needed for a single chunk processing
-    # We need memory for several arrays: q, r, r2, v, p_new chunks plus overhead
-    chunk_bytes = chunk_size * dtype_size
-    required_mem_per_chunk = chunk_bytes * 5  # 5 arrays in memory
-    
-    # Add memory for other operations and Python overhead
-    overhead_factor = 1.5
-    total_required = required_mem_per_chunk * overhead_factor
-    
-    available_mem = resource_manager.available_memory
-    safe_ratio = available_mem / total_required
-    
-    log.info(f"Memory check for chunked processing:")
-    log.info(f"  - Chunk size: {chunk_size:,} elements ({chunk_bytes/(1024*1024):.2f} MB)")
-    log.info(f"  - Required per chunk: {required_mem_per_chunk/(1024*1024*1024):.2f} GB")
-    log.info(f"  - Available memory: {available_mem/(1024*1024*1024):.2f} GB")
-    log.info(f"  - Safety ratio: {safe_ratio:.2f}")
-    
-    # We want at least 20% headroom
-    if safe_ratio < 1.2:
-        log.warning(f"Available memory ({available_mem/(1024**3):.2f} GB) may be insufficient "
-                   f"for SQUAREM algorithm with current chunk size.")
-        log.warning(f"Consider reducing chunk size further or increasing available memory.")
-        return False
-    
-    return True
-
-
 def chunked_fixed_point_map(
     input_prob: np.memmap,
     mask: np.memmap,
@@ -546,14 +515,18 @@ def chunked_fixed_point_map(
         )
         new_prob[:] = input_prob[:]
 
-        # Copy masked elements for safe manipulation
-        masked_prob = input_prob[mask].copy()
-        masked_slen = slen[mask].copy()
-        masked_slen[masked_slen == 0] = np.finfo(np.float64).tiny
-
-        # Calculate s_w and update
-        s_w = masked_prob / masked_slen
-        new_prob[mask] = masked_prob * s_w
+        # Instead of copying the full masked arrays into memory,
+        # process the indices in manageable chunks directly from memmap.
+        indices = np.nonzero(mask)[0]
+        for start in range(0, len(indices), 1_000_000):
+            end = min(start + 1_000_000, len(indices))
+            idx = indices[start:end]
+            # Process each small chunk from the memmap without a full in-memory copy
+            mp = input_prob[idx]
+            ms = slen[idx]
+            ms[ms == 0] = np.finfo(np.float64).tiny  # avoid zero division
+            s_w = mp / ms
+            new_prob[idx] = mp * s_w
 
         # Create prob_sum as memory-mapped array
         prob_sum = np.memmap(
@@ -589,6 +562,60 @@ def chunked_fixed_point_map(
             pass
 
 
+def check_memory_requirements(
+    prob_size_bytes: int, resource_manager: ResourceManager
+) -> bool:
+    """
+    Check if there's enough memory to run the SQUAREM algorithm safely,
+    taking into account our chunking strategy.
+    """
+    # Calculate max chunk size based on array size and dtype
+    array_size = prob_size_bytes // 8  # Assuming float64 (8 bytes)
+    dtype_size = 8  # float64
+
+    # Get the optimal chunk size we would use
+    chunk_size = calculate_optimal_chunk_size(
+        array_size=array_size,
+        dtype_size=dtype_size,
+        available_memory=resource_manager.available_memory,
+    )
+
+    # Calculate memory needed for a single chunk processing
+    # We need memory for several arrays: q, r, r2, v, p_new chunks plus overhead
+    chunk_bytes = chunk_size * dtype_size
+    required_mem_per_chunk = chunk_bytes * 5  # 5 arrays in memory
+
+    # Add memory for other operations and Python overhead
+    overhead_factor = 1.5
+    total_required = required_mem_per_chunk * overhead_factor
+
+    available_mem = resource_manager.available_memory
+    safe_ratio = available_mem / total_required
+
+    log.info(f"Memory check for chunked processing:")
+    log.info(
+        f"  - Chunk size: {chunk_size:,} elements ({chunk_bytes/(1024*1024):.2f} MB)"
+    )
+    log.info(
+        f"  - Required per chunk: {required_mem_per_chunk/(1024*1024*1024):.2f} GB"
+    )
+    log.info(f"  - Available memory: {available_mem/(1024*1024*1024):.2f} GB")
+    log.info(f"  - Safety ratio: {safe_ratio:.2f}")
+
+    # We want at least 20% headroom
+    if safe_ratio < 1.2:
+        log.warning(
+            f"Available memory ({available_mem/(1024**3):.2f} GB) may be insufficient "
+            f"for SQUAREM algorithm with current chunk size."
+        )
+        log.warning(
+            f"Consider reducing chunk size further or increasing available memory."
+        )
+        return False
+
+    return True
+
+
 def chunked_squarem_step(
     prob: np.memmap,
     mask: np.memmap,
@@ -604,56 +631,62 @@ def chunked_squarem_step(
     """SQUAREM implementation using chunked processing with strict memory management."""
     if resource_manager is None:
         resource_manager = ResourceManager()
-    
+
     # Get array size information
     array_size_gb = prob.nbytes / (1024**3)
     log.info(f"SQUAREM processing array of size: {array_size_gb:.2f} GB")
-    
+
     # Calculate optimal chunk size based on array size and available memory
     # with maximum chunk size enforced
     chunk_size = calculate_optimal_chunk_size(
         array_size=len(prob),
         dtype_size=prob.dtype.itemsize,
-        available_memory=resource_manager.available_memory
+        available_memory=resource_manager.available_memory,
     )
-    
+
     # Use mega-chunks for bulk operations, but limit maximum size
     mega_chunk_factor = min(5, max(1, 100_000_000 // chunk_size))
     mega_chunk = min(chunk_size * mega_chunk_factor, 100_000_000)
-    
+
     log.info(f"Using chunk size: {chunk_size:,}, mega chunk: {mega_chunk:,}")
-    
+
     # Track and log memory usage
     available_mem_gb = resource_manager.available_memory / (1024**3)
     log.info(f"Available memory before SQUAREM: {available_mem_gb:.2f} GB")
-    
+
     # First fixed point evaluation - initialize q to default value
     q = None  # Initialize q to ensure it's in scope
     try:
         log.info("Computing first fixed point map")
         q = chunked_fixed_point_map(
-            prob, mask, slen, query_inverse_indices, max_query, mmap_folder, resource_manager
+            prob,
+            mask,
+            slen,
+            query_inverse_indices,
+            max_query,
+            mmap_folder,
+            resource_manager,
         )
     except Exception as e:
         log.error(f"Failed to compute first fixed point map: {str(e)}")
         return prob
-    
+
     if q is None:
         log.error("First fixed point calculation returned None")
         return prob
-    
+
     # Process each step with careful memory management
     r_file = os.path.join(mmap_folder, "r_temp.mmap")
     r2_file = os.path.join(mmap_folder, "r2_temp.mmap")
     v_file = os.path.join(mmap_folder, "v_temp.mmap")
     p_new_file = os.path.join(mmap_folder, "p_new_temp.mmap")
     result_file = os.path.join(mmap_folder, "squarem_result.mmap")
-    
+
     try:
         # Step 1: Calculate first difference r = q - prob
         log.info("Computing first difference vector r")
         r = np.memmap(r_file, dtype=np.float64, mode="w+", shape=prob.shape)
-        
+
         # Process in mega-chunks for better I/O performance
         for start in range(0, len(prob), mega_chunk):
             end = min(start + mega_chunk, len(prob))
@@ -661,13 +694,13 @@ def chunked_squarem_step(
             # Flush to disk less frequently
             if start % (mega_chunk * 2) == 0:
                 r.flush()
-        
+
         # Calculate sr2 using JIT-compiled function in mega-chunks
         sr2 = 0.0
         for start in range(0, len(r), mega_chunk):
             end = min(start + mega_chunk, len(r))
             sr2 += compute_squared_sum(r[start:end])
-        
+
         # Early convergence check
         if sr2 < 1e-10:
             log.info("Early convergence detected")
@@ -676,35 +709,41 @@ def chunked_squarem_step(
         # Second fixed point evaluation
         log.info("Computing second fixed point map")
         q2 = chunked_fixed_point_map(
-            q, mask, slen, query_inverse_indices, max_query, mmap_folder, resource_manager
+            q,
+            mask,
+            slen,
+            query_inverse_indices,
+            max_query,
+            mmap_folder,
+            resource_manager,
         )
-            
+
         if q2 is None:
             log.error("Second fixed point calculation returned None")
             return q
-                
+
         # Re-open r for reading only to save memory
         r = np.memmap(r_file, dtype=np.float64, mode="r", shape=prob.shape)
-        
+
         # Calculate r2 = q2 - q and v = r2 - r in a single mega-chunk pass
         log.info("Computing difference vectors")
         r2 = np.memmap(r2_file, dtype=np.float64, mode="w+", shape=prob.shape)
         v = np.memmap(v_file, dtype=np.float64, mode="w+", shape=prob.shape)
-        
+
         for start in range(0, len(prob), mega_chunk):
             end = min(start + mega_chunk, len(prob))
             # Calculate both in one pass to reduce memory operations
             r2_chunk = q2[start:end] - q[start:end]
             r2[start:end] = r2_chunk
             v[start:end] = r2_chunk - r[start:end]
-            
+
             if start % (mega_chunk * 2) == 0:
                 r2.flush()
                 v.flush()
 
         # Free memory
         del r2_chunk
-        
+
         # Calculate sv2 and srv using JIT-compiled functions
         log.info("Computing acceleration parameters")
         sv2 = 0.0
@@ -715,62 +754,68 @@ def chunked_squarem_step(
             r_chunk = r[start:end]
             sv2 += compute_squared_sum(v_chunk)
             srv += compute_dot_product(r_chunk, v_chunk)
-        
+
         # Check stability
         if sv2 < 1e-10:
             log.info("Acceleration numerically unstable, returning second iterate")
             return q2
-        
+
         # Calculate step length
         if step_min < 0:
             step_min = 0.001
         if step_max < step_min:
             step_max = 1.0
-        
+
         alpha = np.sqrt(sr2 / sv2)
         alpha = np.clip(alpha, step_min, step_max)
         log.info(f"SQUAREM step length: alpha = {alpha:.6f}")
-        
+
         # Pre-calculate coefficients for JIT function
         alpha2 = alpha * alpha
         two_alpha = 2 * alpha
-        
+
         # Calculate p_new using JIT-compiled function
         log.info("Computing accelerated point")
         p_new = np.memmap(p_new_file, dtype=np.float64, mode="w+", shape=prob.shape)
-        
+
         for start in range(0, len(prob), mega_chunk):
             end = min(start + mega_chunk, len(prob))
             p_new[start:end] = compute_p_new(
                 prob[start:end], r[start:end], v[start:end], two_alpha, alpha2
             )
-            
+
             # Flush less frequently
             if start % (mega_chunk * 2) == 0:
                 p_new.flush()
-                
+
         # Validate probabilities
         log.info("Validating accelerated point")
         valid = validate_probabilities(
             p_new[mask], query_inverse_indices[mask], max_query, mmap_folder
         )
-        
+
         if valid:
             log.info("Computing fixed point of accelerated iterate")
             result = chunked_fixed_point_map(
-                p_new, mask, slen, query_inverse_indices, max_query, mmap_folder, resource_manager
+                p_new,
+                mask,
+                slen,
+                query_inverse_indices,
+                max_query,
+                mmap_folder,
+                resource_manager,
             )
-            
+
             # Free memory
             del p_new
             gc.collect()
-            
+
             # Create final result array
             log.info("Creating final result")
             final_result = np.memmap(
                 result_file, dtype=np.float64, mode="w+", shape=prob.shape
             )
-            
+
             # Copy result in small chunks
             for start in range(0, len(result), chunk_size):
                 end = min(start + chunk_size, len(result))
@@ -778,16 +823,16 @@ def chunked_squarem_step(
                 if start % (chunk_size * 5) == 0:
                     final_result.flush()
                     gc.collect()
-            
+
             # Free memory
             del result
             gc.collect()
-            
+
             # Validate final result
             valid_final = validate_probabilities(
                 final_result[mask], query_inverse_indices[mask], max_query, mmap_folder
             )
-            
+
             if valid_final:
                 log.info("Final result validated successfully")
                 return final_result
@@ -800,48 +845,58 @@ def chunked_squarem_step(
                     if start % (chunk_size * 5) == 0:
                         final_result.flush()
                 return final_result
-        
+
         # If initial validation fails, try step halving
         log.info("Initial validation failed, attempting step halving")
         r = np.memmap(r_file, dtype=np.float64, mode="r", shape=prob.shape)
         v = np.memmap(v_file, dtype=np.float64, mode="r", shape=prob.shape)
         p_new = np.memmap(p_new_file, dtype=np.float64, mode="r+", shape=prob.shape)
-        
+
         for m in range(mstep):
             alpha = alpha / 2
             log.info(f"Step halving iteration {m+1}, alpha={alpha:.6f}")
-            
+
             # Update p_new in chunks
             for start in range(0, len(prob), chunk_size):
                 end = min(start + chunk_size, len(prob))
-                p_new[start:end] = prob[start:end] + 2 * alpha * r[start:end] + alpha * alpha * v[start:end]
+                p_new[start:end] = (
+                    prob[start:end]
+                    + 2 * alpha * r[start:end]
+                    + alpha * alpha * v[start:end]
+                )
                 if start % (chunk_size * 5) == 0:
                     p_new.flush()
                     gc.collect()
-            
+
             valid = validate_probabilities(
                 p_new[mask], query_inverse_indices[mask], max_query, mmap_folder
             )
-            
+
             if valid:
                 # Free memory before heavy computation
                 del r, v
                 gc.collect()
-                
+
                 log.info(f"Step halving succeeded with alpha={alpha:.6f}")
                 result = chunked_fixed_point_map(
-                    p_new, mask, slen, query_inverse_indices, max_query, mmap_folder, resource_manager
+                    p_new,
+                    mask,
+                    slen,
+                    query_inverse_indices,
+                    max_query,
+                    mmap_folder,
+                    resource_manager,
                 )
-                
+
                 # Free memory
                 del p_new
                 gc.collect()
-                
+
                 # Create final result
                 final_result = np.memmap(
                     result_file, dtype=np.float64, mode="w+", shape=prob.shape
                 )
-                
+
                 # Copy in small chunks
                 for start in range(0, len(result), chunk_size):
                     end = min(start + chunk_size, len(result))
@@ -849,25 +904,28 @@ def chunked_squarem_step(
                     if start % (chunk_size * 5) == 0:
                         final_result.flush()
                         gc.collect()
-                
+
                 # Free memory
                 del result
                 gc.collect()
-                
+
                 valid_final = validate_probabilities(
-                    final_result[mask], query_inverse_indices[mask], max_query, mmap_folder
+                    final_result[mask],
+                    query_inverse_indices[mask],
+                    max_query,
+                    mmap_folder,
                 )
-                
+
                 if valid_final:
                     log.info("Step-halved result validated successfully")
                     return final_result
-        
+
         # If all steps fail, use second iteration
         log.warning("All step halving attempts failed, using second iterate")
         final_result = np.memmap(
             result_file, dtype=np.float64, mode="w+", shape=prob.shape
         )
-        
+
         # Copy q2 to final result
         for start in range(0, len(q2), chunk_size):
             end = min(start + chunk_size, len(q2))
@@ -875,18 +933,18 @@ def chunked_squarem_step(
             if start % (chunk_size * 5) == 0:
                 final_result.flush()
                 gc.collect()
-        
+
         return final_result
 
     except Exception as e:
         log.error(f"Error in SQUAREM step: {str(e)}")
         # In case of error, try to return q2 if available, otherwise return q if available, finally return prob
-        if 'q2' in locals() and q2 is not None:
+        if "q2" in locals() and q2 is not None:
             return q2
         elif q is not None:
             return q
         return prob
-    
+
     finally:
         # Clean up all temporary files
         for file_path in [r_file, r2_file, v_file, p_new_file]:
@@ -895,7 +953,7 @@ def chunked_squarem_step(
                     os.unlink(file_path)
             except OSError as e:
                 log.warning(f"Error cleaning up {file_path}: {str(e)}")
-        
+
         # Final garbage collection
         gc.collect()
 
@@ -916,7 +974,9 @@ def resolve_multimaps_return_indices(
 ) -> np.ndarray:
     """Resolve multimapped reads using chunked processing."""
     # Add memory check before starting iterations
-    if resource_manager is not None and not check_memory_requirements(prob.nbytes, resource_manager):
+    if resource_manager is not None and not check_memory_requirements(
+        prob.nbytes, resource_manager
+    ):
         log.warning("Memory check failed. Proceeding with extra caution.")
         # Reduce chunk size further or take other measures
 
@@ -929,14 +989,14 @@ def resolve_multimaps_return_indices(
 
     # Use memory-mapped array for total_reads calculation
     unique_queries_file = os.path.join(mmap_folder, "unique_queries_temp.dat")
-    
+
     # Calculate unique queries in chunks to avoid memory issues
     max_query = query_inverse_indices.max()
     query_counts = np.memmap(
         unique_queries_file, dtype=np.int8, mode="w+", shape=(max_query + 1,)
     )
     query_counts.fill(0)
-    
+
     # Count queries in chunks
     chunk_size = min(100_000_000, len(mask))
     for start in range(0, len(query_inverse_indices), chunk_size):
@@ -944,15 +1004,15 @@ def resolve_multimaps_return_indices(
         chunk_queries = query_inverse_indices[start:end]
         unique_indices = np.unique(chunk_queries)
         query_counts[unique_indices] = 1
-    
+
     total_reads = np.sum(query_counts)
     del query_counts
-    
+
     try:
         os.unlink(unique_queries_file)
     except OSError:
         pass
-    
+
     current_iter = 0
     prev_num_alignments = np.inf
 
@@ -1042,30 +1102,33 @@ def resolve_multimaps_return_indices(
                             continue
                         chunk_queries = query_inverse_indices[start:end][chunk_mask]
                         np.add.at(n_aln, chunk_queries, 1)
-                    
+
                     # Create unique_mask and non_unique_mask as memory-mapped arrays
                     unique_mask = np.memmap(
                         unique_mask_file, dtype=np.bool_, mode="w+", shape=mask.shape
                     )
                     unique_mask.fill(False)
-                    
+
                     non_unique_mask = np.memmap(
-                        non_unique_mask_file, dtype=np.bool_, mode="w+", shape=mask.shape
+                        non_unique_mask_file,
+                        dtype=np.bool_,
+                        mode="w+",
+                        shape=mask.shape,
                     )
                     non_unique_mask.fill(False)
-                    
+
                     # Process in chunks to avoid memory issue during mask creation
                     for start in range(0, len(mask), chunk_size):
                         end = min(start + chunk_size, len(mask))
                         chunk_mask = mask[start:end]
                         chunk_queries = query_inverse_indices[start:end]
                         chunk_n_aln = n_aln[chunk_queries]
-                        
+
                         unique_mask[start:end] = (chunk_n_aln == 1) & chunk_mask
                         non_unique_mask[start:end] = (chunk_n_aln > 1) & chunk_mask
 
                     pbar.update(1)
-                    
+
                     if np.all(unique_mask):
                         log.info("All reads uniquely mapped - stopping early")
                         break
@@ -1091,9 +1154,12 @@ def resolve_multimaps_return_indices(
 
                     # Create max_prob_scaled as memory-mapped
                     max_prob_scaled = np.memmap(
-                        max_prob_scaled_file, dtype=np.float64, mode="w+", shape=mask.shape
+                        max_prob_scaled_file,
+                        dtype=np.float64,
+                        mode="w+",
+                        shape=mask.shape,
                     )
-                    
+
                     # Process in chunks for scaling
                     for start in range(0, len(mask), chunk_size):
                         end = min(start + chunk_size, len(mask))
@@ -1102,15 +1168,15 @@ def resolve_multimaps_return_indices(
                             max_prob_scaled[start:end] = max_prob[chunk_queries]
                         else:
                             max_prob_scaled[start:end] = max_prob[chunk_queries] * scale
-                    
+
                     pbar.update(1)
-                    
+
                     # Create final_mask as memory-mapped
                     final_mask = np.memmap(
                         final_mask_file, dtype=np.bool_, mode="w+", shape=mask.shape
                     )
                     final_mask.fill(False)
-                    
+
                     # Process in chunks for final mask calculation
                     for start in range(0, len(mask), chunk_size):
                         end = min(start + chunk_size, len(mask))
@@ -1119,8 +1185,10 @@ def resolve_multimaps_return_indices(
                             continue
                         chunk_probs = prob_working[start:end]
                         chunk_max_scaled = max_prob_scaled[start:end]
-                        final_mask[start:end] = (chunk_probs >= chunk_max_scaled) & chunk_non_unique
-                    
+                        final_mask[start:end] = (
+                            chunk_probs >= chunk_max_scaled
+                        ) & chunk_non_unique
+
                     pbar.update(1)
 
                     # Update iter_array in chunks
@@ -1129,34 +1197,40 @@ def resolve_multimaps_return_indices(
                         chunk_final_mask = final_mask[start:end]
                         if np.any(chunk_final_mask):
                             iter_array[start:end][chunk_final_mask] = current_iter + 1
-                    
+
                     # Update mask in chunks
                     for start in range(0, len(mask), chunk_size):
                         end = min(start + chunk_size, len(mask))
                         chunk_unique = unique_mask[start:end]
                         chunk_final = final_mask[start:end]
                         mask[start:end] = chunk_unique | chunk_final
-                    
+
                     pbar.update(1)
-                    
+
                     # Calculate global statistics in chunks
                     global_uniques = 0
                     for start in range(0, len(unique_mask), chunk_size):
                         end = min(start + chunk_size, len(unique_mask))
                         global_uniques += np.sum(unique_mask[start:end])
-                    
+
                     reads_to_process = total_reads - global_uniques
 
                 finally:
                     # Clean up temporary files after each iteration
-                    for temp_file in [n_aln_file, max_prob_file, unique_mask_file, 
-                                      non_unique_mask_file, max_prob_scaled_file, final_mask_file]:
+                    for temp_file in [
+                        n_aln_file,
+                        max_prob_file,
+                        unique_mask_file,
+                        non_unique_mask_file,
+                        max_prob_scaled_file,
+                        final_mask_file,
+                    ]:
                         try:
                             if os.path.exists(temp_file):
                                 os.unlink(temp_file)
                         except OSError:
                             pass
-                    
+
                     # Force garbage collection
                     gc.collect()
 
@@ -1179,7 +1253,7 @@ def resolve_multimaps_return_indices(
         final_result = np.memmap(
             final_result_file, dtype=np.bool_, mode="w+", shape=mask.shape
         )
-        
+
         # Copy the result in chunks
         for start in range(0, len(mask), chunk_size):
             end = min(start + chunk_size, len(mask))
@@ -1188,7 +1262,7 @@ def resolve_multimaps_return_indices(
         # Wait for any pending I/O and garbage collect
         final_result.flush()
         gc.collect()
-        
+
         return final_result
 
     finally:
