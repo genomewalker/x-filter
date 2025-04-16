@@ -139,21 +139,6 @@ class ResourceManager:
         self.max_memory = max_memory
         self.max_threads = max_threads
 
-        # Placeholder for detected cache sizes
-        self._L3_CACHE_SIZE = self._detect_cache_size()  # Default L3 size
-        self._CACHE_LINE_SIZE = 64  # Common default
-
-    def _detect_cache_size(self, level=3) -> int:
-        """Attempt to detect L3 cache size (basic placeholder)."""
-        try:
-            pass
-        except Exception:
-            pass
-        vm = psutil.virtual_memory()
-        estimated_cache = min(8 * 1024 * 1024, max(1024 * 1024, int(vm.total / (1024**3)) * 1024 * 1024))
-        log.debug(f"Using fallback L3 cache size estimate: {estimated_cache / (1024*1024):.1f} MB")
-        return estimated_cache
-
     def parse_memory_limit(self, memory_limit: str) -> int:
         """Parse memory limit string to bytes."""
         memory_limit = memory_limit.upper().strip()
@@ -211,126 +196,95 @@ class ResourceManager:
     def calculate_chunk_size(
         self,
         arr_info: ArrayInfo,
-        num_concurrent_chunks: int,
         cache_optimization: bool = True,
-        overhead_factor: float = 0.7,
-        min_chunks_target: int = 10,
-        max_chunk_elements: int = 100_000_000,
-        min_chunk_elements: int = 100_000,
+        max_chunks: int = 100,
     ) -> ChunkingStrategy:
-        """Calculate optimal chunk size and processing strategy based on available resources."""
-        limiting_factor = "Initialization"
+        """Calculate optimal chunk size and processing strategy."""
+        L3_CACHE_SIZE = 8 * 1024 * 1024  # 8MB typical L3 cache
+        CACHE_LINE_SIZE = 64  # 64 bytes typical cache line
 
-        if arr_info.elements == 0:
-            return ChunkingStrategy(1, 1, 0, 1, 1, False)
+        available_memory_gb = min(
+            self.available_memory / (1024**3), arr_info.memory_needed_gb
+        )
 
-        if arr_info.element_size <= 0:
-            log.warning("Array element size is zero or negative, cannot calculate chunk size.")
-            return ChunkingStrategy(1, arr_info.elements, 0, 1, 1, False)
+        scale_strategies = {
+            ArrayScale.TINY: {
+                "chunks": 1,
+                "memory_fraction": 1.0,
+                "thread_fraction": 1.0,
+            },
+            ArrayScale.SMALL: {
+                "chunks": min(4, max_chunks),
+                "memory_fraction": 0.8,
+                "thread_fraction": 0.5,
+            },
+            ArrayScale.MEDIUM: {
+                "chunks": min(8, max_chunks),
+                "memory_fraction": 0.6,
+                "thread_fraction": 0.25,
+            },
+            ArrayScale.LARGE: {
+                "chunks": min(16, max_chunks),
+                "memory_fraction": 0.4,
+                "thread_fraction": 0.125,
+            },
+            ArrayScale.HUGE: {
+                "chunks": min(32, max_chunks),
+                "memory_fraction": 0.2,
+                "thread_fraction": 0.0625,
+            },
+        }
 
-        if num_concurrent_chunks <= 0:
-            log.warning("num_concurrent_chunks must be positive, defaulting to 1.")
-            num_concurrent_chunks = 1
-
-        current_available_memory = self.available_memory
-        usable_memory_for_chunks = int(current_available_memory * overhead_factor)
-
-        if usable_memory_for_chunks <= 0:
-            log.warning("No usable memory available for chunks based on overhead factor, using minimum chunk size.")
-            chunk_elements = max(1, min(min_chunk_elements, arr_info.elements))
-            num_chunks_actual = (arr_info.elements + chunk_elements - 1) // chunk_elements
-            limiting_factor = "No Usable Memory"
-            return ChunkingStrategy(chunk_elements, num_chunks_actual, 0, 1, 1, False)
-
-        memory_based_elements = usable_memory_for_chunks // (arr_info.element_size * num_concurrent_chunks)
-        memory_based_elements = max(1, memory_based_elements)
-        chunk_elements = memory_based_elements
-        limiting_factor = f"Available Memory ({current_available_memory/(1024**3):.2f} GB * {overhead_factor:.2f} / {num_concurrent_chunks} concurrent)"
-
-        current_min_chunks = min_chunks_target
-        if arr_info.scale == ArrayScale.HUGE:
-            current_min_chunks = max(min_chunks_target, 100)
-        elif arr_info.scale == ArrayScale.LARGE:
-            current_min_chunks = max(min_chunks_target, 50)
-
-        max_elements_for_total_size_target = arr_info.elements // current_min_chunks
-        max_elements_reasonable_min = arr_info.elements // 1000
-        max_elements_for_total_size = max(1, max_elements_for_total_size_target, max_elements_reasonable_min)
-
-        if chunk_elements > max_elements_for_total_size:
-            chunk_elements = max_elements_for_total_size
-            limiting_factor = f"Min Chunks Target ({current_min_chunks})"
-
-        if chunk_elements > max_chunk_elements:
-            chunk_elements = max_chunk_elements
-            limiting_factor = f"Max Chunk Elements ({max_chunk_elements:,})"
-
-        effective_min_elements = min(min_chunk_elements, arr_info.elements)
-        if chunk_elements < effective_min_elements:
-            chunk_elements = effective_min_elements
-            if limiting_factor != f"Min Chunk Elements ({effective_min_elements:,})":
-                pass
-            limiting_factor = f"Min Chunk Elements ({effective_min_elements:,})"
-
-        if chunk_elements > arr_info.elements:
-            chunk_elements = arr_info.elements
-            limiting_factor = "Array Total Elements"
-
-        original_chunk_elements = chunk_elements
-        if cache_optimization:
-            chunk_elements = self._optimize_for_cache(
-                chunk_elements, arr_info.element_size, self._L3_CACHE_SIZE, self._CACHE_LINE_SIZE
-            )
-            chunk_elements = max(min(chunk_elements, max_chunk_elements), min(min_chunk_elements, arr_info.elements))
-            chunk_elements = min(chunk_elements, arr_info.elements)
-            chunk_elements = max(1, chunk_elements)
-            if chunk_elements != original_chunk_elements and not limiting_factor.startswith("Cache"):
-                limiting_factor += " + Cache Alignment"
-
-        chunk_elements = max(1, chunk_elements)
-        num_chunks_actual = (arr_info.elements + chunk_elements - 1) // chunk_elements
-        memory_per_chunk_gb = (chunk_elements * arr_info.element_size) / (1024**3)
-        estimated_total_chunk_mem_gb = memory_per_chunk_gb * num_concurrent_chunks
-
+        strategy = scale_strategies[arr_info.scale]
+        memory_per_chunk_gb = (
+            available_memory_gb * strategy["memory_fraction"]
+        ) / strategy["chunks"]
         total_threads = min(arr_info.optimal_threads, self.available_threads)
-        threads_per_chunk = max(1, total_threads // num_chunks_actual) if num_chunks_actual > 0 else 1
-
-        log.info(f"Calculated chunk size: {chunk_elements:,} elements. Limiting Factor: {limiting_factor}")
-        log.info(f"  - Based on: Available Mem: {current_available_memory/(1024**3):.2f} GB, "
-                 f"Concurrent Chunks: {num_concurrent_chunks}, Overhead Factor: {overhead_factor}")
-        log.info(f"  - Estimated memory per chunk: {memory_per_chunk_gb:.3f} GB")
-        log.info(f"  - Estimated total concurrent chunk memory: {estimated_total_chunk_mem_gb:.3f} GB")
-        log.info(f"  - Array Size: {arr_info.elements:,} elements -> Num Chunks: {num_chunks_actual}")
-        log.info(f"  - Threading: Total: {total_threads}, Per Chunk (estimated): {threads_per_chunk}")
+        threads_per_chunk = max(1, int(total_threads * strategy["thread_fraction"]))
 
         return ChunkingStrategy(
-            chunk_size=chunk_elements,
-            num_chunks=num_chunks_actual,
+            chunk_size=self._calculate_chunk_size(
+                arr_info,
+                memory_per_chunk_gb,
+                cache_optimization,
+                L3_CACHE_SIZE,
+                CACHE_LINE_SIZE,
+                threads_per_chunk,
+            ),
+            num_chunks=strategy["chunks"],
             memory_per_chunk_gb=memory_per_chunk_gb,
             threads_per_chunk=threads_per_chunk,
             total_threads=total_threads,
             cache_friendly=cache_optimization,
         )
 
-    def _optimize_for_cache(
+    def _calculate_chunk_size(
         self,
-        current_chunk_elements: int,
-        element_size: int,
+        arr_info: ArrayInfo,
+        memory_per_chunk_gb: float,
+        cache_optimization: bool,
         L3_CACHE_SIZE: int,
         CACHE_LINE_SIZE: int,
+        threads_per_chunk: int,
     ) -> int:
-        """Refine chunk size to align better with cache lines."""
-        if element_size <= 0:
-            return current_chunk_elements
+        """Calculate optimal chunk size based on memory and cache constraints."""
+        bytes_per_chunk = int(memory_per_chunk_gb * 1024**3)
+        elements_per_chunk = bytes_per_chunk // arr_info.element_size
 
-        elements_per_line = max(1, CACHE_LINE_SIZE // element_size)
-        aligned_chunk_elements = (current_chunk_elements // elements_per_line) * elements_per_line
-        aligned_chunk_elements = max(min(elements_per_line, current_chunk_elements), aligned_chunk_elements)
+        if not cache_optimization:
+            return max(1024, min(elements_per_chunk, arr_info.elements))
 
-        final_chunk_elements = aligned_chunk_elements
-        final_chunk_elements = max(1, final_chunk_elements)
+        # Calculate cache-based chunk size
+        cache_elements = L3_CACHE_SIZE // arr_info.element_size
+        elements_per_line = max(1, CACHE_LINE_SIZE // arr_info.element_size)
+        cache_based_chunk_size = min(
+            elements_per_chunk, cache_elements * threads_per_chunk
+        )
+        cache_based_chunk_size = (
+            cache_based_chunk_size // elements_per_line
+        ) * elements_per_line
 
-        return final_chunk_elements
+        return min(cache_based_chunk_size, elements_per_chunk)
 
     def slice_chunk(self, arr: np.ndarray, indices: np.ndarray) -> np.ndarray:
         """Slice a chunk of an array with error handling."""
@@ -349,14 +303,17 @@ class ResourceManager:
         num_chunks = (total_elements + chunk_size - 1) // chunk_size
         max_workers_per_array = max(1, self.max_threads // len(arrays))
 
+        # Calculate total chunks
         total_chunks = num_chunks * len(arrays)
 
+        # Create progress queue
         manager = Manager()
         progress_queue = manager.Queue()
         arrays_list = list(arrays.keys())
         processed_results = {}
 
         with tqdm(total=total_chunks, desc="Processing arrays", unit="chunks") as pbar:
+            # Progress tracking thread
             def update_progress():
                 while True:
                     progress = progress_queue.get()
@@ -368,11 +325,13 @@ class ResourceManager:
             progress_thread.start()
 
             try:
+                # Process arrays in parallel
                 with ProcessPoolExecutor(
                     max_workers=min(len(arrays), self.max_threads)
                 ) as executor:
                     futures = []
 
+                    # Submit all arrays
                     for name in arrays_list:
                         mmap_path = os.path.join(mmap_folder, f"{name}_slice.mmap")
                         future = executor.submit(
@@ -388,6 +347,7 @@ class ResourceManager:
                         )
                         futures.append((future, name))
 
+                    # Process results
                     for future, name in futures:
                         try:
                             result = future.result()
@@ -397,6 +357,7 @@ class ResourceManager:
                             log.error(f"Error processing array {name}: {e}")
 
             finally:
+                # Clean up progress tracking
                 progress_queue.put(None)
                 progress_thread.join()
 
@@ -415,13 +376,16 @@ class ResourceManager:
     ) -> Optional[np.ndarray]:
         """Process chunks of a single array."""
         try:
+            # Create memory map for output
             mmap_out = np.memmap(
                 mmap_path, dtype=arr.dtype, mode="w+", shape=(len(indices),)
             )
 
+            # Process chunks
             with ProcessPoolExecutor(max_workers=max_workers) as chunk_executor:
                 futures = []
 
+                # Submit chunks
                 for chunk_idx in range(num_chunks):
                     start_idx = chunk_idx * chunk_size
                     end_idx = min(start_idx + chunk_size, len(indices))
@@ -430,6 +394,7 @@ class ResourceManager:
                     future = chunk_executor.submit(self.slice_chunk, arr, chunk_indices)
                     futures.append((future, start_idx, end_idx))
 
+                # Process results
                 for future, start_idx, end_idx in futures:
                     try:
                         chunk_data = future.result()

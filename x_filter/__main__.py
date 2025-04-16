@@ -553,7 +553,6 @@ def cleanup_mmap_files(mmap_folder: str) -> None:
     for root, dirs, files in os.walk(mmap_folder, topdown=False):
         for filename in files:
             if filename.startswith(".nfs"):
-                log.debug(f"Skipping NFS temporary file: {os.path.join(root, filename)}")
                 continue  # Skip NFS temporary files
 
             file_path = os.path.join(root, filename)
@@ -588,12 +587,7 @@ def cleanup_mmap_files(mmap_folder: str) -> None:
         # Now try to delete the empty directories (bottom-up due to topdown=False)
         if root != mmap_folder:  # Don't delete the main mmap folder yet
             try:
-                # Check if directory is empty before attempting removal
-                if not os.listdir(root):
-                    os.rmdir(root)
-                else:
-                    # Log if directory is not empty (might contain skipped .nfs files)
-                    log.debug(f"Directory not empty, skipping removal: {root}")
+                os.rmdir(root)
             except Exception as e:
                 log.warning(f"Error deleting directory {root}: {e}")
 
@@ -616,90 +610,6 @@ def cleanup_temp_files(tmp_files: Dict[str, str]) -> None:
                 os.rmdir(dir_path)
         except Exception as e:
             log.warning(f"Error deleting directory {dir_path}: {e}")
-
-
-def retry_cleanup_mmap_files(mmap_path, max_attempts=3, delay=1):
-    """
-    Attempt to clean up memory-mapped files with retry logic.
-
-    Args:
-        mmap_path: Path to the mmap file or directory containing mmap files
-        max_attempts: Maximum number of retry attempts per file
-        delay: Delay in seconds between retry attempts
-
-    Returns:
-        tuple: (success_count, failed_files) - Number of successfully cleaned files and list of files that couldn't be cleaned
-    """
-    log = logging.getLogger(__name__)
-    success_count = 0
-    failed_files = []
-
-    if not mmap_path:
-        log.debug("No memory-mapped path provided to clean up")
-        return success_count, failed_files
-
-    # Handle both file and directory cases
-    files_to_clean = []
-    dirs_to_clean = []
-    if os.path.isdir(mmap_path):
-        for root, dirs, files in os.walk(mmap_path, topdown=False):
-            for name in files:
-                if not name.startswith(".nfs"): # Skip NFS files
-                    files_to_clean.append(os.path.join(root, name))
-            for name in dirs:
-                dirs_to_clean.append(os.path.join(root, name))
-        # Add the root directory itself to the list of directories to remove
-        dirs_to_clean.append(mmap_path)
-    elif os.path.isfile(mmap_path) and not os.path.basename(mmap_path).startswith(".nfs"):
-        files_to_clean = [mmap_path]
-
-    # Clean individual files
-    for file_path in files_to_clean:
-        for attempt in range(max_attempts):
-            try:
-                if os.path.exists(file_path):
-                    os.unlink(file_path)
-                    log.debug(f"Successfully removed mmap file: {file_path}")
-                    success_count += 1
-                break
-            except (OSError, PermissionError) as e:
-                if attempt < max_attempts - 1:
-                    log.debug(
-                        f"Attempt {attempt+1}/{max_attempts} to remove {file_path} failed: {e}. Retrying..."
-                    )
-                    time.sleep(delay)
-                else:
-                    log.warning(
-                        f"Failed to remove mmap file {file_path} after {max_attempts} attempts: {e}"
-                    )
-                    failed_files.append(file_path)
-
-    # Try to remove directories (bottom-up order due to os.walk topdown=False)
-    for dir_path in dirs_to_clean:
-        if os.path.exists(dir_path):
-            for attempt in range(max_attempts):
-                try:
-                    # Only remove if directory is empty (or contains only .nfs files)
-                    if not any(f for f in os.listdir(dir_path) if not f.startswith(".nfs")):
-                        os.rmdir(dir_path)
-                        log.debug(f"Successfully removed directory: {dir_path}")
-                        break
-                    else:
-                        log.debug(f"Directory not empty (contains non-NFS files or subdirs), skipping removal: {dir_path}")
-                        break # Don't retry if not empty
-                except (OSError, PermissionError) as e:
-                    if attempt < max_attempts - 1:
-                        log.debug(
-                            f"Attempt {attempt+1}/{max_attempts} to remove directory {dir_path} failed: {e}. Retrying..."
-                        )
-                        time.sleep(delay)
-                    else:
-                        log.warning(
-                            f"Failed to remove directory {dir_path} after {max_attempts} attempts: {e}"
-                        )
-                        failed_files.append(dir_path)
-
-    return success_count, failed_files
 
 
 def analyze_alignments(
@@ -1034,6 +944,78 @@ def close_and_cleanup_mmap_arrays(
     retry_cleanup_mmap_files(tmp_files["mmap"])
 
 
+def retry_cleanup_mmap_files(mmap_path, max_attempts=3, delay=1):
+    """
+    Attempt to clean up memory-mapped files with retry logic.
+
+    Args:
+        mmap_path: Path to the mmap file or directory containing mmap files
+        max_attempts: Maximum number of retry attempts per file
+        delay: Delay in seconds between retry attempts
+
+    Returns:
+        tuple: (success_count, failed_files) - Number of successfully cleaned files and list of files that couldn't be cleaned
+    """
+    log = logging.getLogger(__name__)
+    success_count = 0
+    failed_files = []
+
+    if not mmap_path:
+        log.debug("No memory-mapped path provided to clean up")
+        return success_count, failed_files
+
+    # Handle both file and directory cases
+    if os.path.isdir(mmap_path):
+        files_to_clean = glob.glob(os.path.join(mmap_path, "*"))
+        # Also try to remove the directory itself after cleaning files
+        dir_to_remove = mmap_path
+    else:
+        files_to_clean = [mmap_path] if os.path.exists(mmap_path) else []
+        dir_to_remove = None
+
+    # Clean individual files
+    for file_path in files_to_clean:
+        for attempt in range(max_attempts):
+            try:
+                if os.path.exists(file_path):
+                    os.unlink(file_path)
+                    log.debug(f"Successfully removed mmap file: {file_path}")
+                    success_count += 1
+                break
+            except (OSError, PermissionError) as e:
+                if attempt < max_attempts - 1:
+                    log.debug(
+                        f"Attempt {attempt+1}/{max_attempts} to remove {file_path} failed: {e}. Retrying..."
+                    )
+                    time.sleep(delay)
+                else:
+                    log.warning(
+                        f"Failed to remove mmap file {file_path} after {max_attempts} attempts: {e}"
+                    )
+                    failed_files.append(file_path)
+
+    # Try to remove the directory if it was a directory
+    if dir_to_remove and os.path.exists(dir_to_remove):
+        for attempt in range(max_attempts):
+            try:
+                shutil.rmtree(dir_to_remove)
+                log.debug(f"Successfully removed mmap directory: {dir_to_remove}")
+                break
+            except (OSError, PermissionError) as e:
+                if attempt < max_attempts - 1:
+                    log.debug(
+                        f"Attempt {attempt+1}/{max_attempts} to remove directory {dir_to_remove} failed: {e}. Retrying..."
+                    )
+                    time.sleep(delay)
+                else:
+                    log.warning(
+                        f"Failed to remove mmap directory {dir_to_remove} after {max_attempts} attempts: {e}"
+                    )
+                    failed_files.append(dir_to_remove)
+
+    return success_count, failed_files
+
+
 def safe_cleanup(tmp_dir_obj):
     """
     A safer version of tempfile's cleanup that handles potential issues with memory-mapped files.
@@ -1094,18 +1076,14 @@ def force_delete_mmap_folder(mmap_folder: str) -> None:
     gc.collect()
     time.sleep(1)  # Give OS time to release locks
 
-    # Get list of all files, excluding .nfs files
+    # Get list of all files
     all_files = []
-    all_dirs = []
     for root, dirs, files in os.walk(mmap_folder, topdown=False):
         for f in files:
-            if not f.startswith(".nfs"):
-                all_files.append(os.path.join(root, f))
-        for d in dirs:
-             all_dirs.append(os.path.join(root, d))
+            all_files.append(os.path.join(root, f))
 
     if all_files:
-        log.info(f"Found {len(all_files)} non-NFS files to remove")
+        log.info(f"Found {len(all_files)} files to remove")
 
         # Try to delete each file individually
         for file_path in all_files:
@@ -1119,23 +1097,14 @@ def force_delete_mmap_folder(mmap_folder: str) -> None:
                 except Exception:
                     log.warning(f"Failed to remove: {file_path}")
 
-    # Try removing directories (bottom-up)
-    for dir_path in all_dirs + [mmap_folder]: # Add root folder last
-        try:
-            # Only remove if directory is empty (or contains only .nfs files)
-            if os.path.exists(dir_path) and not any(f for f in os.listdir(dir_path) if not f.startswith(".nfs")):
-                os.rmdir(dir_path)
-        except Exception as e:
-            log.warning(f"Failed to remove directory {dir_path}: {e}")
-
-    # Try to remove directory tree with force option if it still exists
-    # This might still fail on NFS if .nfs files remain locked
-    if os.path.exists(mmap_folder):
-        try:
-            log.info(f"Attempting shutil.rmtree on: {mmap_folder}")
-            shutil.rmtree(mmap_folder, ignore_errors=True)
-        except Exception as e:
-            log.warning(f"shutil.rmtree failed for mmap folder: {e}")
+    # Try to remove directory tree with force option
+    try:
+        # Using system command as a last resort
+        if os.path.exists(mmap_folder):
+            log.info(f"Using rm -rf to force delete: {mmap_folder}")
+            os.system(f"rm -rf {mmap_folder}")
+    except Exception as e:
+        log.warning(f"Failed to force-delete mmap folder: {e}")
 
 
 def main() -> None:

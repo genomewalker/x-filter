@@ -260,10 +260,8 @@ def calculate_statistics(
         )
 
         # Get chunk strategy for coverage processing
-        # Estimate concurrent chunks needed for coverage update: indices, starts, ends, coverage ~ 4
-        num_concurrent_coverage = 4
         arr_info = resource_mgr.analyze_array(subject_ids)
-        strategy = resource_mgr.calculate_chunk_size(arr_info, num_concurrent_chunks=num_concurrent_coverage)
+        strategy = resource_mgr.calculate_chunk_size(arr_info)
 
         # Calculate maximum subject lengths
         pbar.set_description("Calculating maximum subject lengths")

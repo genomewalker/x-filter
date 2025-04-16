@@ -145,14 +145,12 @@ def get_representative_indices(
     os.makedirs(mmap_folder, exist_ok=True)
 
     # Initialize resource manager
-    resource_mgr = ResourceManager(max_memory=max_memory, max_threads=num_threads)  # Use provided num_threads
-    num_threads = resource_mgr.max_threads  # Update num_threads based on resource manager
+    resource_mgr = ResourceManager(max_memory=max_memory)
+    num_threads = resource_mgr.max_threads
     numba.set_num_threads(num_threads)
 
     arr_info = resource_mgr.analyze_array(row_hashes)
-    # Estimate concurrent chunks for distribution phase: chunk_hashes, chunk_indices, local_bucket write ~ 3
-    num_concurrent_distribute = 3
-    strategy = resource_mgr.calculate_chunk_size(arr_info, num_concurrent_chunks=num_concurrent_distribute)
+    strategy = resource_mgr.calculate_chunk_size(arr_info)
     chunk_size = strategy.chunk_size
 
     # Calculate optimal number of buckets
@@ -176,21 +174,17 @@ def get_representative_indices(
 
     log.info(f"Processing {len(row_hashes):,} elements using {num_buckets} buckets")
     log.info(f"Target elements per bucket: {target_elements_per_bucket:,}")
-    log.info(f"Using chunk size of {chunk_size:,} for distribution")
-    log.info(f"Using {num_threads} threads for Numba operations")
+    log.info(f"Using chunk size of {chunk_size:,}")
 
     # First pass: count elements per bucket
     log.info("Counting elements per bucket...")
     bucket_counts = np.zeros(num_buckets, dtype=np.int64)
-    # Use a potentially larger chunk size for counting as it's less memory intensive per chunk
-    count_chunk_size = chunk_size * 4  # Example: 4x the distribution chunk size
+    count_chunk_size = chunk_size * 4
 
-    # Use the num_threads determined by ResourceManager for Numba counting
-    for start in tqdm.tqdm(range(0, len(row_hashes), count_chunk_size), ncols=80, desc="Counting buckets"):
+    for start in tqdm.tqdm(range(0, len(row_hashes), count_chunk_size), ncols=80):
         end = min(start + count_chunk_size, len(row_hashes))
         chunk_hashes = row_hashes[start:end]
-        # Pass num_threads to the Numba function
-        chunk_counts = fast_count_bucket_sizes(chunk_hashes, num_buckets, n_threads=num_threads)
+        chunk_counts = fast_count_bucket_sizes(chunk_hashes, num_buckets)
         bucket_counts += chunk_counts
 
     # Create bucket files
