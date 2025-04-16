@@ -704,10 +704,14 @@ def memory_efficient_factorize(
     # Initialize resource manager and get chunking strategy
     resource_mgr = ResourceManager(max_memory=max_memory, max_threads=num_threads)
     arr_info = resource_mgr.analyze_array(subject_ids)
-    strategy = resource_mgr.calculate_chunk_size(arr_info)
-    chunk_size = max(100_000_000, strategy.chunk_size)
+    # Estimate concurrent chunks needed: input chunk, indices, assignments, overhead ~ 4
+    num_concurrent_factorize = 4
+    strategy = resource_mgr.calculate_chunk_size(arr_info, num_concurrent_chunks=num_concurrent_factorize)
+    # Use a potentially larger chunk size if memory allows, but respect strategy's calculation
+    # Let's stick to the strategy's calculation for consistency.
+    chunk_size = strategy.chunk_size # max(100_000_000, strategy.chunk_size) # Reverted this override
 
-    log.info(f"Using chunk size of {chunk_size:,} elements")
+    log.info(f"Using chunk size of {chunk_size:,} elements for factorization")
 
     # Create temporary memmap for storing intermediate unique values
     temp_unique = np.memmap(
