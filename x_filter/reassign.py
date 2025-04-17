@@ -487,8 +487,8 @@ def validate_probabilities(
         try:
             if os.path.exists(prob_sum_file):
                 os.unlink(prob_sum_file)
-        except OSError:
-            pass
+            except OSError:
+                pass
 
 
 def chunked_fixed_point_map(
@@ -982,6 +982,7 @@ def resolve_multimaps_return_indices(
     resource_manager: Optional[ResourceManager] = None,
 ) -> np.ndarray:
     """Resolve multimapped reads using chunked processing."""
+    log.info(f"Multimap resolution using scale={scale}")
     # Add memory check before starting iterations
     if resource_manager is not None and not check_memory_requirements(
         prob.nbytes, resource_manager
@@ -1162,6 +1163,7 @@ def resolve_multimaps_return_indices(
                         np.maximum.at(max_prob, chunk_queries, chunk_probs)
 
                     # Create max_prob_scaled as memory-mapped
+                    log.info(f"Applying scale threshold: scale={scale}")
                     max_prob_scaled = np.memmap(
                         max_prob_scaled_file,
                         dtype=np.float64,
@@ -1173,7 +1175,8 @@ def resolve_multimaps_return_indices(
                     for start in range(0, len(mask), chunk_size):
                         end = min(start + chunk_size, len(mask))
                         chunk_queries = query_inverse_indices[start:end]
-                        if scale == 0:
+                        # non-positive scale → exact max; positive scale → fraction of max
+                        if scale <= 0:
                             max_prob_scaled[start:end] = max_prob[chunk_queries]
                         else:
                             max_prob_scaled[start:end] = max_prob[chunk_queries] * scale
