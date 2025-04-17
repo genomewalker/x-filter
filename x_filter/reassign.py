@@ -1181,6 +1181,41 @@ def resolve_multimaps_return_indices(
                         else:
                             max_prob_scaled[start:end] = max_prob[chunk_queries] * scale
 
+                    # Log a random sample to verify scale is having an effect
+                    sample_size = min(10, len(mask))
+                    sample_indices = np.random.choice(
+                        np.arange(len(mask))[mask], sample_size, replace=False
+                    )
+                    log.info(f"Sample probs vs thresholds:")
+                    for idx in sample_indices:
+                        query_idx = query_inverse_indices[idx]
+                        log.info(
+                            f"  Read {query_idx}: prob={prob_working[idx]:.6f}, max={max_prob[query_idx]:.6f}, threshold={max_prob_scaled[idx]:.6f}"
+                        )
+
+                    # Count alignments that would be kept with different scales
+                    if current_iter == 0:  # Only on first iteration
+                        test_scales = [0.0, 0.5, 0.9, 0.99, 1.0]
+                        for test_scale in test_scales:
+                            test_count = 0
+                            for s in range(0, len(mask), chunk_size):
+                                e = min(s + chunk_size, len(mask))
+                                chunk_non_unique = non_unique_mask[s:e]
+                                if not np.any(chunk_non_unique):
+                                    continue
+                                chunk_probs = prob_working[s:e]
+                                chunk_queries = query_inverse_indices[s:e]
+                                if test_scale <= 0:
+                                    test_thresh = max_prob[chunk_queries]
+                                else:
+                                    test_thresh = max_prob[chunk_queries] * test_scale
+                                test_count += np.sum(
+                                    (chunk_probs >= test_thresh) & chunk_non_unique
+                                )
+                            log.info(
+                                f"  Scale {test_scale} would keep {test_count:,} alignments"
+                            )
+
                     pbar.update(1)
 
                     # Create final_mask as memory-mapped
@@ -1200,6 +1235,15 @@ def resolve_multimaps_return_indices(
                         final_mask[start:end] = (
                             chunk_probs >= chunk_max_scaled
                         ) & chunk_non_unique
+
+                    # Count final alignments kept
+                    final_count = 0
+                    for start in range(0, len(final_mask), chunk_size):
+                        end = min(start + chunk_size, len(final_mask))
+                        final_count += np.sum(final_mask[start:end])
+                    log.info(
+                        f"Scale {scale} kept {final_count:,} alignments after filtering"
+                    )
 
                     pbar.update(1)
 
