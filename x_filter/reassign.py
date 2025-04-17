@@ -1294,7 +1294,7 @@ def reassign(
     step_min: float = -1.0,
     step_max: float = -1.0,
     mstep: int = 4,
-    scale: float = 0.9,  # Add scale parameter
+    scale: float = 0.9,
     max_memory: Union[str, float, int] = "4G",
     num_threads: int = 1,
 ) -> pd.DataFrame:
@@ -1371,7 +1371,7 @@ def reassign(
                 step_min=step_min,
                 step_max=step_max,
                 mstep=mstep,
-                scale=scale,  # Forward scale
+                scale=scale,
                 resource_manager=resource_manager,
             )
 
