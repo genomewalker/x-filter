@@ -64,7 +64,7 @@ HELP_MESSAGES = {
     "bitscore": "Bitscore where to filter the results",
     "evalue": "Evalue where to filter the results",
     "filter": "Which filter to use. Possible values are: avgAlnLength, nAlns, avgReadLength, avgIdentity, breadth, avgDepth, covMean, covStd, depthEvenness, breadthExpectedRatio",
-    "scale": "Scale to select the best weighting alignments",
+    "scale": "Scale threshold for selecting alignments (0-1). Lower values keep more alignments. 0=keep all alignments, 0.9=keep alignments ≥90% of maximum probability, 1.0=keep only the best alignments.",
     "evalue_perc": "Percentage of the -log(Evalue) to filter out results",
     "evalue_perc_step": "Step size to find the percentage of the -log(Evalue) to filter out results",
     "mapping_file": "File with mappings to genes for aggregation",

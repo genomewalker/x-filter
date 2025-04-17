@@ -487,8 +487,8 @@ def validate_probabilities(
         try:
             if os.path.exists(prob_sum_file):
                 os.unlink(prob_sum_file)
-        except OSError:
-            pass
+            except OSError:
+                pass
 
 
 def chunked_fixed_point_map(
@@ -1175,9 +1175,9 @@ def resolve_multimaps_return_indices(
                     for start in range(0, len(mask), chunk_size):
                         end = min(start + chunk_size, len(mask))
                         chunk_queries = query_inverse_indices[start:end]
-                        # non-positive scale → exact max; positive scale → fraction of max
                         if scale <= 0:
-                            max_prob_scaled[start:end] = max_prob[chunk_queries]
+                            # When scale=0, set threshold to 0 to keep all alignments
+                            max_prob_scaled[start:end] = 0.0
                         else:
                             max_prob_scaled[start:end] = max_prob[chunk_queries] * scale
 
