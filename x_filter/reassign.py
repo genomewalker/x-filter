@@ -487,8 +487,8 @@ def validate_probabilities(
         try:
             if os.path.exists(prob_sum_file):
                 os.unlink(prob_sum_file)
-            except OSError:
-                pass
+        except OSError:
+            pass
 
 
 def chunked_fixed_point_map(
