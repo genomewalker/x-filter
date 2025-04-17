@@ -432,6 +432,7 @@ def efficient_filter_arrays(
             iters=args.n_iters,
             max_memory=args.max_memory,
             num_threads=num_threads,
+            scale=args.scale,
         )
 
         # Write only essential columns
