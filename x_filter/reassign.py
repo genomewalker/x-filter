@@ -515,18 +515,19 @@ def chunked_fixed_point_map(
         )
         new_prob[:] = input_prob[:]
 
-        # Instead of copying the full masked arrays into memory,
-        # process the indices in manageable chunks directly from memmap.
-        indices = np.nonzero(mask)[0]
-        for start in range(0, len(indices), 1_000_000):
-            end = min(start + 1_000_000, len(indices))
-            idx = indices[start:end]
-            # Process each small chunk from the memmap without a full in-memory copy
-            mp = input_prob[idx]
-            ms = slen[idx]
-            ms[ms == 0] = np.finfo(np.float64).tiny  # avoid zero division
-            s_w = mp / ms
-            new_prob[idx] = mp * s_w
+        # Update masked entries in chunks to avoid allocating full index arrays
+        tiny = np.finfo(np.float64).tiny
+        for cstart in range(0, len(mask), chunk_size):
+            cend = min(cstart + chunk_size, len(mask))
+            cm = mask[cstart:cend]
+            if not np.any(cm):
+                continue
+            # Get indices just for this chunk, keeping memory use low
+            offs = np.nonzero(cm)[0] + cstart
+            mp = input_prob[offs]
+            ms = slen[offs]
+            ms[ms == 0] = tiny
+            new_prob[offs] = mp * (mp / ms)
 
         # Create prob_sum as memory-mapped array
         prob_sum = np.memmap(
@@ -544,10 +545,18 @@ def chunked_fixed_point_map(
             chunk_probs = new_prob[start:end][chunk_mask]
             np.add.at(prob_sum, chunk_queries, chunk_probs)
 
-        # Normalize probabilities
-        mask_sum = prob_sum[query_inverse_indices[mask]]
-        mask_sum[mask_sum == 0] = np.finfo(np.float64).tiny
-        new_prob[mask] = new_prob[mask] / mask_sum
+        # Normalize masked entries in chunks
+        for cstart in range(0, len(mask), chunk_size):
+            cend = min(cstart + chunk_size, len(mask))
+            cm = mask[cstart:cend]
+            if not np.any(cm):
+                continue
+            # Get indices just for this chunk
+            offs = np.nonzero(cm)[0] + cstart
+            qs = query_inverse_indices[offs]
+            sums = prob_sum[qs]
+            sums[sums == 0] = tiny
+            new_prob[offs] = new_prob[offs] / sums
 
         return new_prob
 
