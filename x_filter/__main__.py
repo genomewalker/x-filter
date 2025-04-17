@@ -94,14 +94,14 @@ def efficient_filter_arrays(
 ) -> str:
     """
     Efficiently filter arrays with parallelized filtering and writing
-    
+
     Args:
         final_stats: DataFrame with filtering statistics
         numpy_arrays: Dictionary of numpy arrays to filter
         tmp_files: Dictionary with paths to temporary directories
         args: Command line arguments
         max_chunk_size: Maximum chunk size for memory-efficient processing
-    
+
     Returns:
         Path to file with filtered IDs
     """
@@ -183,6 +183,7 @@ def efficient_filter_arrays(
                 iters=args.n_iters,
                 max_memory=args.max_memory,
                 num_threads=num_threads,
+                scale=args.scale,
             )
 
             # Write only essential columns
@@ -209,12 +210,14 @@ def efficient_filter_arrays(
     match_counts = [np.int64(0)] * total_chunks  # Use np.int64 for match counts
     current_pos = np.int64(0)  # Explicitly use 64-bit integer
     position_lock = threading.Lock()  # Create a proper lock for thread synchronization
-    accumulated_matches = np.zeros(total_chunks, dtype=np.int64)  # Track matches per chunk
+    accumulated_matches = np.zeros(
+        total_chunks, dtype=np.int64
+    )  # Track matches per chunk
 
     def filter_and_write_chunk(chunk_idx):
         start = chunk_idx * chunk_size
         end = min(start + chunk_size, len(numpy_arrays["subject_numeric_id"]))
-        
+
         # Get chunk and find matches
         chunk_subjects = numpy_arrays["subject_numeric_id"][start:end]
         mask = np.isin(chunk_subjects, target_subjects)
@@ -314,9 +317,15 @@ def efficient_filter_arrays(
         # Process chunks to build filtered arrays
         current_pos = np.int64(0)  # Explicitly use 64-bit integer
         chunk_size = min(chunk_size, max_chunk_size)  # Use the configurable parameter
-        position_lock = threading.Lock()  # Create a proper lock for thread synchronization
-        total_chunks = (len(numpy_arrays["subject_numeric_id"]) + chunk_size - 1) // chunk_size
-        accumulated_matches = np.zeros(total_chunks, dtype=np.int64)  # Track matches per chunk
+        position_lock = (
+            threading.Lock()
+        )  # Create a proper lock for thread synchronization
+        total_chunks = (
+            len(numpy_arrays["subject_numeric_id"]) + chunk_size - 1
+        ) // chunk_size
+        accumulated_matches = np.zeros(
+            total_chunks, dtype=np.int64
+        )  # Track matches per chunk
 
         def build_filtered_chunk(chunk_idx):
             nonlocal current_pos
@@ -326,7 +335,9 @@ def efficient_filter_arrays(
             # Get chunk and find matches
             chunk_subjects = numpy_arrays["subject_numeric_id"][start:end]
             mask = np.isin(chunk_subjects, target_subjects)
-            chunk_matches = np.int64(np.sum(mask))  # Get number of matches as 64-bit int
+            chunk_matches = np.int64(
+                np.sum(mask)
+            )  # Get number of matches as 64-bit int
             accumulated_matches[chunk_idx] = chunk_matches  # Store for debugging
 
             if chunk_matches > 0:
@@ -334,10 +345,12 @@ def efficient_filter_arrays(
                 with position_lock:
                     pos = current_pos  # Get current position
                     current_pos += chunk_matches  # Update position atomically
-                    
+
                 # Log more debug info for very large chunks
                 if chunk_matches > max_chunk_size:
-                    log.debug(f"Chunk {chunk_idx}: Processing {chunk_matches:,} matches at position {pos:,}")
+                    log.debug(
+                        f"Chunk {chunk_idx}: Processing {chunk_matches:,} matches at position {pos:,}"
+                    )
 
                 # Copy filtered data to memory-mapped arrays
                 for key in filtered_arrays:
@@ -357,9 +370,11 @@ def efficient_filter_arrays(
         current_pos = np.int64(0)  # Reset position counter
 
         # Process chunks in parallel with fewer workers for big data
-        max_workers = max(num_threads, 8) if total_matches > 100_000_000_000 else num_threads
+        max_workers = (
+            max(num_threads, 8) if total_matches > 100_000_000_000 else num_threads
+        )
         log.info(f"Using {max_workers} parallel workers for building filtered arrays")
-        
+
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
             futures = [
                 executor.submit(build_filtered_chunk, i) for i in range(total_chunks)
@@ -375,18 +390,20 @@ def efficient_filter_arrays(
         # Verify we got the expected number of matches
         actual_matches = np.int64(sum(match_counts))  # Explicitly use 64-bit sum
         if actual_matches != total_matches:
-            log.warning(f"Expected {total_matches:,} matches but got {actual_matches:,}")
-            
+            log.warning(
+                f"Expected {total_matches:,} matches but got {actual_matches:,}"
+            )
+
             # More detailed diagnostics
             expected_from_chunks = np.sum(accumulated_matches)
             log.warning(f"Sum of accumulated matches: {expected_from_chunks:,}")
             if expected_from_chunks != actual_matches:
                 log.warning("Mismatch between accumulated and returned match counts!")
-                
+
             # Check for overflow
             if actual_matches < 0 or total_matches < 0:
                 log.error("Integer overflow detected in match counts!")
-                
+
             # Resize memory-mapped arrays to actual size for safety
             log.info(f"Resizing memory-mapped arrays to {actual_matches:,} elements")
             for key in filtered_arrays:
@@ -396,7 +413,7 @@ def efficient_filter_arrays(
                     del filtered_arrays[key]
                 except:
                     pass
-                
+
                 # Create a new memmap with correct size
                 new_mmap = np.memmap(
                     os.path.join(tmp_files["mmap"], f"filtered_{key}.dat"),
@@ -1127,9 +1144,9 @@ def main() -> None:
         )
 
         filtered_ids_path = efficient_filter_arrays(
-            final_stats, 
-            numpy_arrays, 
-            tmp_files, 
+            final_stats,
+            numpy_arrays,
+            tmp_files,
             args,
             max_chunk_size=100_000_000,  # Can be adjusted based on dataset size and memory
         )
