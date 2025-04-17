@@ -1186,12 +1186,12 @@ def resolve_multimaps_return_indices(
                     sample_indices = np.random.choice(
                         np.arange(len(mask))[mask], sample_size, replace=False
                     )
-                    log.info(f"Sample probs vs thresholds:")
-                    for idx in sample_indices:
-                        query_idx = query_inverse_indices[idx]
-                        log.info(
-                            f"  Read {query_idx}: prob={prob_working[idx]:.6f}, max={max_prob[query_idx]:.6f}, threshold={max_prob_scaled[idx]:.6f}"
-                        )
+                    # log.info(f"Sample probs vs thresholds:")
+                    # for idx in sample_indices:
+                    #     query_idx = query_inverse_indices[idx]
+                    #     log.info(
+                    #         f"  Read {query_idx}: prob={prob_working[idx]:.6f}, max={max_prob[query_idx]:.6f}, threshold={max_prob_scaled[idx]:.6f}"
+                    #     )
 
                     # Count alignments that would be kept with different scales
                     if current_iter == 0:  # Only on first iteration
