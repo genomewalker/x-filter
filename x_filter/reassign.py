@@ -372,8 +372,10 @@ def calculate_optimal_chunk_size(
     chunk_size = max(min(chunk_size, array_size), MIN_CHUNK_SIZE)
 
     # Log the calculation details
-    num_chunks = max(1, (array_size + chunk_size - 1) // chunk_size) # Ceiling division
-    memory_usage_gb = (chunk_size * dtype_size * 5) / (1024 * 1024 * 1024) # Estimated peak usage
+    num_chunks = max(1, (array_size + chunk_size - 1) // chunk_size)  # Ceiling division
+    memory_usage_gb = (chunk_size * dtype_size * 5) / (
+        1024 * 1024 * 1024
+    )  # Estimated peak usage
     log.info(
         f"Calculated chunk size: {chunk_size:,} elements "
         f"(estimated peak usage per chunk: {memory_usage_gb:.2f} GB) for {array_size:,} total elements"
@@ -457,9 +459,15 @@ def chunked_initialize_weights(
 def validate_probabilities(
     prob: np.ndarray, query_indices: np.ndarray, max_query: int, mmap_folder: str
 ) -> bool:
-    """Validate probability array for numerical stability."""
-    if np.any(prob < 0):
-        return False
+    """Validate probability array for numerical stability using chunked processing."""
+    chunk_size = 1_000_000  # Use a fixed chunk size for validation checks
+
+    # Chunked check for negative probabilities
+    for i in range(0, len(prob), chunk_size):
+        chunk_end = min(i + chunk_size, len(prob))
+        if np.any(prob[i:chunk_end] < 0):
+            log.warning("Validation failed: Negative probabilities found.")
+            return False
 
     # Use memmap for large temporary array
     prob_sum_file = os.path.join(mmap_folder, "prob_sum_temp.mmap")
@@ -469,20 +477,37 @@ def validate_probabilities(
         )
         prob_sum.fill(0)
 
-        # Process in chunks to reduce memory usage
-        chunk_size = 1_000_000
+        # Process accumulation in chunks (already chunked)
         for i in range(0, len(query_indices), chunk_size):
             chunk_end = min(i + chunk_size, len(query_indices))
-            np.add.at(prob_sum, query_indices[i:chunk_end], prob[i:chunk_end])
+            # Ensure indices are within bounds of prob array if lengths differ
+            prob_chunk_end = min(i + chunk_size, len(prob))
+            if i >= len(prob):  # Avoid index error if query_indices is longer than prob
+                break
+            np.add.at(prob_sum, query_indices[i:chunk_end], prob[i:prob_chunk_end])
 
-        result = not np.any(prob_sum == 0)
-        return result
+        # Chunked check for zero sums
+        for i in range(0, len(prob_sum), chunk_size):
+            chunk_end = min(i + chunk_size, len(prob_sum))
+            if np.any(prob_sum[i:chunk_end] == 0):
+                log.warning(
+                    "Validation failed: Zero probability sum found for some queries."
+                )
+                return False
+
+        return True  # Validation passed
     finally:
+        # Ensure cleanup happens even if checks fail early
         try:
+            # Explicitly delete memmap object before unlinking
+            del prob_sum
+            gc.collect()  # Suggest garbage collection
             if os.path.exists(prob_sum_file):
                 os.unlink(prob_sum_file)
-            except OSError:
-                pass
+        except NameError:  # prob_sum might not be defined if memmap creation failed
+            pass
+        except OSError as e:
+            log.warning(f"Error deleting temporary file {prob_sum_file}: {e}")
 
 
 def chunked_fixed_point_map(
@@ -672,11 +697,11 @@ def chunked_squarem_step(
         )
     except Exception as e:
         log.error(f"Failed to compute first fixed point map: {str(e)}")
-        return prob
+        return prob  # Return original prob if first step fails
 
     if q is None:
         log.error("First fixed point calculation returned None")
-        return prob
+        return prob  # Return original prob if first step returns None
 
     # Process each step with careful memory management
     r_file = os.path.join(mmap_folder, "r_temp.mmap")
@@ -794,6 +819,7 @@ def chunked_squarem_step(
 
         # Explicitly release memory before validation
         log.info("Releasing intermediate arrays before validation")
+        q_ref = q  # Keep a reference before deleting
         try:
             del q
             del r
@@ -867,7 +893,9 @@ def chunked_squarem_step(
             r = np.memmap(r_file, dtype=np.float64, mode="r", shape=prob.shape)
             v = np.memmap(v_file, dtype=np.float64, mode="r", shape=prob.shape)
         except FileNotFoundError:
-            log.error("Could not re-open r or v for step halving. Returning previous iterate.")
+            log.error(
+                "Could not re-open r or v for step halving. Returning previous iterate."
+            )
             return prob
 
         p_new = np.memmap(p_new_file, dtype=np.float64, mode="r+", shape=prob.shape)
@@ -958,11 +986,17 @@ def chunked_squarem_step(
 
     except Exception as e:
         log.error(f"Error in SQUAREM step: {str(e)}")
+        # Check q2 first, then the reference to the original q, then fallback to prob
         if "q2" in locals() and q2 is not None:
+            log.warning("Returning second iterate (q2) due to error.")
             return q2
-        elif q is not None:
-            return q
-        return prob
+        elif "q_ref" in locals() and q_ref is not None:
+            log.warning("Returning first iterate (q) due to error after its deletion.")
+            return q_ref  # Return the saved reference if q was deleted
+        else:
+            # This case covers errors early on or if q_ref was somehow None
+            log.warning("Returning original probabilities (prob) due to error.")
+            return prob
 
     finally:
         # Clean up all temporary files
