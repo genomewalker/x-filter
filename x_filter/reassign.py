@@ -359,32 +359,26 @@ def calculate_optimal_chunk_size(
     MAX_CHUNK_SIZE = 100_000_000
 
     # Calculate memory-based chunk size
-    memory_based_size = usable_memory // (
-        dtype_size * 3
-    )  # Account for multiple array copies
+    # Account for multiple array copies (e.g., prob, q, r, v, p_new in SQUAREM)
+    # A factor of 5 seems reasonable for SQUAREM's peak usage.
+    memory_based_size = usable_memory // (dtype_size * 5)
 
-    # For very large arrays, limit chunks based on number of elements
-    if array_size > 1_000_000_000:  # More than 1 billion elements
-        # Use fewer chunks for very large arrays, but still cap at MAX_CHUNK_SIZE
-        min_chunks = 1000 if array_size > 10_000_000_000 else 500
-        array_based_size = min(array_size // min_chunks, MAX_CHUNK_SIZE)
-
-        # Use the smaller of the two sizes to ensure we don't use too much memory
-        chunk_size = min(memory_based_size, array_based_size)
-    else:
-        # For smaller arrays, still respect memory constraints and max size
-        chunk_size = min(memory_based_size, MAX_CHUNK_SIZE)
+    # Use the smaller of the memory-based size and the absolute max size
+    chunk_size = min(memory_based_size, MAX_CHUNK_SIZE)
 
     # Ensure minimum reasonable size and don't exceed array size
-    chunk_size = max(min(chunk_size, array_size), 100_000)
+    # Increase minimum chunk size slightly for potentially better performance
+    MIN_CHUNK_SIZE = 500_000
+    chunk_size = max(min(chunk_size, array_size), MIN_CHUNK_SIZE)
 
     # Log the calculation details
-    memory_usage_gb = (chunk_size * dtype_size) / (1024 * 1024 * 1024)
+    num_chunks = max(1, (array_size + chunk_size - 1) // chunk_size) # Ceiling division
+    memory_usage_gb = (chunk_size * dtype_size * 5) / (1024 * 1024 * 1024) # Estimated peak usage
     log.info(
         f"Calculated chunk size: {chunk_size:,} elements "
-        f"({memory_usage_gb:.2f} GB) for {array_size:,} total elements"
+        f"(estimated peak usage per chunk: {memory_usage_gb:.2f} GB) for {array_size:,} total elements"
     )
-    log.info(f"This will process the array in {array_size/chunk_size:.1f} chunks")
+    log.info(f"This will process the array in {num_chunks:,} chunks")
 
     return chunk_size
 
@@ -487,8 +481,8 @@ def validate_probabilities(
         try:
             if os.path.exists(prob_sum_file):
                 os.unlink(prob_sum_file)
-        except OSError:
-            pass
+            except OSError:
+                pass
 
 
 def chunked_fixed_point_map(
@@ -1182,10 +1176,10 @@ def resolve_multimaps_return_indices(
                             max_prob_scaled[start:end] = max_prob[chunk_queries] * scale
 
                     # Log a random sample to verify scale is having an effect
-                    sample_size = min(10, len(mask))
-                    sample_indices = np.random.choice(
-                        np.arange(len(mask))[mask], sample_size, replace=False
-                    )
+                    # sample_size = min(10, len(mask))
+                    # sample_indices = np.random.choice(
+                    #     np.arange(len(mask))[mask], sample_size, replace=False
+                    # )
                     # log.info(f"Sample probs vs thresholds:")
                     # for idx in sample_indices:
                     #     query_idx = query_inverse_indices[idx]
@@ -1194,27 +1188,27 @@ def resolve_multimaps_return_indices(
                     #     )
 
                     # Count alignments that would be kept with different scales
-                    if current_iter == 0:  # Only on first iteration
-                        test_scales = [0.0, 0.5, 0.9, 0.99, 1.0]
-                        for test_scale in test_scales:
-                            test_count = 0
-                            for s in range(0, len(mask), chunk_size):
-                                e = min(s + chunk_size, len(mask))
-                                chunk_non_unique = non_unique_mask[s:e]
-                                if not np.any(chunk_non_unique):
-                                    continue
-                                chunk_probs = prob_working[s:e]
-                                chunk_queries = query_inverse_indices[s:e]
-                                if test_scale <= 0:
-                                    test_thresh = max_prob[chunk_queries]
-                                else:
-                                    test_thresh = max_prob[chunk_queries] * test_scale
-                                test_count += np.sum(
-                                    (chunk_probs >= test_thresh) & chunk_non_unique
-                                )
-                            log.info(
-                                f"  Scale {test_scale} would keep {test_count:,} alignments"
-                            )
+                    # if current_iter == 0:  # Only on first iteration
+                    #     test_scales = [0.0, 0.5, 0.9, 0.99, 1.0]
+                    #     for test_scale in test_scales:
+                    #         test_count = 0
+                    #         for s in range(0, len(mask), chunk_size):
+                    #             e = min(s + chunk_size, len(mask))
+                    #             chunk_non_unique = non_unique_mask[s:e]
+                    #             if not np.any(chunk_non_unique):
+                    #                 continue
+                    #             chunk_probs = prob_working[s:e]
+                    #             chunk_queries = query_inverse_indices[s:e]
+                    #             if test_scale <= 0:
+                    #                 test_thresh = max_prob[chunk_queries]
+                    #             else:
+                    #                 test_thresh = max_prob[chunk_queries] * test_scale
+                    #             test_count += np.sum(
+                    #                 (chunk_probs >= test_thresh) & chunk_non_unique
+                    #             )
+                    #         log.info(
+                    #             f"  Scale {test_scale} would keep {test_count:,} alignments"
+                    #         )
 
                     pbar.update(1)
 
