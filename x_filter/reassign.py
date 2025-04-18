@@ -790,6 +790,18 @@ def chunked_squarem_step(
             # Flush less frequently
             if start % (mega_chunk * 2) == 0:
                 p_new.flush()
+        p_new.flush()  # Ensure final flush
+
+        # Explicitly release memory before validation
+        log.info("Releasing intermediate arrays before validation")
+        try:
+            del q
+            del r
+            del v
+        except NameError:
+            log.warning("Could not delete one or more intermediate arrays (q, r, v).")
+            pass
+        gc.collect()  # Force garbage collection
 
         # Validate probabilities
         log.info("Validating accelerated point")
@@ -851,8 +863,13 @@ def chunked_squarem_step(
 
         # If initial validation fails, try step halving
         log.info("Initial validation failed, attempting step halving")
-        r = np.memmap(r_file, dtype=np.float64, mode="r", shape=prob.shape)
-        v = np.memmap(v_file, dtype=np.float64, mode="r", shape=prob.shape)
+        try:
+            r = np.memmap(r_file, dtype=np.float64, mode="r", shape=prob.shape)
+            v = np.memmap(v_file, dtype=np.float64, mode="r", shape=prob.shape)
+        except FileNotFoundError:
+            log.error("Could not re-open r or v for step halving. Returning previous iterate.")
+            return prob
+
         p_new = np.memmap(p_new_file, dtype=np.float64, mode="r+", shape=prob.shape)
 
         for m in range(mstep):
@@ -941,7 +958,6 @@ def chunked_squarem_step(
 
     except Exception as e:
         log.error(f"Error in SQUAREM step: {str(e)}")
-        # In case of error, try to return q2 if available, otherwise return q if available, finally return prob
         if "q2" in locals() and q2 is not None:
             return q2
         elif q is not None:
@@ -1174,41 +1190,6 @@ def resolve_multimaps_return_indices(
                             max_prob_scaled[start:end] = 0.0
                         else:
                             max_prob_scaled[start:end] = max_prob[chunk_queries] * scale
-
-                    # Log a random sample to verify scale is having an effect
-                    # sample_size = min(10, len(mask))
-                    # sample_indices = np.random.choice(
-                    #     np.arange(len(mask))[mask], sample_size, replace=False
-                    # )
-                    # log.info(f"Sample probs vs thresholds:")
-                    # for idx in sample_indices:
-                    #     query_idx = query_inverse_indices[idx]
-                    #     log.info(
-                    #         f"  Read {query_idx}: prob={prob_working[idx]:.6f}, max={max_prob[query_idx]:.6f}, threshold={max_prob_scaled[idx]:.6f}"
-                    #     )
-
-                    # Count alignments that would be kept with different scales
-                    # if current_iter == 0:  # Only on first iteration
-                    #     test_scales = [0.0, 0.5, 0.9, 0.99, 1.0]
-                    #     for test_scale in test_scales:
-                    #         test_count = 0
-                    #         for s in range(0, len(mask), chunk_size):
-                    #             e = min(s + chunk_size, len(mask))
-                    #             chunk_non_unique = non_unique_mask[s:e]
-                    #             if not np.any(chunk_non_unique):
-                    #                 continue
-                    #             chunk_probs = prob_working[s:e]
-                    #             chunk_queries = query_inverse_indices[s:e]
-                    #             if test_scale <= 0:
-                    #                 test_thresh = max_prob[chunk_queries]
-                    #             else:
-                    #                 test_thresh = max_prob[chunk_queries] * test_scale
-                    #             test_count += np.sum(
-                    #                 (chunk_probs >= test_thresh) & chunk_non_unique
-                    #             )
-                    #         log.info(
-                    #             f"  Scale {test_scale} would keep {test_count:,} alignments"
-                    #         )
 
                     pbar.update(1)
 
