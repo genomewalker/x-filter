@@ -457,55 +457,95 @@ def chunked_initialize_weights(
 
 
 def validate_probabilities(
-    prob: np.ndarray, query_indices: np.ndarray, max_query: int, mmap_folder: str
+    prob: np.memmap,  # Full probability array
+    query_indices: np.memmap,  # Full query indices array
+    mask: np.memmap,  # Full mask array
+    max_query: int,
+    mmap_folder: str,
+    chunk_size: int = 10_000_000,  # Increased default chunk size for validation
 ) -> bool:
-    """Validate probability array for numerical stability using chunked processing."""
-    chunk_size = 1_000_000  # Use a fixed chunk size for validation checks
+    """
+    Validate probability array for numerical stability using chunked processing,
+    applying mask internally.
+    """
+    log.debug(f"Validating probabilities with chunk size: {chunk_size:,}")
 
-    # Chunked check for negative probabilities
+    # Chunked check for negative probabilities within the mask
     for i in range(0, len(prob), chunk_size):
         chunk_end = min(i + chunk_size, len(prob))
-        if np.any(prob[i:chunk_end] < 0):
-            log.warning("Validation failed: Negative probabilities found.")
+        chunk_mask = mask[i:chunk_end]
+        if not np.any(chunk_mask):
+            continue
+        # Only check masked values
+        if np.any(prob[i:chunk_end][chunk_mask] < 0):
+            log.warning("Validation failed: Negative probabilities found within mask.")
             return False
+    log.debug("Negative probability check passed.")
 
     # Use memmap for large temporary array
-    prob_sum_file = os.path.join(mmap_folder, "prob_sum_temp.mmap")
+    prob_sum_file = os.path.join(
+        mmap_folder, "prob_sum_temp_validate.mmap"
+    )  # Unique name
+    prob_sum = None  # Initialize
     try:
         prob_sum = np.memmap(
             prob_sum_file, dtype=np.float64, mode="w+", shape=(max_query + 1,)
         )
         prob_sum.fill(0)
+        log.debug(f"Created temporary prob_sum array: {prob_sum_file}")
 
-        # Process accumulation in chunks (already chunked)
-        for i in range(0, len(query_indices), chunk_size):
-            chunk_end = min(i + chunk_size, len(query_indices))
-            # Ensure indices are within bounds of prob array if lengths differ
-            prob_chunk_end = min(i + chunk_size, len(prob))
-            if i >= len(prob):  # Avoid index error if query_indices is longer than prob
-                break
-            np.add.at(prob_sum, query_indices[i:chunk_end], prob[i:prob_chunk_end])
+        # Process accumulation in chunks, applying mask
+        processed_elements = 0
+        for i in range(0, len(prob), chunk_size):
+            chunk_end = min(i + chunk_size, len(prob))
+            chunk_mask = mask[i:chunk_end]
+
+            if not np.any(chunk_mask):
+                continue
+
+            # Get masked indices and probabilities for the current chunk
+            chunk_query_indices = query_indices[i:chunk_end][chunk_mask]
+            chunk_prob = prob[i:chunk_end][chunk_mask]
+
+            if len(chunk_query_indices) > 0:
+                np.add.at(prob_sum, chunk_query_indices, chunk_prob)
+                processed_elements += len(chunk_query_indices)
+
+        log.debug(
+            f"Accumulated probabilities for {processed_elements:,} masked elements."
+        )
+        prob_sum.flush()  # Ensure sums are written before checking
 
         # Chunked check for zero sums
+        has_zero_sum = False
         for i in range(0, len(prob_sum), chunk_size):
             chunk_end = min(i + chunk_size, len(prob_sum))
+            # Check if any element in the chunk is exactly zero
             if np.any(prob_sum[i:chunk_end] == 0):
-                log.warning(
-                    "Validation failed: Zero probability sum found for some queries."
-                )
-                return False
+                log.warning("Validation failed: Zero probability sum found.")
+                has_zero_sum = True
+                break  # Exit loop early on failure
 
+        if has_zero_sum:
+            return False
+
+        log.debug("Zero probability sum check passed.")
         return True  # Validation passed
+
+    except Exception as e:
+        log.error(f"Error during probability validation: {e}")
+        return False  # Treat any exception during validation as failure
     finally:
-        # Ensure cleanup happens even if checks fail early
+        # Ensure cleanup happens even if checks fail early or exceptions occur
         try:
-            # Explicitly delete memmap object before unlinking
-            del prob_sum
-            gc.collect()  # Suggest garbage collection
+            if prob_sum is not None:
+                del prob_sum
+                gc.collect()  # Suggest garbage collection
             if os.path.exists(prob_sum_file):
                 os.unlink(prob_sum_file)
-        except NameError:  # prob_sum might not be defined if memmap creation failed
-            pass
+                log.debug(f"Deleted temporary file: {prob_sum_file}")
+        except NameError:
+            pass  # prob_sum might not be defined
         except OSError as e:
             log.warning(f"Error deleting temporary file {prob_sum_file}: {e}")
 
@@ -832,7 +872,7 @@ def chunked_squarem_step(
         # Validate probabilities
         log.info("Validating accelerated point")
         valid = validate_probabilities(
-            p_new[mask], query_inverse_indices[mask], max_query, mmap_folder
+            p_new, query_inverse_indices, mask, max_query, mmap_folder
         )
 
         if valid:
@@ -871,7 +911,7 @@ def chunked_squarem_step(
 
             # Validate final result
             valid_final = validate_probabilities(
-                final_result[mask], query_inverse_indices[mask], max_query, mmap_folder
+                final_result, query_inverse_indices, mask, max_query, mmap_folder
             )
 
             if valid_final:
@@ -917,7 +957,7 @@ def chunked_squarem_step(
                     gc.collect()
 
             valid = validate_probabilities(
-                p_new[mask], query_inverse_indices[mask], max_query, mmap_folder
+                p_new, query_inverse_indices, mask, max_query, mmap_folder
             )
 
             if valid:
