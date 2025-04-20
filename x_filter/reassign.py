@@ -311,7 +311,10 @@ def compute_p_new(
     """JIT-compiled function to compute p_new efficiently."""
     result = np.empty_like(prob_chunk)
     for i in range(len(prob_chunk)):
-        result[i] = prob_chunk[i] + two_alpha * r_chunk[i] + alpha2 * v_chunk[i]
+        # Calculate new value and enforce non-negativity
+        val = prob_chunk[i] + two_alpha * r_chunk[i] + alpha2 * v_chunk[i]
+        # Ensure non-negative probabilities
+        result[i] = max(0.0, val)
     return result
 
 
@@ -909,9 +912,12 @@ def chunked_squarem_step(
             del result
             gc.collect()
 
-            # Validate final result
             valid_final = validate_probabilities(
-                final_result, query_inverse_indices, mask, max_query, mmap_folder
+                final_result,
+                query_inverse_indices,
+                mask,
+                max_query,
+                mmap_folder,
             )
 
             if valid_final:
@@ -944,13 +950,15 @@ def chunked_squarem_step(
             alpha = alpha / 2
             log.info(f"Step halving iteration {m+1}, alpha={alpha:.6f}")
 
-            # Update p_new in chunks
+            # Update p_new in chunks using compute_p_new (keeps non-negativity)
             for start in range(0, len(prob), chunk_size):
                 end = min(start + chunk_size, len(prob))
-                p_new[start:end] = (
-                    prob[start:end]
-                    + 2 * alpha * r[start:end]
-                    + alpha * alpha * v[start:end]
+                p_new[start:end] = compute_p_new(
+                    prob[start:end],
+                    r[start:end],
+                    v[start:end],
+                    2 * alpha,
+                    alpha * alpha,
                 )
                 if start % (chunk_size * 5) == 0:
                     p_new.flush()
@@ -998,8 +1006,9 @@ def chunked_squarem_step(
                 gc.collect()
 
                 valid_final = validate_probabilities(
-                    final_result[mask],
-                    query_inverse_indices[mask],
+                    final_result,
+                    query_inverse_indices,
+                    mask,
                     max_query,
                     mmap_folder,
                 )
