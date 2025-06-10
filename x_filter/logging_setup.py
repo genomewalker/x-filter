@@ -47,3 +47,12 @@ def get_logger(name: Optional[str] = None) -> logging.Logger:
     if name is None:
         return logging.getLogger("my_logger")
     return logging.getLogger(name)
+
+def is_debug() -> bool:
+    """
+    Check if debug mode is enabled.
+    
+    Returns:
+        bool: True if logging level is DEBUG, False otherwise
+    """
+    return logging.getLogger().getEffectiveLevel() == logging.DEBUG

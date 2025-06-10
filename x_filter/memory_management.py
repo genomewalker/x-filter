@@ -5,34 +5,80 @@ import numpy as np
 import threading
 from typing import Dict, Optional, Any, List, Tuple
 from x_filter.logging_setup import get_logger
+import psutil
 
 log = get_logger()
 
 
 class MemmapArrayManager:
-    """Manages memory-mapped arrays with robust creation and cleanup capabilities.
+    """Manages memory-mapped arrays with robust creation and cleanup capabilities."""
 
-    This class provides a consistent interface for creating, accessing, and cleaning up
-    memory-mapped numpy arrays throughout the codebase.
-    """
-
-    def __init__(self, mmap_folder: str, name: str = "default"):
+    def __init__(self, mmap_folder: str, name: str = "default", max_memory: Optional[str] = None):
         """Initialize the memory-mapped array manager.
 
         Args:
             mmap_folder: Base directory for storing memory-mapped files
             name: Name for this array manager instance
+            max_memory: Maximum memory limit as string (e.g., "32GB")
         """
         self.mmap_folder = mmap_folder
         self.name = name
         self.arrays: Dict[str, np.memmap] = {}
         self.array_paths: Dict[str, str] = {}
         self.locks: Dict[str, threading.Lock] = {}
+        
+        # Parse memory limit
+        if max_memory:
+            self.max_memory_bytes = self._parse_memory_limit(max_memory)
+        else:
+            # Default to 80% of available memory
+            vm = psutil.virtual_memory()
+            self.max_memory_bytes = int(vm.available * 0.8)
 
         # Create folder if it doesn't exist
         os.makedirs(mmap_folder, exist_ok=True)
 
-        log.debug(f"Initialized ArrayManager '{name}' in {mmap_folder}")
+        log.debug(f"Initialized ArrayManager '{name}' in {mmap_folder} with {self.max_memory_bytes / (1024**3):.1f}GB limit")
+
+    def _parse_memory_limit(self, memory_limit: str) -> int:
+        """Parse memory limit string to bytes."""
+        memory_limit = memory_limit.upper().strip()
+        
+        # Support both single and multi-letter units
+        unit_multipliers = {
+            'B': 1,
+            'K': 1024, 'KB': 1024, 'KIB': 1024,
+            'M': 1024**2, 'MB': 1024**2, 'MIB': 1024**2,
+            'G': 1024**3, 'GB': 1024**3, 'GIB': 1024**3,
+            'T': 1024**4, 'TB': 1024**4, 'TIB': 1024**4,
+        }
+        
+        # Find unit suffix - check longer units first to avoid partial matches
+        for unit_name in sorted(unit_multipliers.keys(), key=len, reverse=True):
+            if memory_limit.endswith(unit_name):
+                number_str = memory_limit[:-len(unit_name)].strip()
+                try:
+                    number = float(number_str)
+                    return int(number * unit_multipliers[unit_name])
+                except ValueError:
+                    break
+        
+        # Fallback
+        vm = psutil.virtual_memory()
+        return int(vm.available * 0.8)
+
+    def estimate_memory_usage(self) -> int:
+        """Estimate current memory usage of all managed arrays in bytes."""
+        total_bytes = 0
+        for array in self.arrays.values():
+            if hasattr(array, 'nbytes'):
+                total_bytes += array.nbytes
+        return total_bytes
+
+    def check_memory_availability(self, needed_bytes: int) -> bool:
+        """Check if enough memory is available for allocation."""
+        current_usage = self.estimate_memory_usage()
+        return (current_usage + needed_bytes) <= self.max_memory_bytes
 
     def create_array(
         self, name: str, shape: Tuple, dtype: np.dtype, filename: Optional[str] = None

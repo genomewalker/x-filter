@@ -9,19 +9,37 @@ from x_filter.ops import (
     process_parquet_to_memmap,
 )
 from x_filter.stats import calculate_statistics
-from x_filter.reassign import reassign
+# Import the reassign function from the correct module
+import importlib.util
+import sys
+import os
+
+# Load the reassign.py module directly
+reassign_module_path = os.path.join(os.path.dirname(__file__), 'reassign.py')
+spec = importlib.util.spec_from_file_location("reassign_module", reassign_module_path)
+reassign_module = importlib.util.module_from_spec(spec)
+sys.modules["reassign_module"] = reassign_module
+spec.loader.exec_module(reassign_module)
+
 from x_filter.aggregate import aggregate_gene_abundances, convert_to_anvio
+from x_filter.db_manager import DatabaseManager
+from x_filter.core_processing import (
+    initialize_mmap_array,
+    create_filtered_mmap_arrays,
+    apply_mask_parallel,
+)
+from numba import njit, prange
 
 # Standard library imports
 import os
-import time
-import logging
 import gc
+import time
 import glob
+import tempfile
+import logging
 import shutil
 from concurrent.futures import ThreadPoolExecutor
-from typing import Dict, List, Tuple, Any, Optional
-import threading  # Add this import for proper thread synchronization
+from typing import Dict, List, Tuple, Any, Optional, Union
 
 # Third-party imports
 import numpy as np
@@ -35,30 +53,143 @@ from tqdm import tqdm
 log = get_logger()
 
 
+@njit(parallel=True, fastmath=True)
+def _create_subject_mask_ultra_fast(
+    alignment_subject_ids: np.ndarray,
+    target_subjects: np.ndarray,
+    output_mask: np.ndarray,
+) -> None:
+    """
+    Ultra-fast subject mask creation using optimized hash-like lookup.
+    """
+    n_alignments = len(alignment_subject_ids)
+    n_targets = len(target_subjects)
+    
+    # For small target sets, use linear search
+    if n_targets < 100:
+        for i in prange(n_alignments):
+            subject_id = alignment_subject_ids[i]
+            found = False
+            for j in range(n_targets):
+                if target_subjects[j] == subject_id:
+                    found = True
+                    break
+            output_mask[i] = found
+    else:
+        # For larger sets, use sorted array with binary search
+        sorted_targets = np.sort(target_subjects)
+        
+        for i in prange(n_alignments):
+            subject_id = alignment_subject_ids[i]
+            
+            # Optimized binary search
+            left = 0
+            right = n_targets - 1
+            found = False
+            
+            while left <= right:
+                mid = left + ((right - left) >> 1)  # Faster division by 2
+                mid_val = sorted_targets[mid]
+                
+                if mid_val == subject_id:
+                    found = True
+                    break
+                elif mid_val < subject_id:
+                    left = mid + 1
+                else:
+                    right = mid - 1
+            
+            output_mask[i] = found
+
+
+@njit(parallel=True, fastmath=True)
+def _apply_filters_vectorized(
+    filter_mask: np.ndarray,
+    stat_values: np.ndarray,
+    threshold: float,
+    operator: int,  # 0 for >=, 1 for <=
+) -> None:
+    """Ultra-fast vectorized filter application."""
+    if operator == 0:  # >=
+        for i in prange(len(filter_mask)):
+            if filter_mask[i]:
+                filter_mask[i] = stat_values[i] >= threshold
+    else:  # <=
+        for i in prange(len(filter_mask)):
+            if filter_mask[i]:
+                filter_mask[i] = stat_values[i] <= threshold
+
+
+def apply_filters_to_mmap(
+    stats_arrays: Dict[str, np.memmap],
+    filters: List[Dict[str, Any]],
+    mmap_folder: str,
+) -> np.memmap:
+    """
+    Ultra-fast filter application using vectorized operations.
+    """
+    from x_filter.utils import USER_FRIENDLY_FILTER_MAPPING
+    
+    n_subjects = len(stats_arrays['subject_numeric_id'])
+    
+    # Create filter mask
+    filter_mask = initialize_mmap_array(
+        total_positions=n_subjects,
+        dtype=np.bool_,
+        mmap_folder=mmap_folder,
+        array_name="filter_mask",
+    )
+    
+    # Initialize all as True
+    filter_mask[:] = True
+    
+    # Apply each filter using ultra-fast vectorized functions
+    for f in filters:
+        filter_name = f["filter_name"]
+        value = f["value"]
+        
+        if filter_name not in USER_FRIENDLY_FILTER_MAPPING:
+            continue
+            
+        stat_column, operator = USER_FRIENDLY_FILTER_MAPPING[filter_name]
+        
+        if stat_column in stats_arrays:
+            stat_values = stats_arrays[stat_column]
+            
+            # Convert operator to integer for numba
+            op_int = 0 if operator == ">=" else 1
+            
+            _apply_filters_vectorized(filter_mask, stat_values, value, op_int)
+    
+    filter_mask.flush()
+    return filter_mask
+
+
 def process_data(
     args: Any,
     filters: List[Dict[str, Any]],
-    tmp_dir: str,
+    tmp_dir: Any,
     tmp_files: Dict[str, str],
     output_files: Dict[str, str] = {},
-    disable_initial_filtering: bool = False,
-) -> Tuple[pd.DataFrame, np.ndarray, np.ndarray, Dict[str, np.ndarray], str]:
+    enable_initial_filtering: bool = False,
+) -> Tuple[Dict[str, np.memmap], np.ndarray, np.memmap, Dict[str, np.memmap], str]:
+    """Process data using only memory-mapped arrays."""
     np_arrays, parquet_file = process_input_data(
         args.input,
         (tmp_dir, tmp_files),
         num_threads=args.threads,
         evalue_threshold=args.evalue,
         bitscore_threshold=args.bitscore,
+        percent_identity_threshold=args.percent_identity,
         max_memory=args.max_memory,
         keep_db=args.keep_db,
         output_files=output_files,
         mmap_folder_dir=args.mmap_folder_dir,
-        deduplicate=args.keep_duplicates,
     )
 
-    if not disable_initial_filtering:
+    if enable_initial_filtering:
         log.info("Getting initial coverage statistics for filtering")
-        final_stats, unique_subjects, inverse_indices, numpy_arrays = (
+        stats_df, unique_subjects, inverse_indices, numpy_arrays = (
             calculate_statistics(
                 np_arrays,
                 tmp_files,
@@ -66,379 +197,359 @@ def process_data(
                 max_memory=args.max_memory,
             )
         )
-        # sort by breadth descending
-        final_stats = final_stats.sort_values("breadth", ascending=True)
-
+        
         if filters:
-            log.info("Applying initial filters")
-            final_stats = apply_filters(final_stats, filters)
-            final_stats = final_stats.sort_values(
-                ["breadth", "subject_numeric_id"], ascending=True
+            log.info("Applying initial filters to memory-mapped arrays")
+            
+            # Convert DataFrame to memmap arrays for filtering
+            stats_arrays = {}
+            for col in stats_df.columns:
+                col_data = stats_df[col].values
+                col_mmap = initialize_mmap_array(
+                    total_positions=len(col_data),
+                    dtype=col_data.dtype,
+                    mmap_folder=tmp_files["mmap"],
+                    array_name=f"initial_stats_{col}",
+                )
+                col_mmap[:] = col_data
+                col_mmap.flush()
+                stats_arrays[col] = col_mmap
+            
+            filter_mask = apply_filters_to_mmap(
+                stats_arrays=stats_arrays,
+                filters=filters,
+                mmap_folder=tmp_files["mmap"],
             )
+            
+            # Count filtered subjects
+            n_kept = np.sum(filter_mask)
+            log.info(f"Filters kept {n_kept:,} out of {len(unique_subjects):,} subjects")
+            
+            # Return the memmap arrays instead of DataFrame
+            return stats_arrays, unique_subjects, inverse_indices, numpy_arrays, parquet_file
+        else:
+            # No filters, but convert DataFrame to memmap arrays for consistency
+            stats_arrays = {}
+            for col in stats_df.columns:
+                col_data = stats_df[col].values
+                col_mmap = initialize_mmap_array(
+                    total_positions=len(col_data),
+                    dtype=col_data.dtype,
+                    mmap_folder=tmp_files["mmap"],
+                    array_name=f"initial_stats_{col}",
+                )
+                col_mmap[:] = col_data
+                col_mmap.flush()
+                stats_arrays[col] = col_mmap
+            
+            return stats_arrays, unique_subjects, inverse_indices, numpy_arrays, parquet_file
     else:
         # Skip statistics calculation and filtering when disabled
-        final_stats = pd.DataFrame()
-        unique_subjects = np.array([])  # Empty array since we won't use it
-        inverse_indices = np.array([])  # Empty array since we won't use it
+        stats_arrays = {}
+        unique_subjects = np.array([])
+        inverse_indices = initialize_mmap_array(
+            total_positions=1,
+            dtype=np.int64,
+            mmap_folder=tmp_files["mmap"],
+            array_name="dummy_inverse",
+        )
         numpy_arrays = np_arrays
 
-    return final_stats, unique_subjects, inverse_indices, numpy_arrays, parquet_file
+    return stats_arrays, unique_subjects, inverse_indices, numpy_arrays, parquet_file
 
 
 def efficient_filter_arrays(
-    final_stats: pd.DataFrame,
-    numpy_arrays: Dict[str, np.ndarray],
+    stats_arrays: Dict[str, np.memmap],
+    numpy_arrays: Dict[str, np.memmap], 
     tmp_files: Dict[str, str],
     args: Any,
-    max_chunk_size: int = 100_000_000,  # Add configurable max chunk size parameter
+    max_chunk_size: int = 100_000_000,
 ) -> str:
-    """
-    Efficiently filter arrays with parallelized filtering and writing
-
-    Args:
-        final_stats: DataFrame with filtering statistics
-        numpy_arrays: Dictionary of numpy arrays to filter
-        tmp_files: Dictionary with paths to temporary directories
-        args: Command line arguments
-        max_chunk_size: Maximum chunk size for memory-efficient processing
-
-    Returns:
-        Path to file with filtered IDs
-    """
-    num_threads = int(args.threads) if hasattr(args, "threads") else 1
-    filtered_ids_file = os.path.join(tmp_files["db"], "filtered_ids.parquet")
-    essential_columns = ["query_numeric_id", "row_hash"]
-
-    # If no filtering needed
-    if final_stats.empty:
+    """Ultra-fast array filtering using optimized operations."""
+    
+    if not stats_arrays:
         log.info("No filtering criteria - using all alignments")
-
-        # Use parallel chunks for writing
-        chunk_size = 100_000_000  # Larger chunks for better parallelization
-        total_chunks = (
-            len(numpy_arrays["query_numeric_id"]) + chunk_size - 1
-        ) // chunk_size
-        log.info(
-            f"Writing {total_chunks} chunks in parallel with {num_threads} threads"
-        )
-
-        # Create a schema once
-        schema = pa.schema(
-            [
-                (col, pa.from_numpy_dtype(numpy_arrays[col].dtype))
-                for col in essential_columns
-            ]
-        )
-
-        # Create temporary chunk files then merge
-        chunk_files = []
-
-        def process_chunk(chunk_idx):
-            start = chunk_idx * chunk_size
-            end = min(start + chunk_size, len(numpy_arrays["query_numeric_id"]))
-
-            # Create chunk file path
-            chunk_file = os.path.join(tmp_files["db"], f"chunk_{chunk_idx}.parquet")
-            chunk_files.append(chunk_file)
-
-            # Create arrays and table
-            arrays = [
-                pa.array(numpy_arrays[col][start:end]) for col in essential_columns
-            ]
-            table = pa.Table.from_arrays(arrays, essential_columns)
-
-            # Write chunk
-            pq.write_table(table, chunk_file)
-            return end - start
-
-        # Process chunks in parallel
-        with ThreadPoolExecutor(max_workers=num_threads) as executor:
-            futures = [executor.submit(process_chunk, i) for i in range(total_chunks)]
-
-            with tqdm(total=total_chunks, desc="Writing chunks") as pbar:
-                for future in futures:
-                    future.result()
-                    pbar.update(1)
-
-        # Merge chunks
-        log.info("Merging chunks")
-        tables = [pq.read_table(file) for file in chunk_files]
-        merged_table = pa.concat_tables(tables)
-        pq.write_table(merged_table, filtered_ids_file)
-
-        # Clean up chunk files
-        for file in chunk_files:
-            try:
-                os.remove(file)
-            except:
-                pass
-
+        
         if args.skip_reassign:
+            # Create a simple ID file with all rowids
+            filtered_ids_file = os.path.join(tmp_files["db"], "filtered_ids.parquet")
+            
+            # Export rowids directly from memory-mapped array
+            with DatabaseManager(
+                temp_dir=tmp_files['db'],
+                threads=args.threads,
+                memory_limit=args.max_memory,  # Pass as string
+                max_memory_pct=60,
+                enable_progress=True
+            ) as db_manager:
+                # Register the rowid array as a table
+                import pyarrow as pa
+                rowid_table = pa.table({"rowid": numpy_arrays["rowid"]})
+                db_manager.con.register("rowids", rowid_table)
+                
+                db_manager.execute(
+                    f"COPY rowids TO '{filtered_ids_file}' (FORMAT 'parquet')"
+                )
+            
             return filtered_ids_file
         else:
-            # For reassign, run it on full arrays
-            reassigned_df = reassign(
-                numpy_arrays,
-                tmp_files,
-                iters=args.n_iters,
-                max_memory=args.max_memory,
-                num_threads=num_threads,
-                scale=args.scale,
+            log.info("Running reassignment without scale threshold")
+            
+            # Run reassignment on full arrays with all parameters from CLI
+            reassigned_rowids = reassign_module.reassign(
+                args=type('Args', (), {
+                    'filtered_arrays': numpy_arrays,
+                    'mmap_dir': tmp_files["mmap"],
+                    'threads': args.threads,
+                    'n_iters': args.n_iters,
+                    'min_improvement': getattr(args, 'min_improvement', 1e-4),
+                    'adaptive_convergence': getattr(args, 'adaptive_convergence', False),
+                    'max_memory': args.max_memory,  # Pass as string
+                    'selection_mode': getattr(args, 'selection_mode', 'hard_cutoff'),
+                    'reference_bias': getattr(args, 'reference_bias', 0.0),
+                    'handle_ties': getattr(args, 'handle_ties', 'keep_all'),
+                    'min_assignment_confidence': getattr(args, 'min_assignment_confidence', 0.01),
+                    'min_confidence_margin': getattr(args, 'min_confidence_margin', 0.0),
+                    'acceleration_method': getattr(args, 'acceleration_method', 'hybrid'),
+                    'anderson_memory': getattr(args, 'anderson_memory', 10),
+                    'lbfgs_memory': getattr(args, 'lbfgs_memory', 10),
+                })()
             )
-
-            # Write only essential columns
+            
+            # Handle case where reassignment returns None or empty results
+            if reassigned_rowids is None:
+                log.error("Reassignment returned None - using all rowids as fallback")
+                reassigned_rowids = numpy_arrays["rowid"].tolist()
+            elif len(reassigned_rowids) == 0:
+                log.warning("Reassignment returned empty list - no alignments selected")
+                return None
+            
+            # Export reassigned rowids - reassigned_rowids is now a numpy array
             reassigned_file = os.path.join(tmp_files["db"], "reassigned_ids.parquet")
-            reassigned_df[essential_columns].to_parquet(reassigned_file)
+            with DatabaseManager(
+                temp_dir=tmp_files['db'],
+                threads=args.threads,
+                memory_limit=args.max_memory,  # Pass as string
+                max_memory_pct=60,
+                enable_progress=True
+            ) as db_manager:
+                # Create PyArrow table from the numpy array of row IDs
+                import pyarrow as pa
+                rowid_table = pa.table({"rowid": pa.array(reassigned_rowids, type=pa.int64())})
+                
+                # Register and export
+                db_manager.con.register("reassigned_rowids", rowid_table)
+                db_manager.execute(f"""
+                    COPY reassigned_rowids TO '{reassigned_file}' (FORMAT 'parquet')
+                """)
+            
             return reassigned_file
 
-    # Filtering case
-    target_subjects = np.array(
-        list(set(final_stats["subject_numeric_id"].values)),
-        dtype=numpy_arrays["subject_numeric_id"].dtype,
-    )
-    log.info(f"Filtering to {len(target_subjects):,} subjects")
-
-    # Parallelize filtering and writing
-    chunk_size = 100_000_000  # Larger chunks for better parallelization
-    total_chunks = (
-        len(numpy_arrays["subject_numeric_id"]) + chunk_size - 1
-    ) // chunk_size
-    log.info(f"Processing {total_chunks} chunks in parallel with {num_threads} threads")
-
-    # Create temporary chunk files
-    chunk_files = []
-    match_counts = [np.int64(0)] * total_chunks  # Use np.int64 for match counts
-    current_pos = np.int64(0)  # Explicitly use 64-bit integer
-    position_lock = threading.Lock()  # Create a proper lock for thread synchronization
-    accumulated_matches = np.zeros(
-        total_chunks, dtype=np.int64
-    )  # Track matches per chunk
-
-    def filter_and_write_chunk(chunk_idx):
-        start = chunk_idx * chunk_size
-        end = min(start + chunk_size, len(numpy_arrays["subject_numeric_id"]))
-
-        # Get chunk and find matches
-        chunk_subjects = numpy_arrays["subject_numeric_id"][start:end]
-        mask = np.isin(chunk_subjects, target_subjects)
-        chunk_matches = np.sum(mask)
-
-        if chunk_matches > 0:
-            # Use proper lock for thread safety
-            with position_lock:
-                nonlocal current_pos  # Explicitly state we're using the outer current_pos
-                current_pos += chunk_matches  # Update position atomically
-
-            accumulated_matches[chunk_idx] = chunk_matches  # Store for debugging
-
-            # Create chunk file path
-            chunk_file = os.path.join(tmp_files["db"], f"chunk_{chunk_idx}.parquet")
-            chunk_files.append(chunk_file)
-
-            # Create arrays and table with only essential columns
-            arrays = [
-                pa.array(numpy_arrays[col][start:end][mask])
-                for col in essential_columns
-            ]
-            table = pa.Table.from_arrays(arrays, essential_columns)
-
-            # Write chunk
-            pq.write_table(table, chunk_file)
-
-            match_counts[chunk_idx] = chunk_matches
-            return chunk_matches
-        return 0
-
-    # Process chunks in parallel
-    with ThreadPoolExecutor(max_workers=num_threads) as executor:
-        futures = [
-            executor.submit(filter_and_write_chunk, i) for i in range(total_chunks)
-        ]
-
-        with tqdm(
-            total=total_chunks, desc="Filtering chunks", leave=False, ncols=80
-        ) as pbar:
-            for future in futures:
-                future.result()
-                pbar.update(1)
-
-    # Check if we found any matches
-    total_matches = sum(match_counts)
-    log.info(f"Found {total_matches:,} matching elements")
-
-    if total_matches == 0:
-        log.warning(
-            "No matches found! This may indicate a problem with the filtering criteria."
-        )
+    # Filtering case - use ultra-fast operations
+    filter_mask_file = os.path.join(tmp_files["mmap"], "filter_mask.dat")
+    if not os.path.exists(filter_mask_file):
+        log.error("Filter mask file not found - filtering may have failed")
         return None
+        
+    # Load the filter mask
+    filter_mask = np.memmap(
+        filter_mask_file,
+        dtype=np.bool_,
+        mode="r",
+        shape=(len(stats_arrays['subject_numeric_id']),)
+    )
+    
+    # Ultra-fast subject extraction
+    target_subjects = _extract_filtered_subjects(
+        stats_arrays['subject_numeric_id'], 
+        filter_mask,
+        tmp_files["mmap"]
+    )
+    
+    log.info(f"Filtering to {len(target_subjects):,} subjects (out of {len(stats_arrays['subject_numeric_id']):,} total)")
 
-    # Merge chunks
-    log.info("Merging filtered chunks")
-    if chunk_files:
-        tables = [pq.read_table(file) for file in chunk_files]
-        merged_table = pa.concat_tables(tables)
-        pq.write_table(merged_table, filtered_ids_file)
-
-    # Clean up chunk files
-    for file in chunk_files:
-        try:
-            os.remove(file)
-        except:
-            pass
-
+    # Create boolean mask for alignments using ultra-fast method
+    alignment_mask = initialize_mmap_array(
+        total_positions=len(numpy_arrays["subject_numeric_id"]),
+        dtype=np.bool_,
+        mmap_folder=tmp_files["mmap"],
+        array_name="alignment_filter_mask",
+    )
+    
+    # Use ultra-fast subject mask creation
+    _create_subject_mask_ultra_fast(
+        numpy_arrays["subject_numeric_id"],
+        target_subjects,
+        alignment_mask,
+    )
+    
+    n_kept = np.sum(alignment_mask)
+    log.info(f"Found {n_kept:,} alignments matching filtered subjects")
+    
+    if n_kept == 0:
+        log.warning("No alignments match filtering criteria")
+        return None
+    
     if args.skip_reassign:
+        # Export filtered rowids
+        filtered_ids_file = os.path.join(tmp_files["db"], "filtered_ids.parquet")
+        
+        # Create filtered rowid array
+        filtered_rowids = initialize_mmap_array(
+            total_positions=n_kept,
+            dtype=numpy_arrays["rowid"].dtype,
+            mmap_folder=tmp_files["mmap"],
+            array_name="filtered_rowids",
+        )
+        
+        # Copy filtered rowids
+        apply_mask_parallel(
+            numpy_arrays["rowid"],
+            alignment_mask,
+            filtered_rowids,
+        )
+        filtered_rowids.flush()
+        
+        # Export to Parquet
+        with DatabaseManager(
+            temp_dir=tmp_files['db'],
+            threads=args.threads,
+            memory_limit=args.max_memory,
+            max_memory_pct=60,
+            enable_progress=True
+        ) as db_manager:
+            import pyarrow as pa
+            rowid_table = pa.table({"rowid": filtered_rowids})
+            db_manager.con.register("filtered_rowids", rowid_table)
+            
+            db_manager.execute(
+                f"COPY filtered_rowids TO '{filtered_ids_file}' (FORMAT 'parquet')"
+            )
+        
         return filtered_ids_file
     else:
-        # For reassign, use memory-mapped arrays for filtered data
-        log.info("Creating memory-mapped filtered arrays for reassignment")
-
-        # Create memory-mapped arrays in the temporary directory
-        filtered_arrays = {}
-        for key in [
-            "query_numeric_id",
-            "subject_numeric_id",
-            "bitScore",
-            "alnLength",
-            "subjectStart",
-            "subjectEnd",
-            "percIdentity",
-            "row_hash",
-            "slen",
-        ]:
-            if key in numpy_arrays:
-                mmap_path = os.path.join(tmp_files["mmap"], f"filtered_{key}.dat")
-                filtered_arrays[key] = np.memmap(
-                    mmap_path,
-                    dtype=numpy_arrays[key].dtype,
-                    mode="w+",
-                    shape=(total_matches,),
-                )
-
-        # Process chunks to build filtered arrays
-        current_pos = np.int64(0)  # Explicitly use 64-bit integer
-        chunk_size = min(chunk_size, max_chunk_size)  # Use the configurable parameter
-        position_lock = (
-            threading.Lock()
-        )  # Create a proper lock for thread synchronization
-        total_chunks = (
-            len(numpy_arrays["subject_numeric_id"]) + chunk_size - 1
-        ) // chunk_size
-        accumulated_matches = np.zeros(
-            total_chunks, dtype=np.int64
-        )  # Track matches per chunk
-
-        def build_filtered_chunk(chunk_idx):
-            nonlocal current_pos
-            start = chunk_idx * chunk_size
-            end = min(start + chunk_size, len(numpy_arrays["subject_numeric_id"]))
-
-            # Get chunk and find matches
-            chunk_subjects = numpy_arrays["subject_numeric_id"][start:end]
-            mask = np.isin(chunk_subjects, target_subjects)
-            chunk_matches = np.int64(
-                np.sum(mask)
-            )  # Get number of matches as 64-bit int
-            accumulated_matches[chunk_idx] = chunk_matches  # Store for debugging
-
-            if chunk_matches > 0:
-                # Use proper lock for thread safety
-                with position_lock:
-                    pos = current_pos  # Get current position
-                    current_pos += chunk_matches  # Update position atomically
-
-                # Log more debug info for very large chunks
-                if chunk_matches > max_chunk_size:
-                    log.debug(
-                        f"Chunk {chunk_idx}: Processing {chunk_matches:,} matches at position {pos:,}"
-                    )
-
-                # Copy filtered data to memory-mapped arrays
-                for key in filtered_arrays:
-                    filtered_arrays[key][pos : pos + chunk_matches] = numpy_arrays[key][
-                        start:end
-                    ][mask]
-
-                # Explicitly flush changes
-                for arr in filtered_arrays.values():
-                    arr.flush()
-
-                return chunk_matches
-            return np.int64(0)  # Return 64-bit zero
-
-        # Reset match counts for better tracking
-        match_counts = [np.int64(0)] * total_chunks  # Use np.int64 for match counts
-        current_pos = np.int64(0)  # Reset position counter
-
-        # Process chunks in parallel with fewer workers for big data
-        max_workers = (
-            max(num_threads, 8) if total_matches > 100_000_000_000 else num_threads
+        log.info("Running reassignment without scale threshold")
+        
+        # Create filtered arrays for reassignment
+        filtered_arrays = create_filtered_mmap_arrays(
+            source_arrays=numpy_arrays,
+            filter_mask=alignment_mask,
+            mmap_folder=tmp_files["mmap"],
+            prefix="filtered_for_reassign",
         )
-        log.info(f"Using {max_workers} parallel workers for building filtered arrays")
-
-        with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            futures = [
-                executor.submit(build_filtered_chunk, i) for i in range(total_chunks)
-            ]
-
-            with tqdm(
-                total=total_chunks, desc="Building filtered arrays", ncols=80
-            ) as pbar:
-                for i, future in enumerate(futures):
-                    match_counts[i] = future.result()
-                    pbar.update(1)
-
-        # Verify we got the expected number of matches
-        actual_matches = np.int64(sum(match_counts))  # Explicitly use 64-bit sum
-        if actual_matches != total_matches:
-            log.warning(
-                f"Expected {total_matches:,} matches but got {actual_matches:,}"
-            )
-
-            # More detailed diagnostics
-            expected_from_chunks = np.sum(accumulated_matches)
-            log.warning(f"Sum of accumulated matches: {expected_from_chunks:,}")
-            if expected_from_chunks != actual_matches:
-                log.warning("Mismatch between accumulated and returned match counts!")
-
-            # Check for overflow
-            if actual_matches < 0 or total_matches < 0:
-                log.error("Integer overflow detected in match counts!")
-
-            # Resize memory-mapped arrays to actual size for safety
-            log.info(f"Resizing memory-mapped arrays to {actual_matches:,} elements")
-            for key in filtered_arrays:
-                try:
-                    # Close the current memmap
-                    filtered_arrays[key].flush()
-                    del filtered_arrays[key]
-                except:
-                    pass
-
-                # Create a new memmap with correct size
-                new_mmap = np.memmap(
-                    os.path.join(tmp_files["mmap"], f"filtered_{key}.dat"),
-                    dtype=numpy_arrays[key].dtype,
-                    mode="r+",
-                    shape=(actual_matches,),
-                )
-                filtered_arrays[key] = new_mmap
-                new_mmap.flush()
-
-        # Perform reassignment
-        log.info("Performing multimapping resolution")
-        reassigned_df = reassign(
-            filtered_arrays,
-            tmp_files,
-            iters=args.n_iters,
-            max_memory=args.max_memory,
-            num_threads=num_threads,
-            scale=args.scale,
+        
+        # Run reassignment on filtered data with all parameters from CLI
+        reassigned_rowids = reassign_module.reassign(
+            args=type('Args', (), {
+                'filtered_arrays': filtered_arrays,
+                'mmap_dir': tmp_files["mmap"],
+                'threads': args.threads,
+                'n_iters': args.n_iters,
+                'min_improvement': getattr(args, 'min_improvement', 1e-4),
+                'adaptive_convergence': getattr(args, 'adaptive_convergence', False),
+                'max_memory': args.max_memory,  # Pass as string
+                'selection_mode': getattr(args, 'selection_mode', 'hard_cutoff'),
+                'reference_bias': getattr(args, 'reference_bias', 0.0),
+                'handle_ties': getattr(args, 'handle_ties', 'keep_all'),
+                'min_assignment_confidence': getattr(args, 'min_assignment_confidence', 0.01),
+                'min_confidence_margin': getattr(args, 'min_confidence_margin', 0.0),
+                'acceleration_method': getattr(args, 'acceleration_method', 'hybrid'),
+                'anderson_memory': getattr(args, 'anderson_memory', 10),
+                'lbfgs_memory': getattr(args, 'lbfgs_memory', 10),
+            })()
         )
-
-        # Write only essential columns
+        
+        # Handle case where reassignment returns None or empty results
+        if reassigned_rowids is None:
+            log.error("Reassignment returned None - using filtered rowids as fallback")
+            reassigned_rowids = filtered_arrays["rowid"].tolist()
+        elif len(reassigned_rowids) == 0:
+            log.warning("Reassignment returned empty list - no alignments selected")
+            return None
+        
+        # Export reassigned rowids
         reassigned_file = os.path.join(tmp_files["db"], "reassigned_ids.parquet")
-        reassigned_df[essential_columns].to_parquet(reassigned_file)
+        with DatabaseManager(
+            temp_dir=tmp_files['db'],
+            threads=args.threads,
+            memory_limit=args.max_memory,  # Pass as string
+            max_memory_pct=60,
+            enable_progress=True
+        ) as db_manager:
+            # Create PyArrow table from the numpy array of row IDs
+            import pyarrow as pa
+            rowid_table = pa.table({"rowid": pa.array(reassigned_rowids, type=pa.int64())})
+            
+            # Register and export
+            db_manager.con.register("reassigned_rowids", rowid_table)
+            db_manager.execute(f"""
+                COPY reassigned_rowids TO '{reassigned_file}' (FORMAT 'parquet')
+            """)
+        
         return reassigned_file
+
+
+def _extract_filtered_subjects(
+    subject_ids: np.memmap,
+    filter_mask: np.memmap,
+    mmap_folder: str,
+) -> np.memmap:
+    """Extract subjects that passed the filter without using DataFrame operations."""
+    n_filtered = np.sum(filter_mask)
+    
+    # Create output array for filtered subjects
+    filtered_subjects = initialize_mmap_array(
+        total_positions=n_filtered,
+        dtype=subject_ids.dtype,
+        mmap_folder=mmap_folder,
+        array_name="filtered_subjects",
+    )
+    
+    # Copy filtered subjects
+    apply_mask_parallel(subject_ids, filter_mask, filtered_subjects)
+    filtered_subjects.flush()
+    
+    return filtered_subjects
+
+
+def analyze_alignments_mmap(
+    result_file: str,
+    tmp_files: Dict[str, str],
+    num_threads: int = 1,
+    max_memory: str = "8GB",
+) -> Dict[str, np.memmap]:
+    """Analyze alignments using only memory-mapped arrays."""
+    log.info(f"Analyzing alignments from {result_file} using memory mapping")
+
+    # Create memmap subfolder
+    memmap_dir = tmp_files["mmap"]
+    os.makedirs(memmap_dir, exist_ok=True)
+
+    # Define columns to extract with their types
+    columns_info = {
+        "subject_numeric_id": ("BIGINT", "int64"),
+        "subjectStart": ("INTEGER", "int32"), 
+        "subjectEnd": ("INTEGER", "int32"),
+        "alnLength": ("INTEGER", "int32"),
+        "qlen": ("INTEGER", "int32"),
+        "percIdentity": ("FLOAT4", "float32"),
+        "slen": ("INTEGER", "int32"),
+        "rowid": ("BIGINT", "int64"),
+    }
+
+    # Process directly to memory-mapped arrays
+    mmap_arrays = process_parquet_to_memmap(
+        db_file=result_file,
+        total_rows=None,  # Will be determined automatically
+        columns_info=columns_info,
+        memmap_dir=memmap_dir,
+        temp_dir=tmp_files["db"],
+        num_threads=num_threads,
+        max_memory=max_memory,
+        skip_export=True,
+    )
+
+    return mmap_arrays
 
 
 def create_filtered_df_from_arrays(numpy_arrays: Dict[str, np.ndarray]) -> pd.DataFrame:
@@ -452,7 +563,7 @@ def create_filtered_df_from_arrays(numpy_arrays: Dict[str, np.ndarray]) -> pd.Da
             "subjectStart": numpy_arrays["subjectStart"],
             "subjectEnd": numpy_arrays["subjectEnd"],
             "percIdentity": numpy_arrays["percIdentity"],
-            "row_hash": numpy_arrays["row_hash"],
+            "rowid": numpy_arrays["rowid"],  # Add rowid to DataFrame creation
         }
     )
 
@@ -466,79 +577,56 @@ def process_filtered_data(
     """Process filtered data using DuckDB and write results to optimized Parquet (single file or directory)."""
     log.info(f"Processing filtered IDs from {filtered_ids_path}")
 
-    with duckdb.connect(database=db_file) as connection:
-        # Database configuration
-        connection.execute(f"SET threads={args.threads}")
-        connection.execute(f"SET temp_directory='{tmp_files['db']}'")
-        connection.execute("SET preserve_insertion_order=false")
-        connection.execute("SET enable_progress_bar=true")
-        if args.max_memory:
-            formatted_memory = set_memory_limit(args.max_memory)
-            connection.execute(f"SET memory_limit='{formatted_memory}'")
-            connection.execute(f"SET max_memory='{formatted_memory}'")
-
-        # Define columns with DuckDB and NumPy types
-        columns_info = {
-            "queryId": ColumnInfo("queryId", "VARCHAR", "object"),
-            "subjectId": ColumnInfo("subjectId", "VARCHAR", "object"),
-            "percIdentity": ColumnInfo("percIdentity", "FLOAT4", "float32"),
-            "alnLength": ColumnInfo("alnLength", "INTEGER", "int32"),
-            "mismatchCount": ColumnInfo("mismatchCount", "SMALLINT", "int16"),
-            "gapOpenCount": ColumnInfo("gapOpenCount", "SMALLINT", "int16"),
-            "queryStart": ColumnInfo("queryStart", "INTEGER", "int32"),
-            "queryEnd": ColumnInfo("queryEnd", "INTEGER", "int32"),
-            "subjectStart": ColumnInfo("subjectStart", "INTEGER", "int32"),
-            "subjectEnd": ColumnInfo("subjectEnd", "INTEGER", "int32"),
-            "eVal": ColumnInfo("eVal", "DOUBLE", "float64"),
-            "bitScore": ColumnInfo("bitScore", "FLOAT4", "float32"),
-            "qlen": ColumnInfo("qlen", "INTEGER", "int32"),
-            "slen": ColumnInfo("slen", "INTEGER", "int32"),
-            "query_numeric_id": ColumnInfo("query_numeric_id", "BIGINT", "int64"),
-            "subject_numeric_id": ColumnInfo("subject_numeric_id", "BIGINT", "int64"),
-            "row_hash": ColumnInfo("row_hash", "BIGINT", "int64"),
-        }
-
-        # Check for additional columns (cigar, qaln, taln)
-        table_info = connection.execute(
-            "SELECT column_name FROM information_schema.columns WHERE table_name = 'filtered_blast'"
-        ).fetchall()
-        table_columns = [col[0].lower() for col in table_info]
-        if all(col in table_columns for col in ["cigar", "qaln", "taln"]):
-            columns_info.update(
-                {
-                    "cigar": ColumnInfo("cigar", "VARCHAR", "object"),
-                    "qaln": ColumnInfo("qaln", "VARCHAR", "object"),
-                    "taln": ColumnInfo("taln", "VARCHAR", "object"),
-                }
-            )
-
-        # Create a temporary view with filtered results
-        connection.execute(
-            f"""
-            CREATE VIEW filtered_results AS
-            SELECT {', '.join(col.name for col in columns_info.values())}
-            FROM filtered_blast AS blast
-            SEMI JOIN read_parquet('{filtered_ids_path}') AS ids
-            ON blast.query_numeric_id = ids.query_numeric_id
-            AND blast.row_hash = ids.row_hash
-        """
+    with DatabaseManager(
+        database=db_file,
+        temp_dir=tmp_files['db'],
+        threads=args.threads,
+        memory_limit=args.max_memory,
+        max_memory_pct=60,
+        enable_progress=True
+    ) as db_manager:
+        
+        # Load filtered IDs
+        db_manager.execute(
+            f"CREATE TEMPORARY TABLE filtered_ids AS SELECT * FROM read_parquet('{filtered_ids_path}')"
         )
-
+        
+        # Join with original data using DuckDB's built-in rowid
+        db_manager.execute(
+            """
+            CREATE TEMPORARY TABLE filtered_results AS
+            SELECT fb.*, fb.rowid
+            FROM filtered_blast fb
+            INNER JOIN filtered_ids fi ON fb.rowid = fi.rowid
+            """
+        )
+        
         # Get total rows for export
-        total_rows = connection.execute(
+        total_rows = db_manager.execute(
             "SELECT COUNT(*) FROM filtered_results"
         ).fetchone()[0]
         log.info(f"Filtered results contain {total_rows:,} rows")
 
+        # Define columns for export - include rowid
+        columns_info = {
+            "percIdentity": ColumnInfo("percIdentity", "FLOAT4", "float32"),
+            "alnLength": ColumnInfo("alnLength", "INTEGER", "int32"),
+            "subjectStart": ColumnInfo("subjectStart", "INTEGER", "int32"),
+            "subjectEnd": ColumnInfo("subjectEnd", "INTEGER", "int32"),
+            "qlen": ColumnInfo("qlen", "INTEGER", "int32"),
+            "slen": ColumnInfo("slen", "INTEGER", "int32"),
+            "subject_numeric_id": ColumnInfo("subject_numeric_id", "BIGINT", "int64"),
+            "query_numeric_id": ColumnInfo("query_numeric_id", "BIGINT", "int64"),
+            "bitScore": ColumnInfo("bitScore", "FLOAT4", "float32"),
+            "rowid": ColumnInfo("rowid", "BIGINT", "int64"),
+        }
+
         # Export to Parquet using optimized function
         output_path = export_to_parquet(
-            db_file=db_file,
+            db_manager=db_manager,
             columns_info=columns_info,
             output_dir=tmp_files["tmp"],
             total_rows=total_rows,
-            num_threads=args.threads,
-            max_memory=args.max_memory,
-            temp_dir=tmp_files["tmp"],
             keep_db=args.keep_db,
             output_files={},  # Not used here, but required by function signature
             table_name="filtered_results",
@@ -609,7 +697,6 @@ def cleanup_mmap_files(mmap_folder: str) -> None:
             except Exception as e:
                 log.warning(f"Error deleting directory {root}: {e}")
 
-
 def cleanup_db_files(db_file: str) -> None:
     """Clean up database files"""
     if os.path.exists(db_file):
@@ -617,7 +704,6 @@ def cleanup_db_files(db_file: str) -> None:
             os.unlink(db_file)
         except Exception as e:
             log.warning(f"Error deleting file {db_file}: {e}")
-
 
 def cleanup_temp_files(tmp_files: Dict[str, str]) -> None:
     """Clean up all temporary files and directories"""
@@ -628,7 +714,6 @@ def cleanup_temp_files(tmp_files: Dict[str, str]) -> None:
                 os.rmdir(dir_path)
         except Exception as e:
             log.warning(f"Error deleting directory {dir_path}: {e}")
-
 
 def analyze_alignments(
     result_file: str, chunk_size: int = 1_000_000
@@ -737,7 +822,7 @@ def analyze_alignments_mmap(
     memmap_dir = tmp_files["mmap"]
     os.makedirs(memmap_dir, exist_ok=True)
 
-    # Define columns to extract with their types (DuckDB type, NumPy type)
+    # Define columns to extract with their types (DuckDB type, NumPy type) - include rowid
     columns_info = {
         "subject_numeric_id": ("BIGINT", "int64"),
         "subjectStart": ("INTEGER", "int32"),
@@ -746,6 +831,7 @@ def analyze_alignments_mmap(
         "qlen": ("INTEGER", "int32"),
         "percIdentity": ("FLOAT4", "float32"),
         "slen": ("INTEGER", "int32"),
+        "rowid": ("BIGINT", "int64"),  # Include rowid in analysis
     }
 
     with duckdb.connect() as con:
@@ -782,7 +868,7 @@ def analyze_alignments_mmap(
         total_rows = con.execute("SELECT COUNT(*) FROM alignments").fetchone()[0]
         log.info(f"Total alignments to process: {total_rows:,}")
 
-        # Export data to a temporary parquet file
+        # Export data to a temporary parquet file - include rowid
         temp_parquet_file = os.path.join(tmp_files["db"], "temp_alignments.parquet")
 
         # Export the needed columns to parquet
@@ -795,7 +881,8 @@ def analyze_alignments_mmap(
                 alnLength,
                 qlen,
                 percIdentity,
-                slen
+                slen,
+                rowid
             FROM alignments
         ) TO '{temp_parquet_file}' (FORMAT 'parquet')
         """
@@ -823,7 +910,7 @@ def analyze_alignments_mmap(
 
 
 def save_results(
-    final_stats: pd.DataFrame,
+    final_stats: Dict[str, np.memmap],  # Changed from pd.DataFrame to Dict
     result_file: str,
     out_files: Dict[str, str],
     mapping_file: str,
@@ -832,17 +919,31 @@ def save_results(
     tmp_files: Dict[str, str],
     threads: int = 1,
 ) -> None:
-    with duckdb.connect() as con:
-        # Register final_stats
-        con.register("final_stats", final_stats)
+    with DatabaseManager(
+        temp_dir=tmp_files['db'],
+        threads=threads,
+        memory_limit=None,  # Use auto-detection for this case
+        max_memory_pct=60,
+        enable_progress=True
+    ) as db_manager:
+        # Convert memmap arrays to PyArrow table for DuckDB registration
+        import pyarrow as pa
+        
+        # Create PyArrow table from memmap arrays
+        final_stats_table = pa.table({
+            col_name: pa.array(arr) for col_name, arr in final_stats.items()
+        })
+        
+        # Register final_stats table
+        db_manager.con.register("final_stats", final_stats_table)
 
         # Create a temporary view for result files
-        con.execute(
+        db_manager.execute(
             f"CREATE TEMPORARY VIEW alignments AS SELECT * FROM read_parquet('{result_file}')"
         )
 
         # Get column info from the view
-        table_info = con.execute("PRAGMA table_info('alignments')").fetchall()
+        table_info = db_manager.execute("PRAGMA table_info('alignments')").fetchall()
         columns = [col[1].lower() for col in table_info]
         cigar_columns = ", cigar, qaln, taln" if "cigar" in columns else ""
         all_columns = f"queryId, subjectId, percIdentity, alnLength, mismatchCount, gapOpenCount, queryStart, queryEnd, subjectStart, subjectEnd, eVal, bitScore, qlen, slen{cigar_columns}"
@@ -852,7 +953,7 @@ def save_results(
             SELECT DISTINCT subjectId, subject_numeric_id
             FROM alignments
         """
-        con.execute(
+        db_manager.execute(
             "CREATE TEMPORARY TABLE unique_subjects AS " + unique_subjects_query
         )
 
@@ -888,23 +989,26 @@ def save_results(
                 stdev_identity
             FROM merged
         """
-        con.execute(
+        db_manager.execute(
             f"COPY ({coverage_query}) TO '{out_files['coverage']}' (HEADER, DELIMITER '\t')"
         )
 
         # Export multimap results
-        con.execute(
+        db_manager.execute(
             f"COPY (SELECT {all_columns} FROM alignments) TO '{out_files['multimap']}' (HEADER, DELIMITER '\t')"
         )
 
         # Gene abundances (if applicable)
         if mapping_file:
             log.info("Aggregating gene abundances")
-            # Temporarily create DataFrame for gene abundances
-            result_df = con.execute("SELECT * FROM alignments").df()
+            # Convert final_stats back to DataFrame for gene abundances function
+            final_stats_df = pd.DataFrame({
+                col_name: np.array(arr) for col_name, arr in final_stats.items()
+            })
+            
             gene_abundances, gene_abundances_agg = aggregate_gene_abundances(
                 mapping_file=mapping_file,
-                gene_abundances=final_stats,
+                gene_abundances=final_stats_df,
                 num_threads=threads,
                 temp_dir=tmp_files["db"],
             )
@@ -913,14 +1017,14 @@ def save_results(
                 log.info("Couldn't map anything to the references.")
                 return
 
-            con.register("gene_abundances", gene_abundances)
-            con.register("gene_abundances_agg", gene_abundances_agg)
+            db_manager.register("gene_abundances", gene_abundances)
+            db_manager.register("gene_abundances_agg", gene_abundances_agg)
 
-            con.execute(
+            db_manager.execute(
                 f"COPY (SELECT * FROM gene_abundances) TO '{out_files['group_abundances']}' "
                 "(HEADER, DELIMITER '\t', COMPRESSION 'gzip')"
             )
-            con.execute(
+            db_manager.execute(
                 f"COPY (SELECT * FROM gene_abundances_agg) TO '{out_files['group_abundances_agg']}' "
                 "(HEADER, DELIMITER '\t', COMPRESSION 'gzip')"
             )
@@ -929,8 +1033,8 @@ def save_results(
                 gene_abundances_anvio = convert_to_anvio(
                     df=gene_abundances, annotation_source=annotation_source
                 )
-                con.register("gene_abundances_anvio", gene_abundances_anvio)
-                con.execute(
+                db_manager.register("gene_abundances_anvio", gene_abundances_anvio)
+                db_manager.execute(
                     f"COPY (SELECT * FROM gene_abundances_anvio) TO '{out_files['group_abundances_anvio']}' "
                     "(HEADER, DELIMITER '\t', COMPRESSION 'gzip')"
                 )
@@ -1043,9 +1147,7 @@ def safe_cleanup(tmp_dir_obj):
     Args:
         tmp_dir_obj: The TemporaryDirectory object whose cleanup method is being replaced
     """
-    import time
     import tempfile
-    import gc
 
     # Get the directory path before any cleanup happens
     dir_path = tmp_dir_obj.name if hasattr(tmp_dir_obj, "name") else None
@@ -1076,13 +1178,11 @@ def safe_cleanup(tmp_dir_obj):
                 log.info(f"Attempting aggressive cleanup of {dir_path}")
                 force_delete_mmap_folder(dir_path)
         except Exception as e2:
-            log.warning(f"Failed to perform aggressive cleanup of {dir_path}: {e2}")
+            log.warning(f"Failed to perform aggressive cleanup of {dir_path}: {e}")
 
 
 def force_delete_mmap_folder(mmap_folder: str) -> None:
     """Aggressive cleanup of memory-mapped files - to be called before tmp_dir_obj.cleanup()"""
-    import gc
-    import time
 
     if not os.path.exists(mmap_folder):
         return
@@ -1140,7 +1240,7 @@ def main() -> None:
                 tmp_dir_obj,
                 tmp_files,
                 out_files,
-                disable_initial_filtering=args.disable_initial_filtering,
+                enable_initial_filtering=args.enable_initial_filtering,
             )
         )
 
@@ -1168,9 +1268,9 @@ def main() -> None:
             max_memory=args.max_memory,
         )
 
-        # Recalculate statistics
+        # Recalculate statistics - returns memmap arrays, not DataFrame
         log.info("Getting coverage statistics")
-        final_stats, unique_subjects, inverse_indices, numpy_arrays = (
+        final_stats_df, unique_subjects, inverse_indices, numpy_arrays = (
             calculate_statistics(
                 np_arrays,
                 tmp_files,
@@ -1180,23 +1280,74 @@ def main() -> None:
         )
         del inverse_indices
 
-        # Apply final filters
+        # Convert DataFrame to memmap arrays for consistent handling
+        final_stats_mmap = {}
+        for col in final_stats_df.columns:
+            col_data = final_stats_df[col].values
+            col_mmap = initialize_mmap_array(
+                total_positions=len(col_data),
+                dtype=col_data.dtype,
+                mmap_folder=tmp_files["mmap"],
+                array_name=f"final_stats_{col}",
+            )
+            col_mmap[:] = col_data
+            col_mmap.flush()
+            final_stats_mmap[col] = col_mmap
+
+        # Apply final filters using memmap arrays
         if filters:
             log.info("Applying final filters")
-            final_stats = apply_filters(final_stats, filters)
-            log.info(f"References kept: {final_stats.shape[0]:,}")
-            # Filter result_file based on final_stats
+            filter_mask = apply_filters_to_mmap(
+                stats_arrays=final_stats_mmap,
+                filters=filters,
+                mmap_folder=tmp_files["mmap"],
+            )
+            
+            # Count remaining subjects
+            n_kept = np.sum(filter_mask)
+            log.info(f"References kept: {n_kept:,}")
+            
+            # Create filtered final_stats
+            filtered_final_stats = {}
+            for col_name, col_array in final_stats_mmap.items():
+                filtered_array = initialize_mmap_array(
+                    total_positions=n_kept,
+                    dtype=col_array.dtype,
+                    mmap_folder=tmp_files["mmap"],
+                    array_name=f"filtered_final_stats_{col_name}",
+                )
+                apply_mask_parallel(col_array, filter_mask, filtered_array)
+                filtered_array.flush()
+                filtered_final_stats[col_name] = filtered_array
+            
+            final_stats_mmap = filtered_final_stats
+            
+            # Filter result_file based on filtered subjects
             filtered_result_file = os.path.join(
                 tmp_files["db"], "final_filtered_results.parquet"
             )
-            with duckdb.connect() as con:
-                con.register("final_stats", final_stats)
-                con.execute(
+            
+            # Get filtered subject IDs
+            filtered_subject_ids = final_stats_mmap['subject_numeric_id']
+            
+            with DatabaseManager(
+                temp_dir=tmp_files['db'],
+                threads=args.threads,
+                memory_limit=args.max_memory,
+                max_memory_pct=60,
+                enable_progress=True
+            ) as db_manager:
+                # Register filtered subject IDs
+                import pyarrow as pa
+                filtered_subjects_table = pa.table({"subject_numeric_id": filtered_subject_ids})
+                db_manager.con.register("filtered_subjects", filtered_subjects_table)
+                
+                db_manager.execute(
                     f"""
                     COPY (
                         SELECT r.*
                         FROM read_parquet('{result_file}') r
-                        INNER JOIN final_stats fs
+                        INNER JOIN filtered_subjects fs
                         ON r.subject_numeric_id = fs.subject_numeric_id
                     ) TO '{filtered_result_file}' (FORMAT 'parquet')
                 """
@@ -1205,7 +1356,7 @@ def main() -> None:
 
         # Save results
         save_results(
-            final_stats=final_stats,
+            final_stats=final_stats_mmap,  # Pass memmap arrays instead of DataFrame
             result_file=result_file,
             out_files=out_files,
             tmp_files=tmp_files,
@@ -1221,9 +1372,47 @@ def main() -> None:
         # Cleanup all references explicitly
         time.sleep(1)  # Allow some time for OS to release file locks
         close_and_cleanup_mmap_arrays(np_arrays, tmp_files)
-        tmp_dir_obj.cleanup()
+        
+        # Try cleanup with error handling for NFS issues
+        try:
+            tmp_dir_obj.cleanup()
+        except OSError as e:
+            if "Device or resource busy" in str(e) or "nfs" in str(e).lower():
+                log.warning(f"NFS cleanup issue (this is normal on shared filesystems): {e}")
+                log.info("Results were saved successfully despite cleanup warning")
+            else:
+                raise
+        
         log.info("ALL DONE.")
 
 
-if __name__ == "__main__":
-    main()
+@njit(parallel=True, fastmath=True)
+def _create_subject_mask(
+    alignment_subject_ids: np.ndarray,
+    target_subjects: np.ndarray,
+    output_mask: np.ndarray,
+) -> None:
+    """Create boolean mask for alignments that match target subjects."""
+    # First, sort target subjects for binary search
+    sorted_targets = np.sort(target_subjects)
+    
+    # Process alignments in parallel
+    for i in prange(len(alignment_subject_ids)):
+        subject_id = alignment_subject_ids[i]
+        
+        # Binary search for subject_id in sorted_targets
+        left = 0
+        right = len(sorted_targets) - 1
+        found = False
+        
+        while left <= right:
+            mid = (left + right) // 2
+            if sorted_targets[mid] == subject_id:
+                found = True
+                break
+            elif sorted_targets[mid] < subject_id:
+                left = mid + 1
+            else:
+                right = mid - 1
+        
+        output_mask[i] = found

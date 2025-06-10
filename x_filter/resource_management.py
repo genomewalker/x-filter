@@ -1,88 +1,99 @@
+from pathlib import Path
 from enum import Enum
 from dataclasses import dataclass
-from typing import Optional, Union, Dict, Tuple, List
-import os
-import psutil
-import numpy as np
+from typing import Optional, Union, Dict, Tuple, List, Any, Set
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
 from multiprocessing import Manager, Queue
 from tqdm import tqdm
 from threading import Lock
-import threading
-from x_filter.logging_setup import get_logger
+import os
+import psutil
+import time
+import numpy as np
+import logging
+from x_filter.logging_setup import get_logger  # Fixed import path
 
 log = get_logger()
 
 
 class ArrayScale(Enum):
-    """Unified array size categories."""
-
-    TINY = "tiny"  # < 1M elements
-    SMALL = "small"  # 1M - 100M elements
-    MEDIUM = "medium"  # 100M - 1B elements
-    LARGE = "large"  # 1B - 10B elements
-    HUGE = "huge"  # > 10B elements
+    """Enumeration for array scale categories."""
+    SMALL = "small"      # < 1GB
+    MEDIUM = "medium"    # 1GB - 10GB  
+    LARGE = "large"      # 10GB - 100GB
+    HUGE = "huge"        # > 100GB
 
 
 @dataclass
 class ArrayInfo:
-    """Information about array characteristics."""
-
+    """Information about a memory-mapped array."""
+    name: str
+    path: str
+    shape: Tuple[int, ...]
+    dtype: str
+    size_bytes: int
     scale: ArrayScale
-    size_gb: float
-    elements: int
-    element_size: int
-    memory_needed_gb: float
-    optimal_threads: int
+    creation_time: float
+    last_access: float
+    temp: bool = True
+
+
+@dataclass
+class MemoryStats:
+    """Memory usage statistics."""
+    total_memory: int
+    available_memory: int
+    used_memory: int
+    cached_memory: int
+    swap_total: int
+    swap_used: int
+    process_memory: int
+
+
+@dataclass
+class ResourceLimits:
+    """Resource limits and thresholds."""
+    max_memory: int
+    max_threads: int
+    max_arrays: int
+    cleanup_threshold: float
+    warning_threshold: float
 
 
 @dataclass
 class ChunkingStrategy:
-    """Processing strategy parameters."""
-
+    """Strategy for chunking large arrays."""
     chunk_size: int
     num_chunks: int
-    memory_per_chunk_gb: float
-    threads_per_chunk: int
-    total_threads: int
     cache_friendly: bool
+    memory_efficient: bool
+    suggested_threads: int
+    total_threads: int = 1  # Add missing attribute with default value
 
 
 class ThreadPoolManager:
-    """Manages thread pools and their resources."""
-
-    def __init__(self, resource_manager, threads_needed: int):
-        self.resource_manager = resource_manager
-        self.threads_needed = threads_needed
-        self.pool = None
-
+    """Enhanced thread pool manager with better resource control."""
+    
+    def __init__(self, max_workers: int = None, thread_name_prefix: str = "ResourceWorker"):
+        self.max_workers = max_workers or min(32, (os.cpu_count() or 1) + 4)
+        self.thread_name_prefix = thread_name_prefix
+        self._executor = None
+        self._lock = Lock()
+        
     def __enter__(self):
-        """Acquire thread pool."""
-        with self.resource_manager.thread_lock:
-            available = (
-                self.resource_manager.max_threads
-                - self.resource_manager.active_threads.value
-            )
-            threads_to_use = min(self.threads_needed, available)
-            if threads_to_use > 0:
-                self.resource_manager.active_threads.value += threads_to_use
-                self.pool = ThreadPoolExecutor(
-                    max_workers=threads_to_use,
-                    thread_name_prefix="resource_managed_thread",
+        with self._lock:
+            if self._executor is None:
+                self._executor = ThreadPoolExecutor(
+                    max_workers=self.max_workers,
+                    thread_name_prefix=self.thread_name_prefix
                 )
-                return self.pool
-            raise RuntimeError(
-                f"No threads available. Active: {self.resource_manager.active_threads.value}"
-            )
-
+        return self._executor
+        
     def __exit__(self, exc_type, exc_val, exc_tb):
-        """Release thread pool."""
-        if self.pool:
-            self.pool.shutdown()
-            with self.resource_manager.thread_lock:
-                self.resource_manager.active_threads.value = max(
-                    0, self.resource_manager.active_threads.value - self.threads_needed
-                )
+        with self._lock:
+            if self._executor is not None:
+                self._executor.shutdown(wait=True)
+                self._executor = None
 
 
 class MemoryManager:
@@ -91,332 +102,287 @@ class MemoryManager:
     def __init__(self, resource_manager, bytes_needed: int):
         self.resource_manager = resource_manager
         self.bytes_needed = bytes_needed
+        self.acquired = False
 
     def __enter__(self):
-        """Acquire memory."""
-        with self.resource_manager.memory_lock:
-            if (
-                self.resource_manager.memory_allocated.value + self.bytes_needed
-                <= self.resource_manager.max_memory
-            ):
-                self.resource_manager.memory_allocated.value += self.bytes_needed
-                return self.bytes_needed
-            raise RuntimeError(
-                f"Not enough memory. Requested: {self.bytes_needed}, Available: {self.resource_manager.available_memory}"
-            )
+        if self.resource_manager.reserve_memory(self.bytes_needed):
+            self.acquired = True
+        else:
+            raise RuntimeError(f"Cannot allocate {self.bytes_needed} bytes")
+        return self
 
     def __exit__(self, exc_type, exc_val, exc_tb):
-        """Release memory."""
-        with self.resource_manager.memory_lock:
-            self.resource_manager.memory_allocated.value = max(
-                0, self.resource_manager.memory_allocated.value - self.bytes_needed
-            )
+        if self.acquired:
+            self.resource_manager.release_memory(self.bytes_needed)
 
 
 class ResourceManager:
-    """Manage system resources for processing."""
-
+    """
+    Centralized resource management for memory allocation, threading, and temporary files.
+    Handles billion-element datasets efficiently with adaptive memory management.
+    """
+    
     def __init__(
         self,
-        max_memory: Optional[Union[str, int, float]] = None,
+        max_memory: Optional[Union[str, int]] = None,
         max_threads: Optional[int] = None,
+        temp_base_dir: Optional[str] = None,
+        memory_safety_factor: float = 0.9,
+        enable_monitoring: bool = True,
+        min_chunk_size: int = 1_000_000,
+        max_chunk_size: Optional[int] = None,
+        mmap_folder: Optional[str] = None  # Add this parameter
     ):
-        manager = Manager()
-        self.memory_lock = manager.Lock()
-        self.thread_lock = manager.Lock()
-        self.memory_allocated = manager.Value("i", 0)
-        self.active_threads = manager.Value("i", 0)
+        """
+        Initialize ResourceManager with system resource detection and limits.
+        
+        Args:
+            max_memory: Maximum memory to use (string like "250G" or bytes as int)
+            max_threads: Maximum threads to use
+            temp_base_dir: Base directory for temporary files
+            memory_safety_factor: Safety factor for memory allocation (0.0-1.0)
+            enable_monitoring: Whether to enable resource monitoring
+            mmap_folder: Directory for memory-mapped files (alias for temp_base_dir)
+        """
+        # Initialize logger first
+        self.log = get_logger()
+        
+        self.memory_safety_factor = memory_safety_factor
+        self.enable_monitoring = enable_monitoring
+        
+        # Handle mmap_folder parameter - it's an alias for temp_base_dir
+        if mmap_folder is not None:
+            self.temp_base_dir = mmap_folder
+        elif temp_base_dir is not None:
+            self.temp_base_dir = temp_base_dir
+        else:
+            self.temp_base_dir = "/tmp"
+        
+        # Parse memory limit
+        if max_memory is not None:
+            if isinstance(max_memory, str):
+                self.max_memory_bytes = self.parse_memory_limit(max_memory)
+            else:
+                self.max_memory_bytes = int(max_memory)
+        else:
+            # Auto-detect system memory
+            self.max_memory_bytes = psutil.virtual_memory().available
+        
+        # Apply safety factor
+        self.usable_memory_bytes = int(self.max_memory_bytes * memory_safety_factor)
+        
+        # Set thread limits
+        if max_threads is not None:
+            self.max_threads = max_threads
+        else:
+            self.max_threads = min(os.cpu_count() or 1, 16)  # Reasonable default
+        
+        # Initialize tracking variables
+        self.allocated_memory = 0
+        self.allocated_threads = 0
+        self.arrays = {}
+        
+        log.info(f"ResourceManager initialized:")
+        log.info(f"  - Max memory: {self.max_memory_bytes // (1024**3)}GB")
+        log.info(f"  - Usable memory: {self.usable_memory_bytes // (1024**3)}GB")
+        log.info(f"  - Max threads: {self.max_threads}")
 
-        if max_memory is None:
-            vm = psutil.virtual_memory()
-            max_memory = int(vm.available * 0.75)
-        elif isinstance(max_memory, str):
-            max_memory = self.parse_memory_limit(max_memory)
+    @property
+    def max_memory(self) -> int:
+        return self.max_memory_bytes
 
-        if max_threads is None:
-            max_threads = os.cpu_count() or 1
+    @property
+    def mmap_folder(self) -> Optional[str]:
+        return self.temp_base_dir
 
-        self.max_memory = max_memory
-        self.max_threads = max_threads
+    @mmap_folder.setter
+    def mmap_folder(self, value: Optional[str]):
+        self.temp_base_dir = value
 
     def parse_memory_limit(self, memory_limit: str) -> int:
-        """Parse memory limit string to bytes."""
+        """Parse memory limit string like '10GB', '512MB', etc."""
         memory_limit = memory_limit.upper().strip()
-        units = {"B": 1, "K": 1024, "M": 1024**2, "G": 1024**3, "T": 1024**4}
 
-        number = (
-            float(memory_limit[:-1])
-            if memory_limit[-1] in units
-            else float(memory_limit)
-        )
-        unit = memory_limit[-1] if memory_limit[-1] in units else "B"
-
-        return int(number * units[unit])
+        if memory_limit.endswith("GB") or memory_limit.endswith("G"):
+            return int(float(memory_limit[:-1]) * 1024**3)
+        elif memory_limit.endswith("MB") or memory_limit.endswith("M"):
+            return int(float(memory_limit[:-1]) * 1024**2)
+        elif memory_limit.endswith("KB") or memory_limit.endswith("K"):
+            return int(float(memory_limit[:-1]) * 1024)
+        elif memory_limit.endswith("B"):
+            return int(float(memory_limit[:-1]))
+        else:
+            return int(float(memory_limit))
 
     def get_array_scale(self, num_elements: int) -> ArrayScale:
-        """Determine array scale category based on number of elements."""
+        """Determine array scale based on number of elements."""
         if num_elements < 1_000_000:
-            return ArrayScale.TINY
-        elif num_elements < 100_000_000:
             return ArrayScale.SMALL
-        elif num_elements < 1_000_000_000:
+        elif num_elements < 100_000_000:
             return ArrayScale.MEDIUM
-        elif num_elements < 10_000_000_000:
+        elif num_elements < 1_000_000_000:
             return ArrayScale.LARGE
-        return ArrayScale.HUGE
+        elif num_elements < 10_000_000_000:
+            return ArrayScale.HUGE
+        else:
+            return ArrayScale.HUGE
 
     def analyze_array(self, arr: np.ndarray) -> ArrayInfo:
-        """Analyze array characteristics and determine optimal processing strategy."""
-        num_elements = len(arr)
-        element_size = arr.dtype.itemsize
-        size_gb = arr.nbytes / (1024**3)
-
-        scale = self.get_array_scale(num_elements)
-
-        scale_factors = {
-            ArrayScale.TINY: {"memory": 3.0, "threads": 1},
-            ArrayScale.SMALL: {"memory": 2.5, "threads": min(2, self.max_threads)},
-            ArrayScale.MEDIUM: {"memory": 2.0, "threads": min(4, self.max_threads)},
-            ArrayScale.LARGE: {"memory": 1.5, "threads": min(8, self.max_threads)},
-            ArrayScale.HUGE: {"memory": 1.2, "threads": self.max_threads},
-        }
-
-        factor = scale_factors[scale]
-        memory_needed_gb = min(size_gb * factor["memory"], self.max_memory / (1024**3))
-
+        """Analyze array characteristics."""
         return ArrayInfo(
-            scale=scale,
-            size_gb=size_gb,
-            elements=num_elements,
-            element_size=element_size,
-            memory_needed_gb=memory_needed_gb,
-            optimal_threads=factor["threads"],
+            name="",
+            path="",
+            shape=arr.shape,
+            dtype=str(arr.dtype),
+            size_bytes=arr.nbytes,
+            scale=self.get_array_scale(arr.size),
+            creation_time=time.time(),
+            last_access=time.time()
         )
+
+    def calculate_optimal_chunk_size(
+        self,
+        total_elements: int,
+        element_size: int,
+        operation_overhead: float = 2.0,
+        min_chunk_size: int = 1_000_000,
+        max_chunk_size: Optional[int] = None,
+    ) -> int:
+        """Calculate optimal chunk size based on available memory and dataset size."""
+        # Calculate memory needed per element (including overhead)
+        memory_per_element = element_size * operation_overhead
+        
+        # Calculate maximum chunk size based on available memory
+        max_memory_chunk_size = int(self.usable_memory_bytes * 0.8 / memory_per_element)
+        
+        # Apply constraints
+        chunk_size = max(min_chunk_size, min(max_memory_chunk_size, total_elements))
+        
+        if max_chunk_size is not None:
+            chunk_size = min(chunk_size, max_chunk_size)
+        
+        return chunk_size
 
     def calculate_chunk_size(
         self,
         arr_info: ArrayInfo,
         cache_optimization: bool = True,
-        max_chunks: int = 100,
+        min_chunk_size: int = 1_000_000,
+        max_chunk_size: Optional[int] = None
     ) -> ChunkingStrategy:
-        """Calculate optimal chunk size and processing strategy."""
-        L3_CACHE_SIZE = 8 * 1024 * 1024  # 8MB typical L3 cache
-        CACHE_LINE_SIZE = 64  # 64 bytes typical cache line
-
-        available_memory_gb = min(
-            self.available_memory / (1024**3), arr_info.memory_needed_gb
+        """Calculate optimal chunking strategy for an array."""
+        # Simplified implementation
+        total_elements = np.prod(arr_info.shape)
+        element_size = np.dtype(arr_info.dtype).itemsize
+        
+        chunk_size = self.calculate_optimal_chunk_size(
+            total_elements, element_size, 
+            min_chunk_size=min_chunk_size, max_chunk_size=max_chunk_size
         )
-
-        scale_strategies = {
-            ArrayScale.TINY: {
-                "chunks": 1,
-                "memory_fraction": 1.0,
-                "thread_fraction": 1.0,
-            },
-            ArrayScale.SMALL: {
-                "chunks": min(4, max_chunks),
-                "memory_fraction": 0.8,
-                "thread_fraction": 0.5,
-            },
-            ArrayScale.MEDIUM: {
-                "chunks": min(8, max_chunks),
-                "memory_fraction": 0.6,
-                "thread_fraction": 0.25,
-            },
-            ArrayScale.LARGE: {
-                "chunks": min(16, max_chunks),
-                "memory_fraction": 0.4,
-                "thread_fraction": 0.125,
-            },
-            ArrayScale.HUGE: {
-                "chunks": min(32, max_chunks),
-                "memory_fraction": 0.2,
-                "thread_fraction": 0.0625,
-            },
-        }
-
-        strategy = scale_strategies[arr_info.scale]
-        memory_per_chunk_gb = (
-            available_memory_gb * strategy["memory_fraction"]
-        ) / strategy["chunks"]
-        total_threads = min(arr_info.optimal_threads, self.available_threads)
-        threads_per_chunk = max(1, int(total_threads * strategy["thread_fraction"]))
-
+        
+        num_chunks = (total_elements + chunk_size - 1) // chunk_size
+        suggested_threads = min(self.max_threads, num_chunks)
+        
         return ChunkingStrategy(
-            chunk_size=self._calculate_chunk_size(
-                arr_info,
-                memory_per_chunk_gb,
-                cache_optimization,
-                L3_CACHE_SIZE,
-                CACHE_LINE_SIZE,
-                threads_per_chunk,
-            ),
-            num_chunks=strategy["chunks"],
-            memory_per_chunk_gb=memory_per_chunk_gb,
-            threads_per_chunk=threads_per_chunk,
-            total_threads=total_threads,
+            chunk_size=chunk_size,
+            num_chunks=num_chunks,
             cache_friendly=cache_optimization,
+            memory_efficient=True,
+            suggested_threads=suggested_threads,
+            total_threads=suggested_threads  # Set total_threads to match suggested_threads
         )
-
-    def _calculate_chunk_size(
-        self,
-        arr_info: ArrayInfo,
-        memory_per_chunk_gb: float,
-        cache_optimization: bool,
-        L3_CACHE_SIZE: int,
-        CACHE_LINE_SIZE: int,
-        threads_per_chunk: int,
-    ) -> int:
-        """Calculate optimal chunk size based on memory and cache constraints."""
-        bytes_per_chunk = int(memory_per_chunk_gb * 1024**3)
-        elements_per_chunk = bytes_per_chunk // arr_info.element_size
-
-        if not cache_optimization:
-            return max(1024, min(elements_per_chunk, arr_info.elements))
-
-        # Calculate cache-based chunk size
-        cache_elements = L3_CACHE_SIZE // arr_info.element_size
-        elements_per_line = max(1, CACHE_LINE_SIZE // arr_info.element_size)
-        cache_based_chunk_size = min(
-            elements_per_chunk, cache_elements * threads_per_chunk
-        )
-        cache_based_chunk_size = (
-            cache_based_chunk_size // elements_per_line
-        ) * elements_per_line
-
-        return min(cache_based_chunk_size, elements_per_chunk)
 
     def slice_chunk(self, arr: np.ndarray, indices: np.ndarray) -> np.ndarray:
-        """Slice a chunk of an array with error handling."""
-        try:
-            return arr[indices]
-        except Exception as e:
-            log.error(f"Error in slice_chunk: {e}")
-            raise
+        """Slice array using indices."""
+        return arr[indices]
 
-    def slice_arrays(
-        self, arrays: Dict[str, np.ndarray], indices: np.ndarray, mmap_folder: str
-    ) -> Dict[str, np.ndarray]:
-        """Slice multiple arrays using parallel processing."""
-        total_elements = len(indices)
-        chunk_size = max(1024, total_elements // (self.max_threads * 2))
-        num_chunks = (total_elements + chunk_size - 1) // chunk_size
-        max_workers_per_array = max(1, self.max_threads // len(arrays))
+    def reserve_threads(self, num_threads: int) -> bool:
+        """Reserve threads for processing."""
+        if self.allocated_threads + num_threads <= self.max_threads:
+            self.allocated_threads += num_threads
+            return True
+        return False
 
-        # Calculate total chunks
-        total_chunks = num_chunks * len(arrays)
+    def release_threads(self, num_threads: int):
+        """Release reserved threads."""
+        self.allocated_threads = max(0, self.allocated_threads - num_threads)
 
-        # Create progress queue
-        manager = Manager()
-        progress_queue = manager.Queue()
-        arrays_list = list(arrays.keys())
-        processed_results = {}
+    def reserve_memory(self, bytes_needed: int) -> bool:
+        """Reserve memory for processing."""
+        if self.allocated_memory + bytes_needed <= self.usable_memory_bytes:
+            self.allocated_memory += bytes_needed
+            return True
+        return False
 
-        with tqdm(total=total_chunks, desc="Processing arrays", unit="chunks") as pbar:
-            # Progress tracking thread
-            def update_progress():
-                while True:
-                    progress = progress_queue.get()
-                    if progress is None:
-                        break
-                    pbar.update(progress)
+    def release_memory(self, bytes_used: int):
+        """Release reserved memory."""
+        self.allocated_memory = max(0, self.allocated_memory - bytes_used)
 
-            progress_thread = threading.Thread(target=update_progress)
-            progress_thread.start()
-
-            try:
-                # Process arrays in parallel
-                with ProcessPoolExecutor(
-                    max_workers=min(len(arrays), self.max_threads)
-                ) as executor:
-                    futures = []
-
-                    # Submit all arrays
-                    for name in arrays_list:
-                        mmap_path = os.path.join(mmap_folder, f"{name}_slice.mmap")
-                        future = executor.submit(
-                            self.process_array_chunks,
-                            name,
-                            arrays[name],
-                            indices,
-                            chunk_size,
-                            num_chunks,
-                            mmap_path,
-                            max_workers_per_array,
-                            progress_queue,
-                        )
-                        futures.append((future, name))
-
-                    # Process results
-                    for future, name in futures:
-                        try:
-                            result = future.result()
-                            if result is not None:
-                                processed_results[name] = result
-                        except Exception as e:
-                            log.error(f"Error processing array {name}: {e}")
-
-            finally:
-                # Clean up progress tracking
-                progress_queue.put(None)
-                progress_thread.join()
-
-        return processed_results
-
-    def process_array_chunks(
+    def create_array(
         self,
         name: str,
-        arr: np.ndarray,
-        indices: np.ndarray,
-        chunk_size: int,
-        num_chunks: int,
-        mmap_path: str,
-        max_workers: int,
-        progress_queue: Queue,
+        shape: tuple,
+        dtype,
+        folder: str = None,
+        mode: str = "r+",
+        temp: bool = False,
+        overwrite: bool = True,
     ) -> Optional[np.ndarray]:
-        """Process chunks of a single array."""
+        """Create a memory-mapped array."""
         try:
-            # Create memory map for output
-            mmap_out = np.memmap(
-                mmap_path, dtype=arr.dtype, mode="w+", shape=(len(indices),)
-            )
-
-            # Process chunks
-            with ProcessPoolExecutor(max_workers=max_workers) as chunk_executor:
-                futures = []
-
-                # Submit chunks
-                for chunk_idx in range(num_chunks):
-                    start_idx = chunk_idx * chunk_size
-                    end_idx = min(start_idx + chunk_size, len(indices))
-                    chunk_indices = indices[start_idx:end_idx]
-
-                    future = chunk_executor.submit(self.slice_chunk, arr, chunk_indices)
-                    futures.append((future, start_idx, end_idx))
-
-                # Process results
-                for future, start_idx, end_idx in futures:
-                    try:
-                        chunk_data = future.result()
-                        mmap_out[start_idx:end_idx] = chunk_data
-                        progress_queue.put(1)
-                    except Exception as e:
-                        log.error(f"Error processing chunk {start_idx}-{end_idx}: {e}")
-
-            return mmap_out
-
+            if folder is None:
+                folder = self.temp_base_dir
+            
+            # Ensure directory exists
+            os.makedirs(folder, mode=0o755, exist_ok=True)
+            
+            # Create file path
+            filepath = os.path.join(folder, f"{name}.mmap")
+            
+            # Handle existing files
+            if os.path.exists(filepath) and not overwrite:
+                log.warning(f"Array file {filepath} already exists")
+                return None
+            
+            # Create memory-mapped array
+            arr = np.memmap(filepath, dtype=dtype, mode='w+', shape=shape)
+            
+            # Track the array
+            self.arrays[name] = {
+                'array': arr,
+                'path': filepath,
+                'temp': temp
+            }
+            
+            return arr
+            
         except Exception as e:
-            log.error(f"Error processing array {name}: {e}")
+            log.error(f"Failed to create array {name}: {e}")
             return None
 
-    @property
-    def available_memory(self) -> int:
-        """Get available memory in bytes."""
-        with self.memory_lock:
-            return self.max_memory - self.memory_allocated.value
+    def delete_array(self, name: str) -> bool:
+        """Delete a memory-mapped array."""
+        if name in self.arrays:
+            try:
+                arr_info = self.arrays[name]
+                del arr_info['array']  # Release reference
+                
+                if os.path.exists(arr_info['path']):
+                    os.remove(arr_info['path'])
+                
+                del self.arrays[name]
+                return True
+                
+            except Exception as e:
+                log.error(f"Failed to delete array {name}: {e}")
+                return False
+        return False
 
-    @property
-    def available_threads(self) -> int:
-        """Get number of available threads."""
-        with self.thread_lock:
-            return self.max_threads - self.active_threads.value
+    def cleanup(self):
+        """Clean up all temporary arrays and resources."""
+        for name in list(self.arrays.keys()):
+            if self.arrays[name].get('temp', False):
+                self.delete_array(name)
+        
+        self.allocated_memory = 0
+        self.allocated_threads = 0

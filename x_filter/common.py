@@ -1,44 +1,70 @@
 import os
 import duckdb
+import sys
 from typing import Union
 import gzip
 
 
-def detect_input_type(filepath: str) -> str:
+def detect_input_type(input_path: str) -> str:
     """
-    Detect if input file is a DuckDB database, TSV file, or Parquet file/folder.
-    Returns "duckdb", "tsv", or "parquet"
-    """
-    # First try to open as DuckDB
-    try:
-        with duckdb.connect(filepath) as conn:
-            # Check if filtered_blast table exists
-            tables = conn.execute("SHOW TABLES").fetchall()
-            if any("filtered_blast" in table[0] for table in tables):
-                return "duckdb"
-    except:
-        pass
+    Detect the type of input file or directory.
 
-    # Check if it's a Parquet file/folder
-    if os.path.isdir(filepath):
-        if any(f.endswith(".parquet") for f in os.listdir(filepath)):
+    Args:
+        input_path: Path to input file or directory
+
+    Returns:
+        str: One of 'tsv', 'parquet', 'duckdb'
+
+    Raises:
+        ValueError: If input type cannot be determined
+    """
+    if not os.path.exists(input_path):
+        raise ValueError(f"Input path does not exist: {input_path}")
+
+    if os.path.isfile(input_path):
+        # Handle single files
+        if input_path.endswith(".db") or input_path.endswith(".duckdb"):
+            return "duckdb"
+        elif input_path.endswith(".parquet"):
             return "parquet"
-    elif filepath.endswith(".parquet"):
-        return "parquet"
+        elif input_path.endswith((".tsv", ".txt", ".blast", ".m8")):
+            return "tsv"
+        else:
+            # Try to detect by content for files without clear extensions
+            try:
+                with get_open_func(input_path)(input_path, "rt") as f:
+                    first_line = f.readline().strip()
+                    if "\t" in first_line:
+                        return "tsv"
+            except:
+                pass
+            raise ValueError(f"Cannot determine input type for file: {input_path}")
 
-    # Try as TSV
-    try:
-        with get_open_func(filepath)(filepath, "rt") as f:
-            first_line = f.readline()
-            if "\t" in first_line:
-                return "tsv"
-    except:
-        pass
+    elif os.path.isdir(input_path):
+        # Handle directories
+        files = os.listdir(input_path)
 
-    raise ValueError(
-        f"Input file {filepath} is neither a valid DuckDB database with 'filtered_blast' table, "
-        "a processed Parquet file/folder, nor a valid TSV file"
-    )
+        # Check for parquet files
+        parquet_files = [f for f in files if f.endswith(".parquet")]
+        if parquet_files:
+            return "parquet"
+
+        # Check for TSV files
+        tsv_files = [f for f in files if f.endswith((".tsv", ".txt", ".blast", ".m8"))]
+        if tsv_files:
+            return "tsv"
+
+        # Check for compressed TSV files
+        compressed_tsv_files = [
+            f for f in files if f.endswith((".tsv.gz", ".txt.gz", ".blast.gz", ".m8.gz"))
+        ]
+        if compressed_tsv_files:
+            return "tsv"
+
+        raise ValueError(f"No supported file types found in directory: {input_path}")
+
+    else:
+        raise ValueError(f"Input path is neither a file nor a directory: {input_path}")
 
 
 def validate_mmap_folder(folder_path: str) -> None:
@@ -57,7 +83,6 @@ def validate_mmap_folder(folder_path: str) -> None:
         "slen",
         "subject_numeric_id",
         "query_numeric_id",
-        "row_hash",
         "bitScore",
     ]
 

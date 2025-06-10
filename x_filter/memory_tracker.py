@@ -103,6 +103,29 @@ class MemoryTracker:
 
         return self.history[name]
 
+    def get_system_memory_info(self) -> Dict[str, float]:
+        """Get comprehensive system memory information in GB."""
+        vm = psutil.virtual_memory()
+        return {
+            'total_gb': vm.total / (1024**3),
+            'available_gb': vm.available / (1024**3),
+            'used_gb': vm.used / (1024**3),
+            'percent_used': vm.percent,
+            'process_rss_gb': self.process.memory_info().rss / (1024**3),
+            'process_vms_gb': self.process.memory_info().vms / (1024**3),
+        }
+
+    def check_memory_pressure(self, threshold_percent: float = 85.0) -> bool:
+        """Check if system memory usage is above threshold."""
+        vm = psutil.virtual_memory()
+        return vm.percent > threshold_percent
+
+    def recommend_memory_limit(self, safety_factor: float = 0.8) -> str:
+        """Recommend memory limit as string with units."""
+        vm = psutil.virtual_memory()
+        recommended_gb = int((vm.available / (1024**3)) * safety_factor)
+        return f"{max(1, recommended_gb)}GB"
+
 
 def track_memory(
     func: Optional[Callable] = None,

@@ -1,4 +1,4 @@
-from typing import Dict, Tuple, Optional, List
+from typing import Dict, Tuple, Optional, List, Any
 import duckdb
 import numpy as np
 import os
@@ -15,6 +15,9 @@ from concurrent.futures import ThreadPoolExecutor
 from threading import Lock
 import threading
 import collections
+import uuid  # Added
+from x_filter.db_manager import DatabaseManager
+from x_filter.resource_management import ResourceManager
 
 
 log = logging.getLogger("my_logger")
@@ -38,7 +41,7 @@ def validate_mmap_files(
     """
     errors = []
 
-    # Define expected dtypes for mmap files
+    # Define expected dtypes for mmap files - removed row_hash
     dtypes = {
         "percIdentity": "float32",
         "alnLength": "int32",
@@ -48,8 +51,8 @@ def validate_mmap_files(
         "slen": "int32",
         "subject_numeric_id": "int64",
         "query_numeric_id": "int64",
-        "row_hash": "int64",
         "bitScore": "float32",
+        "rowid": "int64",  # Use rowid instead of row_hash
     }
 
     # Get mmap file lengths
@@ -124,7 +127,7 @@ def load_existing_mmap_arrays(
                 + "\n".join(f"- {error}" for error in errors)
             )
 
-    # Define expected dtypes for each column
+    # Define expected dtypes for each column - removed row_hash
     dtypes = {
         "percIdentity": "float32",
         "alnLength": "int32",
@@ -134,8 +137,8 @@ def load_existing_mmap_arrays(
         "slen": "int32",
         "subject_numeric_id": "int64",
         "query_numeric_id": "int64",
-        "row_hash": "int64",
         "bitScore": "float32",
+        "rowid": "int64",  # Use rowid instead of row_hash
     }
 
     # Get total rows from first mmap file
@@ -166,6 +169,114 @@ def load_existing_mmap_arrays(
     return mmap_arrays
 
 
+def create_filtered_blast_table(
+    db_file: str,
+    input_file: str,
+    temp_dir: str,
+    num_threads: int,
+    max_memory: Optional[int],
+    evalue_threshold: float,
+    bitscore_threshold: float,
+    percent_identity_threshold: float = 0.0,  # Added parameter
+) -> int:
+    """Create the filtered blast table and return total row count"""
+    with DatabaseManager(
+        database=db_file,
+        temp_dir=temp_dir,
+        threads=num_threads,
+        memory_limit=max_memory,
+        max_memory_pct=50,  # Conservative memory usage for initial loading
+        enable_progress=True
+    ) as db_manager:
+        # Handle both single files and directories
+        if os.path.isdir(input_file):
+            # For directories, use glob pattern to read all TSV files
+            tsv_pattern = os.path.join(input_file, "*.tsv")
+            # Also check for other common extensions and compressed files
+            patterns = [
+                os.path.join(input_file, "*.tsv"),
+                os.path.join(input_file, "*.txt"),
+                os.path.join(input_file, "*.blast"),
+                os.path.join(input_file, "*.m8"),
+                os.path.join(input_file, "*.tsv.gz"),
+                os.path.join(input_file, "*.txt.gz"),
+                os.path.join(input_file, "*.blast.gz"),
+                os.path.join(input_file, "*.m8.gz"),
+            ]
+            
+            # Find which pattern has files
+            csv_source = None
+            for pattern in patterns:
+                import glob
+                if glob.glob(pattern):
+                    csv_source = pattern
+                    log.info(f"Reading TSV files from pattern: {pattern}")
+                    break
+            
+            if csv_source is None:
+                raise ValueError(f"No TSV files found in directory: {input_file}")
+        else:
+            # Single file
+            csv_source = input_file
+            log.info(f"Reading single TSV file: {csv_source}")
+
+        # Get number of columns from input file
+        num_columns = len(
+            db_manager.execute(
+                f"SELECT * FROM read_csv_auto('{csv_source}') LIMIT 1"
+            ).description
+        )
+        log.info(f"Detected {num_columns} columns in input file(s)")
+
+        additional_columns = (
+            ",\n                column14 AS cigar,\n                column15 AS qaln,\n                column16 AS taln"
+            if num_columns == 17
+            else ""
+        )
+
+        # Create filtered table with explicit type casts - include percent identity filter
+        create_table_sql = f"""
+            CREATE TABLE filtered_blast AS
+            WITH input_data AS (
+                SELECT *,
+                    CAST(column10 AS DOUBLE) as evalue,
+                    CAST(column11 AS FLOAT) as bitscore,
+                    CAST(column02 AS FLOAT) as percIdentity
+                FROM read_csv_auto('{csv_source}', parallel=true)
+                WHERE CAST(column10 AS DOUBLE) <= {evalue_threshold} 
+                AND CAST(column11 AS FLOAT) >= {bitscore_threshold}
+                AND CAST(column02 AS FLOAT) >= {percent_identity_threshold}
+            )
+            SELECT
+                column00 AS queryId,
+                CAST(hash(column01) % 9223372036854775807 AS BIGINT) AS subject_numeric_id,
+                CAST(hash(column00) % 9223372036854775807 AS BIGINT) AS query_numeric_id,
+                column01 AS subjectId,
+                CAST(column02 AS FLOAT4) AS percIdentity,
+                CAST(column03 AS INTEGER) AS alnLength,
+                CAST(column04 AS SMALLINT) AS mismatchCount,
+                CAST(column05 AS SMALLINT) AS gapOpenCount,
+                CAST(column06 AS INTEGER) AS queryStart,
+                CAST(column07 AS INTEGER) AS queryEnd,
+                CAST(column08 AS INTEGER) AS subjectStart,
+                CAST(column09 AS INTEGER) AS subjectEnd,
+                evalue AS eVal,
+                CAST(bitscore AS FLOAT4) AS bitScore,
+                CAST(column12 AS INTEGER) AS qlen,
+                CAST(column13 AS INTEGER) AS slen{additional_columns}
+            FROM input_data
+        """
+        db_manager.execute(create_table_sql)
+
+        # Get total rows
+        total_rows = db_manager.execute(
+            "SELECT COUNT(*) FROM filtered_blast"
+        ).fetchone()[0]
+        log.info(f"Number of alignments after filtering: {total_rows:,}")
+
+    return total_rows
+
+
 def create_filtered_blast_from_parquet(
     db_file: str,
     input_file: str,
@@ -174,37 +285,33 @@ def create_filtered_blast_from_parquet(
     max_memory: Optional[int],
 ) -> int:
     """Create the filtered blast table as a view over Parquet input"""
-    with duckdb.connect(database=db_file) as connection:
-        # Configure DuckDB
-        connection.execute(f"SET threads={num_threads}")
-        connection.execute(f"SET temp_directory='{temp_dir}'")
-        connection.execute("SET preserve_insertion_order=false")
-        connection.execute("SET enable_progress_bar=true")
-        if max_memory:
-            formatted_memory = set_memory_limit(max_memory, ratio=0.6)
-            connection.execute(f"SET memory_limit='{formatted_memory}'")
-            connection.execute(f"SET max_memory='{formatted_memory}'")
-
+    with DatabaseManager(
+        database=db_file,
+        temp_dir=temp_dir,
+        threads=num_threads,
+        memory_limit=max_memory,
+        max_memory_pct=60,
+        enable_progress=True
+    ) as db_manager:
         # Handle Parquet directory
         parquet_path = (
             input_file if os.path.isfile(input_file) else f"{input_file}/*.parquet"
         )
 
-        # Create a view over the parquet data
-        connection.execute(
+        # Create a view over the parquet data - don't add rowid here
+        db_manager.execute(
             f"""
             CREATE VIEW filtered_blast AS 
-            SELECT * FROM parquet_scan('{parquet_path}')
+            SELECT *
+            FROM parquet_scan('{parquet_path}')
         """
         )
 
         # Get total rows
-        total_rows = connection.execute(
+        total_rows = db_manager.execute(
             "SELECT COUNT(*) FROM filtered_blast"
         ).fetchone()[0]
         log.info(f"Created filtered_blast view over Parquet with {total_rows:,} rows")
-
-        connection.commit()
 
     return total_rows
 
@@ -252,9 +359,11 @@ def setup_temporary_directory(
         "tmp": os.path.join(temp_dir_path),
     }
 
+    # Create directories with explicit permissions
     for path in temp_subdirectories.values():
         if not os.path.exists(path):
-            os.makedirs(path)
+            os.makedirs(path, mode=0o755, exist_ok=True)
+            log.debug(f"Created directory with permissions 755: {path}")
 
     return temp_dir, temp_subdirectories
 
@@ -516,16 +625,13 @@ def calculate_optimal_row_group_size(
 
 
 def export_to_parquet(
-    db_file: str,
+    db_manager: DatabaseManager,
     columns_info: Dict[str, ColumnInfo],
     output_dir: str,
     total_rows: int,
     chunk_size: Optional[int] = None,
     compression: str = "zstd",
     compression_level: int = 3,
-    num_threads: int = 1,
-    max_memory: Optional[int] = None,
-    temp_dir: Optional[str] = None,
     keep_db: bool = False,
     output_files: Optional[Dict[str, str]] = None,
     table_name: str = "filtered_blast",
@@ -546,22 +652,6 @@ def export_to_parquet(
     else:
         output_path = os.path.join(output_dir, "db", "export.parquet")
 
-    # Configure DuckDB connection
-    conn = duckdb.connect(database=db_file)
-    conn.execute(f"SET threads={num_threads}")
-    conn.execute("SET preserve_insertion_order=true")
-    conn.execute("SET enable_progress_bar=true")
-    max_memory_str = set_memory_limit(max_memory, ratio=0.6) if max_memory else None
-    if max_memory_str:
-        conn.execute(f"SET memory_limit='{max_memory_str}'")
-        conn.execute(f"SET max_memory='{max_memory_str}'")
-
-    # Prepare column selection with proper casting
-    # select_columns = [
-    #     f"CAST({col_info.name} AS {col_info.duckdb_type}) as {col_info.name}"
-    #     for col_info in columns_info.values()
-    # ]
-
     # Export query with optimized settings
     export_sql = f"""
         COPY {table_name} TO '{output_path}'
@@ -580,15 +670,79 @@ def export_to_parquet(
         - Row group size: {chunk_size:,} rows ({(chunk_size * sum(np.dtype(ci.numpy_type).itemsize for ci in columns_info.values())) / (1024*1024):.2f} MB)
         - Compression: {compression.upper()}
         - Compression level: {compression_level}
-        - Threads: {num_threads}
         - Total rows: {total_rows:,}
         - Number of groups: {math.ceil(total_rows / chunk_size)}
     """
     )
 
-    conn.execute(export_sql)
-    conn.close()
+    db_manager.execute(export_sql)
 
+    return output_path
+
+
+def export_to_parquet_with_rowid(
+    db_manager: DatabaseManager,
+    columns_info: Dict[str, ColumnInfo],
+    output_dir: str,
+    total_rows: int,
+    chunk_size: Optional[int] = None,
+    compression: str = "zstd",
+    compression_level: int = 3,
+    keep_db: bool = False,
+    output_files: Optional[Dict[str, str]] = None,
+) -> str:
+    """Export DuckDB table to optimized Parquet file with rowid included directly in COPY"""
+
+    if chunk_size is None:
+        # Calculate optimal size based on Parquet recommendations
+        available_mem = psutil.virtual_memory().available
+        chunk_size = calculate_optimal_row_group_size(
+            total_rows=total_rows,
+            columns_info=columns_info,
+            available_memory=available_mem,
+        )
+    
+    if keep_db:
+        output_path = output_files["parquet"]
+    else:
+        output_path = os.path.join(output_dir, "db", "export.parquet")
+
+    # Create column list with explicit casts and include rowid
+    select_columns = []
+    for col_name, col_info in columns_info.items():
+        if col_name == "rowid":
+            select_columns.append("rowid")
+        else:
+            select_columns.append(f"CAST({col_name} AS {col_info.duckdb_type}) as {col_name}")
+    
+    # Export directly with COPY (SELECT ...) TO ... - single scan
+    export_sql = f"""
+        COPY (
+            SELECT {', '.join(select_columns)}
+            FROM filtered_blast
+        ) TO '{output_path}'
+        (
+            FORMAT PARQUET,
+            ROW_GROUP_SIZE {chunk_size},
+            COMPRESSION 'ZSTD',
+            COMPRESSION_LEVEL 3,
+            PER_THREAD_OUTPUT
+        )
+    """
+
+    log.info(f"Exporting directly to Parquet with rowid (single scan)")
+    log.debug(
+        f"""
+        Optimized Parquet export settings:
+        - Row group size: {chunk_size:,} rows ({(chunk_size * sum(np.dtype(ci.numpy_type).itemsize for ci in columns_info.values())) / (1024*1024):.2f} MB)
+        - Compression: {compression.upper()}
+        - Compression level: {compression_level}
+        - Total rows: {total_rows:,}
+        - Single table scan with rowid included
+    """
+    )
+
+    db_manager.execute(export_sql)
     return output_path
 
 
@@ -786,22 +940,28 @@ def process_parquet_to_memmap(
         for name, type_info in columns_info.items()
     }
 
-    # Export to parquet
+    # Export to parquet - include rowid directly in COPY statement
     if not skip_export:
-        parquet_file = export_to_parquet(
-            db_file=db_file,
-            columns_info=column_specs,
-            output_dir=temp_dir,
-            total_rows=total_rows,
-            chunk_size=chunk_size,
-            compression=compression,
-            compression_level=compression_level,
-            num_threads=num_threads,
+        with DatabaseManager(
+            database=db_file,
             temp_dir=temp_dir,
-            max_memory=max_memory,
-            keep_db=keep_db,
-            output_files=output_files,
-        )
+            threads=num_threads,
+            memory_limit=max_memory,
+            max_memory_pct=60,
+            enable_progress=True
+        ) as db_manager:
+            # Export directly with rowid included - no temporary table needed
+            parquet_file = export_to_parquet_with_rowid(
+                db_manager=db_manager,
+                columns_info=column_specs,
+                output_dir=temp_dir,
+                total_rows=total_rows,
+                chunk_size=chunk_size,
+                compression=compression,
+                compression_level=compression_level,
+                keep_db=keep_db,
+                output_files=output_files,
+            )
     else:
         parquet_file = db_file
 
@@ -878,121 +1038,204 @@ def process_parquet_to_memmap(
     return read_arrays
 
 
-# import os
-# import time
-# import numpy as np
-# import queue
-# import logging
-# from tqdm import tqdm
-# from typing import Dict, Tuple, Optional
-# from concurrent.futures import ThreadPoolExecutor
-# import duckdb
-
-
-def create_filtered_blast_table(
+def process_db_to_memmap_direct(
     db_file: str,
-    input_file: str,
+    total_rows: int,
+    columns_info: Dict[str, Tuple[str, str]],
+    memmap_dir: str,
     temp_dir: str,
     num_threads: int,
-    max_memory: Optional[int],
-    evalue_threshold: float,
-    bitscore_threshold: float,
-) -> int:
-    """Create the filtered blast table and return total row count"""
-    with duckdb.connect(database=db_file) as connection:
-        # Configure DuckDB with 50% of max memory for table creation
-        connection.execute(f"SET threads={num_threads}")
-        connection.execute(f"SET temp_directory='{temp_dir}'")
-        connection.execute("SET preserve_insertion_order=false")
-        connection.execute("SET enable_progress_bar=true")
-        if max_memory:
-            formatted_memory = set_memory_limit(max_memory, ratio=0.5)
-            # connection.execute(f"SET memory_limit='{formatted_memory}'")
-            connection.execute(f"SET max_memory='{formatted_memory}'")
-
-        # Get number of columns from input file
-        num_columns = len(
-            connection.execute(
-                f"SELECT * FROM read_csv_auto('{input_file}') LIMIT 1"
-            ).description
-        )
-        log.info(f"Detected {num_columns} columns in input file")
-
-        hash_columns = ", ".join([f"column{i:02d}" for i in range(num_columns)])
-        additional_columns = (
-            """
-            column14 AS cigar,
-            column15 AS qaln,
-            column16 AS taln,
-            """
-            if num_columns == 17
-            else ""
+    max_memory: Optional[int] = None,
+    chunk_size: Optional[int] = None,
+) -> Dict[str, np.memmap]:
+    """
+    Process DuckDB table directly to memory-mapped arrays with optimized parallel processing.
+    Uses rowid-based range queries instead of OFFSET/LIMIT for much better performance.
+    """
+    log.info("Starting optimized direct DuckDB to memmap conversion")
+    
+    if chunk_size is None:
+        # Instantiate ResourceManager
+        resource_manager = ResourceManager(max_memory=max_memory, max_threads=num_threads)
+        
+        # Calculate memory per row - use the numpy_type (second element of tuple)
+        row_size = sum(np.dtype(type_tuple[1]).itemsize for _, type_tuple in columns_info.items())
+        
+        # Use ResourceManager to calculate optimal chunk size - make it larger for better performance
+        chunk_size = resource_manager.calculate_optimal_chunk_size(
+            total_elements=total_rows,
+            element_size=row_size,
+            operation_overhead=1.5,  # Reduced overhead factor
+            min_chunk_size=10_000_000,  # Larger minimum chunks
+            max_chunk_size=500_000_000,  # Much larger maximum chunks
         )
 
-        # Create filtered table with explicit type casts
-        create_table_sql = f"""
-            CREATE TABLE filtered_blast AS
-            WITH input_data AS (
-                SELECT *,
-                    CAST(column10 AS DOUBLE) as evalue,
-                    CAST(column11 AS FLOAT) as bitscore
-                FROM read_csv_auto('{input_file}', parallel=true)
-                WHERE CAST(column10 AS DOUBLE) <= {evalue_threshold} 
-                AND CAST(column11 AS FLOAT) >= {bitscore_threshold}
-            )
-            SELECT
-                column00 AS queryId,
-                CAST(hash(column01) % 9223372036854775807 AS BIGINT) AS subject_numeric_id,
-                CAST(hash(column00) % 9223372036854775807 AS BIGINT) AS query_numeric_id,
-                column01 AS subjectId,
-                CAST(column02 AS FLOAT4) AS percIdentity,
-                CAST(column03 AS INTEGER) AS alnLength,
-                CAST(column04 AS SMALLINT) AS mismatchCount,
-                CAST(column05 AS SMALLINT) AS gapOpenCount,
-                CAST(column06 AS INTEGER) AS queryStart,
-                CAST(column07 AS INTEGER) AS queryEnd,
-                CAST(column08 AS INTEGER) AS subjectStart,
-                CAST(column09 AS INTEGER) AS subjectEnd,
-                evalue AS eVal,
-                CAST(bitscore AS FLOAT4) AS bitScore,
-                CAST(column12 AS INTEGER) AS qlen,
-                CAST(column13 AS INTEGER) AS slen,
-                {additional_columns}
-                CAST(hash({hash_columns}) % 9223372036854775807 AS BIGINT) AS row_hash
-            FROM input_data
-        """
-        connection.execute(create_table_sql)
-
-        # Get total rows
-        total_rows = connection.execute(
-            "SELECT COUNT(*) FROM filtered_blast"
-        ).fetchone()[0]
-        log.info(f"Number of alignments after filtering: {total_rows:,}")
-
-        # Ensure all changes are committed before closing connection
-        connection.commit()
-
-    return total_rows
-
-
-def create_unique_hash_view(connection):
-    """Create a view with only unique row_hashes from filtered_blast"""
-    connection.execute(
-        """
-        CREATE VIEW filtered_blast_unique AS
-        SELECT * FROM filtered_blast f1
-        WHERE f1.row_hash = (
-            SELECT MIN(row_hash)
-            FROM filtered_blast f2
-            WHERE f2.row_hash = f1.row_hash
+    log.info(f"Using optimized chunk size: {chunk_size:,} rows")
+    
+    # Initialize all memmap files
+    memmap_arrays = {}
+    total_size = 0
+    for column_name, (_, numpy_type) in columns_info.items():
+        memmap_file_path = os.path.join(memmap_dir, f"{column_name}.dat")
+        dtype = np.dtype(numpy_type)
+        total_size += total_rows * dtype.itemsize
+        memmap_arrays[column_name] = np.memmap(
+            memmap_file_path, mode="w+", shape=(total_rows,), dtype=dtype
         )
-        """
+    
+    log.info(f"Created memmap files totaling: {format_memory_size(total_size)}")
+    
+    # Get rowid range to avoid using OFFSET/LIMIT
+    with DatabaseManager(
+        database=db_file,
+        temp_dir=temp_dir,
+        threads=1,  # Single connection for range query
+        memory_limit=max_memory,
+        max_memory_pct=30,
+        enable_progress=False
+    ) as db_manager:
+        # Get min and max rowid for range-based queries
+        result = db_manager.execute("SELECT MIN(rowid), MAX(rowid) FROM filtered_blast").fetchone()
+        min_rowid, max_rowid = result
+        log.info(f"Rowid range: {min_rowid} to {max_rowid}")
+    
+    # Create rowid-based chunks instead of offset-based
+    rowid_step = (max_rowid - min_rowid + 1) // num_threads
+    if rowid_step == 0:
+        rowid_step = 1
+    
+    # Create thread-safe progress tracking
+    progress_lock = threading.Lock()
+    total_processed = threading.Event()
+    processed_rows = {"count": 0}
+    
+    def process_rowid_range(thread_id: int, start_rowid: int, end_rowid: int):
+        """Process a range of rowids in a separate thread"""
+        try:
+            # Each thread gets its own database connection
+            with DatabaseManager(
+                database=db_file,
+                temp_dir=temp_dir,
+                threads=1,  # One thread per connection
+                memory_limit=max_memory,
+                max_memory_pct=max(20, 80 // num_threads),  # Distribute memory among threads
+                enable_progress=False
+            ) as thread_db:
+                connection = thread_db.connection
+                
+                # Optimize connection for bulk reading
+                connection.execute("SET preserve_insertion_order=true")
+                connection.execute("SET enable_object_cache=true")
+                
+                # Construct SELECT with rowid range - much faster than OFFSET/LIMIT
+                select_columns = []
+                for col, (duckdb_type, _) in columns_info.items():
+                    if col == "rowid":
+                        select_columns.append("rowid")
+                    else:
+                        select_columns.append(f"CAST({col} AS {duckdb_type}) as {col}")
+                
+                # Use rowid-based WHERE clause instead of OFFSET/LIMIT
+                select_sql = f"""
+                    SELECT {', '.join(select_columns)}
+                    FROM filtered_blast
+                    WHERE rowid >= ? AND rowid < ?
+                    ORDER BY rowid
+                """
+                
+                current_rowid = start_rowid
+                thread_processed = 0
+                
+                while current_rowid < end_rowid:
+                    chunk_end = min(current_rowid + chunk_size, end_rowid)
+                    
+                    # Fetch chunk using rowid range
+                    chunk_data = connection.execute(
+                        select_sql, [current_rowid, chunk_end]
+                    ).fetchnumpy()
+                    
+                    if len(chunk_data) == 0:
+                        break
+                    
+                    actual_rows = len(next(iter(chunk_data.values())))
+                    if actual_rows == 0:
+                        break
+                    
+                    # Find the position to write based on rowid values
+                    rowids = chunk_data['rowid']
+                    write_positions = rowids - min_rowid  # Convert rowid to array index
+                    
+                    # Write data efficiently using advanced indexing
+                    for column_name, (_, numpy_type) in columns_info.items():
+                        chunk = chunk_data[column_name]
+                        memmap_arrays[column_name][write_positions] = chunk
+                    
+                    current_rowid = chunk_end
+                    thread_processed += actual_rows
+                    
+                    # Update global progress less frequently
+                    if thread_processed % (chunk_size // 10) == 0:
+                        with progress_lock:
+                            processed_rows["count"] += thread_processed
+                            thread_processed = 0
+                
+                # Final update for remaining rows
+                with progress_lock:
+                    processed_rows["count"] += thread_processed
+                    
+        except Exception as e:
+            log.error(f"Error in thread {thread_id}: {str(e)}")
+            raise
+    
+    # Create progress bar
+    pbar = tqdm(
+        total=total_rows,
+        desc="Converting to memmap",
+        unit="rows",
+        unit_scale=False,
+        leave=False,
     )
-
-    total_unique = connection.execute(
-        "SELECT COUNT(*) FROM filtered_blast_unique"
-    ).fetchone()[0]
-    log.info(f"Created view with {total_unique:,} unique row_hashes")
+    
+    # Start parallel processing
+    with ThreadPoolExecutor(max_workers=num_threads) as executor:
+        futures = []
+        
+        for i in range(num_threads):
+            start_rowid = min_rowid + i * rowid_step
+            end_rowid = min_rowid + (i + 1) * rowid_step if i < num_threads - 1 else max_rowid + 1
+            
+            future = executor.submit(process_rowid_range, i, start_rowid, end_rowid)
+            futures.append(future)
+        
+        # Monitor progress
+        while any(not f.done() for f in futures):
+            time.sleep(5)  # Update every 5 seconds
+            with progress_lock:
+                current_count = processed_rows["count"]
+                pbar.n = current_count
+                pbar.refresh()
+        
+        # Wait for all threads to complete
+        for future in futures:
+            future.result()  # This will raise any exceptions that occurred
+    
+    pbar.n = total_rows
+    pbar.refresh()
+    pbar.close()
+    
+    # Final flush and convert to read-only - only flush once at the end
+    log.info("Finalizing memmap arrays...")
+    read_memmap_arrays = {}
+    for column_name, (_, numpy_type) in columns_info.items():
+        memmap_file_path = os.path.join(memmap_dir, f"{column_name}.dat")
+        memmap_arrays[column_name].flush()  # Single flush at the end
+        del memmap_arrays[column_name]
+        read_memmap_arrays[column_name] = np.memmap(
+            memmap_file_path, mode="r", dtype=np.dtype(numpy_type), shape=(total_rows,)
+        )
+    
+    log.info("Optimized direct DuckDB to memmap conversion completed")
+    return read_memmap_arrays
 
 
 @track_memory(name="process_input_data", detailed=True)
@@ -1003,28 +1246,13 @@ def process_input_data(
     num_threads: int = 1,
     evalue_threshold: float = 1e-5,
     bitscore_threshold: float = 50,
+    percent_identity_threshold: float = 0.0,  # Added parameter
     max_memory: Optional[int] = None,
     keep_db: bool = False,
     output_files: Optional[Dict[str, str]] = None,
-    deduplicate: bool = True,
+    use_direct_conversion: bool = False,  # New parameter to control conversion method
 ) -> Tuple[Dict[str, np.ndarray], str]:
-    """Main function to process input data and create memory-mapped arrays with deduplication
-
-    Args:
-        input_file: Path to input file (Parquet, TSV, or DuckDB)
-        temp_directories: Tuple of temporary directory and subdirectories
-        mmap_folder_dir: Optional directory for existing memory-mapped files
-        num_threads: Number of threads to use
-        evalue_threshold: E-value threshold for filtering
-        bitscore_threshold: Bit score threshold for filtering
-        max_memory: Maximum memory to use in bytes
-        keep_db: Whether to keep the database file
-        output_files: Optional dictionary of output file paths
-        deduplicate: Whether to remove duplicate row_hashes
-
-    Returns:
-        Tuple of (memory_mapped_arrays, database_file_path)
-    """
+    """Main function to process input data and create memory-mapped arrays"""
     temp_dir = temp_directories[0].name
     temp_subdirectories = temp_directories[1]
     db_dir = temp_subdirectories["db"]
@@ -1032,13 +1260,12 @@ def process_input_data(
 
     if keep_db:
         memmap_dir = output_files["mmap"]
-        # Create memmap directory if it doesn't exist
         if not os.path.exists(memmap_dir):
             os.makedirs(memmap_dir)
     else:
         memmap_dir = temp_subdirectories["mmap"]
 
-    # Define column types with explicit DuckDB and NumPy type mapping
+    # Define column types - add rowid to replace row_hash
     column_data_types = {
         "percIdentity": ("FLOAT4", "float32"),
         "alnLength": ("INTEGER", "int32"),
@@ -1048,8 +1275,8 @@ def process_input_data(
         "slen": ("INTEGER", "int32"),
         "subject_numeric_id": ("BIGINT", "int64"),
         "query_numeric_id": ("BIGINT", "int64"),
-        "row_hash": ("BIGINT", "int64"),
         "bitScore": ("FLOAT4", "float32"),
+        "rowid": ("BIGINT", "int64"),  # Add rowid as replacement for row_hash
     }
 
     log.info(f"Starting processing of input file: {input_file}")
@@ -1060,62 +1287,14 @@ def process_input_data(
 
     # Process input based on type
     if input_type == "parquet":
-        log.info(f"Creating DuckDB database from Parquet at: {db_file}")
-        with duckdb.connect(database=db_file) as connection:
-            connection.execute(f"SET threads={num_threads}")
-            connection.execute(f"SET temp_directory='{temp_dir}'")
-            connection.execute("SET preserve_insertion_order=false")
-            connection.execute("SET enable_progress_bar=true")
-            if max_memory:
-                formatted_memory = set_memory_limit(max_memory, ratio=0.6)
-                connection.execute(f"SET memory_limit='{formatted_memory}'")
-                connection.execute(f"SET max_memory='{formatted_memory}'")
-
-            # Handle Parquet directory
-            parquet_path = (
-                input_file if os.path.isfile(input_file) else f"{input_file}/*.parquet"
-            )
-
-            # Create initial view
-            base_view = f"""
-                CREATE VIEW base_filtered_blast AS 
-                SELECT * FROM parquet_scan('{parquet_path}')
-            """
-            connection.execute(base_view)
-
-            # Create deduplicated view if requested
-            if deduplicate:
-                dedup_view = """
-                    CREATE VIEW filtered_blast AS
-                    SELECT DISTINCT ON (row_hash) *
-                    FROM base_filtered_blast
-                """
-            else:
-                dedup_view = """
-                    CREATE VIEW filtered_blast AS
-                    SELECT * FROM base_filtered_blast
-                """
-            connection.execute(dedup_view)
-
-            # Get total rows
-            total_rows = connection.execute(
-                "SELECT COUNT(*) FROM filtered_blast"
-            ).fetchone()[0]
-            if deduplicate:
-                original_rows = connection.execute(
-                    "SELECT COUNT(*) FROM base_filtered_blast"
-                ).fetchone()[0]
-                log.info(
-                    f"Deduplicated {original_rows:,} rows to {total_rows:,} unique rows "
-                    f"(removed {original_rows - total_rows:,} duplicates)"
-                )
-            else:
-                log.info(f"Created filtered_blast view with {total_rows:,} rows")
-
-            connection.commit()
-
+        total_rows = create_filtered_blast_from_parquet(
+            db_file=db_file,
+            input_file=input_file,
+            temp_dir=temp_dir,
+            num_threads=num_threads,
+            max_memory=max_memory,
+        )
     elif input_type == "tsv":
-        log.info(f"Creating DuckDB database at: {db_file}")
         total_rows = create_filtered_blast_table(
             db_file=db_file,
             input_file=input_file,
@@ -1124,164 +1303,71 @@ def process_input_data(
             max_memory=max_memory,
             evalue_threshold=evalue_threshold,
             bitscore_threshold=bitscore_threshold,
+            percent_identity_threshold=percent_identity_threshold,  # Added parameter
         )
-
-        if deduplicate:
-            with duckdb.connect(database=db_file) as connection:
-                # Create base view from original table
-                connection.execute(
-                    """
-                    CREATE VIEW base_filtered_blast AS
-                    SELECT * FROM filtered_blast
-                    """
-                )
-
-                # Create new table with deduplicated data
-                connection.execute(
-                    """
-                    CREATE TABLE temp_filtered_blast AS
-                    SELECT DISTINCT ON (row_hash) *
-                    FROM base_filtered_blast
-                    """
-                )
-
-                # Drop original table and view
-                connection.execute("DROP TABLE filtered_blast")
-                connection.execute("DROP VIEW base_filtered_blast")
-
-                # Rename temp table to final table
-                connection.execute(
-                    "ALTER TABLE temp_filtered_blast RENAME TO filtered_blast"
-                )
-
-                # Get new total
-                new_total = connection.execute(
-                    "SELECT COUNT(*) FROM filtered_blast"
-                ).fetchone()[0]
-                log.info(
-                    f"Deduplicated {total_rows:,} rows to {new_total:,} unique rows "
-                    f"(removed {total_rows - new_total:,} duplicates)"
-                )
-                total_rows = new_total
-                connection.commit()
-
-    else:  # input_type == "duckdb"
-        log.info("Using existing DuckDB database")
-        db_file = input_file
-
-        with duckdb.connect(db_file) as connection:
-            if deduplicate:
-                # Execute statements separately
-                connection.execute(
-                    """
-                    CREATE VIEW base_filtered_blast AS
-                    SELECT * FROM filtered_blast
-                """
-                )
-
-                connection.execute("DROP TABLE filtered_blast")
-
-                connection.execute(
-                    """
-                    CREATE VIEW filtered_blast AS
-                    SELECT DISTINCT ON (row_hash) *
-                    FROM base_filtered_blast
-                """
-                )
-
-            total_rows = connection.execute(
-                "SELECT COUNT(*) FROM filtered_blast"
-            ).fetchone()[0]
-            if deduplicate:
-                # Create base view first
-                connection.execute(
-                    """
-                    CREATE VIEW base_filtered_blast AS
-                    SELECT * FROM filtered_blast
-                    """
-                )
-
-                # Create new table with deduplicated data
-                connection.execute(
-                    """
-                    CREATE TABLE temp_filtered_blast AS
-                    SELECT DISTINCT ON (row_hash) *
-                    FROM base_filtered_blast
-                    """
-                )
-
-                # Drop original table and view
-                connection.execute("DROP TABLE filtered_blast")
-                connection.execute("DROP VIEW base_filtered_blast")
-
-                # Rename temp table to final table
-                connection.execute(
-                    "ALTER TABLE temp_filtered_blast RENAME TO filtered_blast"
-                )
-
-    # If mmap folder is provided, load and validate existing arrays
-    if mmap_folder_dir:
-        log.info(f"Loading existing memory-mapped arrays from: {mmap_folder_dir}")
-        memory_mapped_arrays = load_existing_mmap_arrays(
-            folder_path=mmap_folder_dir,
-            expected_rows=total_rows,  # Pass the row count for validation
-        )
-        return memory_mapped_arrays, db_file
-
-    # Handle direct memory or new mmap creation
-    if not max_memory:
-        # Direct memory implementation
-        log.info("Loading data into memory using optimized batch fetch")
-        memory_arrays = {}
-        try:
-            with duckdb.connect(database=db_file) as connection:
-                connection.execute(f"SET threads={num_threads}")
-                select_columns = []
-                for col, (duckdb_type, numpy_type) in column_data_types.items():
-                    select_columns.append(f"CAST({col} AS {duckdb_type}) as {col}")
-
-                select_sql = f"SELECT {', '.join(select_columns)} FROM filtered_blast"
-                result = connection.execute(select_sql).fetchnumpy()
-
-                for col, (_, numpy_type) in column_data_types.items():
-                    memory_arrays[col] = result[col].astype(numpy_type, copy=False)
-
-            return memory_arrays, db_file
-
-        except Exception as e:
-            log.error(f"Error during data loading: {str(e)}")
-            raise
-
     else:
-        # Memory-mapped implementation
-        log.info("Creating memory-mapped arrays with batch processing")
-        if input_type == "parquet" and not deduplicate:
-            # Use the parquet file directly for creating mmaps only if not deduplicating
-            log.info("Using existing Parquet file for memory-mapped arrays")
-            memory_mapped_arrays = process_parquet_to_memmap(
-                db_file=input_file,  # Original parquet file
-                total_rows=total_rows,
-                columns_info=column_data_types,
-                memmap_dir=memmap_dir,
-                temp_dir=temp_dir,
-                num_threads=num_threads,
-                max_memory=max_memory,
-                skip_export=True,  # Skip export since we already have parquet
-                keep_db=keep_db,
-                output_files=output_files,
-            )
-        else:
-            # Export to parquet and create mmaps
-            memory_mapped_arrays = process_parquet_to_memmap(
-                db_file=db_file,
-                total_rows=total_rows,
-                columns_info=column_data_types,
-                memmap_dir=memmap_dir,
-                temp_dir=temp_dir,
-                num_threads=num_threads,
-                max_memory=max_memory,
-                skip_export=False,  # Need to export for non-parquet inputs or when deduplicating
-                keep_db=keep_db,
-                output_files=output_files,
-            )
-        return memory_mapped_arrays, db_file
+        raise ValueError(f"Unsupported input type: {input_type}")
+
+    # Choose conversion method based on dataset size and user preference
+    if use_direct_conversion and total_rows > 1_000_000:
+        log.info("Using direct DuckDB to memmap conversion for better performance")
+        read_arrays = process_db_to_memmap_direct(
+            db_file=db_file,
+            total_rows=total_rows,
+            columns_info=column_data_types,
+            memmap_dir=memmap_dir,
+            temp_dir=temp_dir,
+            num_threads=num_threads,
+            max_memory=max_memory,
+        )
+    else:
+        log.info("Using Parquet intermediate conversion")
+        # Process Parquet to memory-mapped arrays
+        read_arrays = process_parquet_to_memmap(
+            db_file=db_file,
+            total_rows=total_rows,
+            columns_info=column_data_types,
+            memmap_dir=memmap_dir,
+            temp_dir=temp_dir,
+            num_threads=num_threads,
+            max_memory=max_memory,
+            keep_db=keep_db,
+            output_files=output_files,
+        )
+    
+    log.info(f"Processed {len(read_arrays)} columns into memory-mapped arrays")
+    return read_arrays, db_file
+
+
+def is_debug() -> bool:
+    """Check if debug mode is enabled"""
+    return log.getEffectiveLevel() <= logging.DEBUG
+
+
+def cleanup_temporary_files(
+    temp_paths: List[str],
+    keep_files: bool = False
+) -> None:
+    """
+    Clean up temporary files and directories.
+    
+    Args:
+        temp_paths: List of file/directory paths to clean up
+        keep_files: If True, skip cleanup (for debugging)
+    """
+    if keep_files:
+        log.info("Keeping temporary files for debugging")
+        return
+        
+    for path in temp_paths:
+        try:
+            if os.path.isfile(path):
+                os.remove(path)
+                log.debug(f"Removed temporary file: {path}")
+            elif os.path.isdir(path):
+                import shutil
+                shutil.rmtree(path)
+                log.debug(f"Removed temporary directory: {path}")
+        except Exception as e:
+            log.warning(f"Failed to remove temporary path {path}: {e}")
+

@@ -704,9 +704,8 @@ def memory_efficient_factorize(
     # Initialize resource manager and get chunking strategy
     resource_mgr = ResourceManager(max_memory=max_memory, max_threads=num_threads)
     arr_info = resource_mgr.analyze_array(subject_ids)
-    strategy = resource_mgr.calculate_chunk_size(arr_info)
-    chunk_size = max(100_000_000, strategy.chunk_size)
-
+    strategy = resource_mgr.calculate_chunk_size(arr_info, min_chunk_size=1_000_000, max_chunk_size=100_000_000)
+    chunk_size = strategy.chunk_size
     log.info(f"Using chunk size of {chunk_size:,} elements")
 
     # Create temporary memmap for storing intermediate unique values
@@ -898,3 +897,92 @@ def create_inverse_chunk(chunk_data, unique_vals, output, num_threads=1):
             # If we exited without finding an exact match, use the closest value
             if left > right:
                 output[i] = left if left < len(unique_vals) else right
+
+
+@njit(parallel=True, fastmath=True)
+def apply_mask_parallel(
+    source_array: np.ndarray,
+    mask: np.ndarray,
+    output_array: np.ndarray,
+) -> None:
+    """Apply boolean mask to copy filtered elements in parallel."""
+    output_idx = 0
+    mask_indices = np.where(mask)[0]
+    
+    for i in prange(len(mask_indices)):
+        source_idx = mask_indices[i]
+        output_array[i] = source_array[source_idx]
+
+
+def create_filtered_mmap_arrays(
+    source_arrays: Dict[str, np.memmap],
+    filter_mask: np.memmap,
+    mmap_folder: str,
+    prefix: str = "filtered",
+) -> Dict[str, np.memmap]:
+    """
+    Create filtered memory-mapped arrays based on a boolean mask.
+    
+    Args:
+        source_arrays: Dictionary of source memory-mapped arrays
+        filter_mask: Boolean mask array indicating which elements to keep
+        mmap_folder: Directory for storing the filtered arrays
+        prefix: Prefix for the filtered array filenames
+    
+    Returns:
+        Dictionary of filtered memory-mapped arrays
+    """
+    log.info("Creating filtered memory-mapped arrays")
+    
+    # Count number of elements that pass the filter
+    n_filtered = np.sum(filter_mask)
+    log.info(f"Filtering to {n_filtered:,} elements from {len(filter_mask):,}")
+    
+    if n_filtered == 0:
+        log.warning("No elements pass the filter - returning empty arrays")
+        return {}
+    
+    filtered_arrays = {}
+    
+    # Create filtered arrays for each source array
+    for array_name, source_array in source_arrays.items():
+        try:
+            # Get actual array length, not dictionary length
+            source_length = len(source_array)  # Use actual array length
+            
+            # Verify filter mask is compatible
+            if len(filter_mask) != source_length:
+                log.error(f"Filter mask length ({len(filter_mask):,}) does not match source array '{array_name}' length ({source_length:,})")
+                continue
+                
+            # Create filtered array path
+            filtered_path = os.path.join(mmap_folder, f"{prefix}_{array_name}.dat")
+            
+            # Create filtered memory-mapped array
+            filtered_array = np.memmap(
+                filtered_path,
+                dtype=source_array.dtype,
+                mode='w+',
+                shape=(n_filtered,)
+            )
+            
+            # Apply filter using parallel processing for large arrays
+            if source_length > 1_000_000:
+                log.debug(f"Using parallel filtering for large array '{array_name}' ({source_length:,} elements)")
+                apply_mask_parallel(source_array, filter_mask, filtered_array)
+            else:
+                log.debug(f"Using direct filtering for array '{array_name}' ({source_length:,} elements)")
+                filtered_array[:] = source_array[filter_mask]
+            
+            # Flush to disk
+            filtered_array.flush()
+            
+            filtered_arrays[array_name] = filtered_array
+            log.debug(f"Created filtered array '{array_name}': {source_length:,} -> {n_filtered:,} elements")
+            
+        except Exception as e:
+            log.error(f"Failed to create filtered array for '{array_name}': {e}")
+            continue
+    
+    log.info(f"Successfully created {len(filtered_arrays)} filtered arrays")
+    return filtered_arrays
