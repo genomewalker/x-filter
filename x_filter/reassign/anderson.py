@@ -131,9 +131,7 @@ def solve_anderson_system_stable(
         # Swap rows if needed
         if max_row != k:
             for j in range(memory_used):
-                temp_val = temp_matrix[k, j]
-                temp_matrix[k, j] = temp_matrix[max_row, j]
-                temp_matrix[max_row, j] = temp_val
+                temp_matrix[k, j], temp_matrix[max_row, j] = temp_matrix[max_row, j], temp_matrix[k, j]
         
         # Elimination
         for i in range(k + 1, memory_used):
@@ -251,15 +249,14 @@ def vectorized_anderson_solve(
                 if i != j:
                     sum_val += temp_gram[i, j] * weights_out[j]
             if temp_gram[i, i] > 1e-12:
-                new_val = (1.0 / memory_used - sum_val) / temp_gram[i, i]
-                weights_out[i] = new_val
-                total += new_val
+                weights_out[i] = (1.0 / memory_used - sum_val) / temp_gram[i, i]
+            total += weights_out[i]
         
         # Vectorized normalization
         if total > 1e-12:
             inv_total = 1.0 / total
             for i in prange(memory_used):
-                weights_out[i] = weights_out[i] * inv_total
+                weights_out[i] *= inv_total
     
     return True
 
@@ -322,15 +319,14 @@ def fast_solve_anderson_system_mmap(
                     sum_val += temp_gram[i, j] * weights_out[j]
             
             if temp_gram[i, i] > 1e-12:
-                new_weight = (uniform_weight - sum_val) / temp_gram[i, i]
-                weights_out[i] = new_weight
-                total_new_weight += new_weight
+                weights_out[i] = (uniform_weight - sum_val) / temp_gram[i, i]
+            total_new_weight += weights_out[i]
         
         # Normalize in-place
         if total_new_weight > 1e-12:
             inv_total = 1.0 / total_new_weight
             for i in range(memory_used):
-                weights_out[i] = weights_out[i] * inv_total
+                weights_out[i] *= inv_total
     
     return True
 
@@ -457,42 +453,14 @@ class FastAndersonAccelerator:
             # Try Anderson acceleration if we have history
             if self.memory_used > 0:
                 try:
-                    # Compute residual difference: Δf_k = f_k - f_{k-1}
-                    diff_norm = 0.0
-                    for i in range(self.dimension):
-                        self.temp_residual_diff[i] = self.temp_residual[i] - self.prev_residual[i]
-                        diff_norm += self.temp_residual_diff[i] * self.temp_residual_diff[i]
-                    diff_norm = diff_norm ** 0.5
-                    
-                    if np.isfinite(diff_norm) and diff_norm > 1e-15:
-                        # Update history
-                        pos = self.current_pos % self.memory_depth
-                        for i in range(self.dimension):
-                            self.residual_diffs[pos, i] = self.temp_residual_diff[i]
-                        
-                        self.memory_used = min(self.memory_used + 1, self.memory_depth)
-                        self.current_pos += 1
-                        
-                        # Solve Anderson system for weights
-                        if fast_solve_anderson_system_mmap(
-                            self.residual_diffs[:self.memory_used],
-                            self.memory_used,
-                            self.weights[:self.memory_used],
-                            self.temp_gram[:self.memory_used, :self.memory_used]
-                        ):
-                            # Apply Anderson acceleration
-                            result = self._safe_apply_anderson_acceleration_mmap(current_iterate, fx_k)
-                            
-                            if self._safe_validate_result_mmap(result, current_iterate, fx_k):
-                                for i in range(self.dimension):
-                                    self.prev_residual[i] = self.temp_residual[i]
-                                self.success_count += 1
-                                return result
+                    result = self._safe_apply_anderson_acceleration_mmap(current_iterate, fx_k)
+                    if result is not None and self._safe_validate_result_mmap(result, current_iterate, fx_k):
+                        self.success_count += 1
+                        return result
                     
                 except Exception as e:
                     if self.is_debug:
                         log.debug(f"Anderson acceleration failed: {e}")
-                    self.error_count += 1
             
             # Store residual and return basic F(x_k)
             for i in range(self.dimension):
@@ -606,10 +574,6 @@ class FastAndersonAccelerator:
 
     def _clip_to_bounds(self, array):
         """Clip array values to valid bounds using memory-mapped temp array AND RENORMALIZE."""
-        # Operate on self.temp_result assuming 'array' might be self.temp_result or another source
-        # Copy 'array' to 'self.temp_result' if it's not already it, or work on 'array' if it's a distinct modifiable buffer.
-        # For simplicity, this function will assume it's okay to modify self.temp_result based on 'array'.
-        
         current_sum = 0.0
         for i in range(len(array)):
             val = max(1e-15, min(1.0, array[i]))
@@ -618,10 +582,10 @@ class FastAndersonAccelerator:
 
         if current_sum > 1e-15:
             inv_sum = 1.0 / current_sum
-            for i in range(len(self.temp_result)): # Iterate over self.temp_result length
+            for i in range(len(self.temp_result)):
                 self.temp_result[i] *= inv_sum
         else:
-            # Fallback to uniform if sum is zero (e.g. all weights became 1e-15)
+            # Fallback to uniform if sum is zero
             if self.dimension > 0:
                 uniform_val = 1.0 / self.dimension
                 for i in range(len(self.temp_result)):
@@ -632,7 +596,24 @@ class FastAndersonAccelerator:
         """Safe cleanup with error handling."""
         try:
             if hasattr(self, 'resource_manager') and self.resource_manager is not None:
-                # Arrays will be cleaned up by ResourceManager
-                pass
+                # Clear references to arrays before ResourceManager cleanup
+                array_attrs = [
+                    'residual_diffs', 'weights', 'prev_residual', 'temp_gram',
+                    'temp_residual', 'temp_residual_diff', 'temp_weighted_sum', 'temp_result'
+                ]
+                
+                for attr in array_attrs:
+                    if hasattr(self, attr):
+                        try:
+                            # Clear the reference without explicitly deleting
+                            setattr(self, attr, None)
+                        except Exception:
+                            pass  # Ignore errors during cleanup
+                
+                # Reset state
+                self.memory_used = 0
+                self.current_pos = 0
+                self.first_iteration = True
+                
         except Exception:
-            pass  # Ignore cleanup errors
+            pass  # Ignore all cleanup errors to prevent segfaults

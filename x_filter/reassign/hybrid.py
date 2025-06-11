@@ -1,6 +1,6 @@
-import logging
-import numpy as np
 from typing import Tuple, Optional
+import numpy as np
+import logging
 
 from x_filter.reassign.anderson import FastAndersonAccelerator
 from x_filter.reassign.quasi_newton import FastLBFGSAccelerator
@@ -42,71 +42,56 @@ class HybridAccelerator:
 
     def step(self, current_iterate: np.ndarray, fixed_point_map: callable,
              em_data: np.ndarray = None) -> np.ndarray:
-        """
-        Perform hybrid acceleration step.
-        """
+        """Hybrid step that tries Anderson first, then L-BFGS."""
         try:
-            if self.current_method == "anderson":
-                result = self._try_acceleration_method_fast("anderson", current_iterate, fixed_point_map)
-                if result is not None:
-                    self.anderson_successes += 1
-                    return result
-                else:
-                    self.anderson_failures += 1
-                    # Switch to L-BFGS
-                    self.current_method = "lbfgs"
-                    
-            if self.current_method == "lbfgs":
-                result = self._try_acceleration_method_fast("lbfgs", current_iterate, fixed_point_map)
-                if result is not None:
-                    self.lbfgs_successes += 1
-                    return result
-                else:
-                    self.lbfgs_failures += 1
-                    # Switch back to Anderson
-                    self.current_method = "anderson"
-            
-            # If all methods fail, return basic EM step
-            return fixed_point_map(current_iterate)
-            
+            # Try Anderson first
+            result = self.anderson_accelerator.step(current_iterate, fixed_point_map)
+            if result is not None:
+                self.anderson_successes += 1
+                return result
+            else:
+                self.anderson_failures += 1
         except Exception as e:
-            log.warning(f"Hybrid acceleration failed: {e}")
-            return fixed_point_map(current_iterate)
+            self.anderson_failures += 1
+            log.debug(f"Anderson failed: {e}")
+        
+        try:
+            # Fallback to L-BFGS
+            result = self.lbfgs_accelerator.step(current_iterate, fixed_point_map)
+            if result is not None:
+                self.lbfgs_successes += 1
+                return result
+            else:
+                self.lbfgs_failures += 1
+        except Exception as e:
+            self.lbfgs_failures += 1
+            log.debug(f"L-BFGS failed: {e}")
+        
+        # Return basic EM step
+        return fixed_point_map(current_iterate)
 
     def _try_acceleration_method_fast(self, method: str, current_iterate, fixed_point_map):
-        """
-        Try acceleration method with error handling.
-        """
-        try:
-            if method == "anderson":
-                return self.anderson_accelerator.step(current_iterate, fixed_point_map)
-            elif method == "lbfgs":
-                return self.lbfgs_accelerator.step(current_iterate, fixed_point_map)
-            else:
-                return None
-        except Exception as e:
-            log.debug(f"{method} acceleration failed: {e}")
+        """Try a specific acceleration method."""
+        if method == "anderson":
+            return self.anderson_accelerator.step(current_iterate, fixed_point_map)
+        elif method == "lbfgs":
+            return self.lbfgs_accelerator.step(current_iterate, fixed_point_map)
+        else:
             return None
     
     def cleanup(self):
-        """Clean up accelerator resources."""
-        if hasattr(self.anderson_accelerator, 'cleanup'):
+        """Cleanup both accelerators."""
+        try:
             self.anderson_accelerator.cleanup()
-        if hasattr(self.lbfgs_accelerator, 'cleanup'):
             self.lbfgs_accelerator.cleanup()
+        except Exception:
+            pass
     
     def get_performance_stats(self):
         """Get performance statistics."""
-        total_anderson = self.anderson_successes + self.anderson_failures
-        total_lbfgs = self.lbfgs_successes + self.lbfgs_failures
-        
-        anderson_rate = self.anderson_successes / max(total_anderson, 1) * 100
-        lbfgs_rate = self.lbfgs_successes / max(total_lbfgs, 1) * 100
-        
         return {
-            'anderson_success_rate': anderson_rate,
-            'lbfgs_success_rate': lbfgs_rate,
-            'anderson_attempts': total_anderson,
-            'lbfgs_attempts': total_lbfgs,
-            'current_method': self.current_method
+            'anderson_successes': self.anderson_successes,
+            'anderson_failures': self.anderson_failures,
+            'lbfgs_successes': self.lbfgs_successes,
+            'lbfgs_failures': self.lbfgs_failures
         }

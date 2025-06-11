@@ -113,7 +113,12 @@ class MemoryManager:
 
     def __exit__(self, exc_type, exc_val, exc_tb):
         if self.acquired:
-            self.resource_manager.release_memory(self.bytes_needed)
+            try:
+                self.resource_manager.release_memory(self.bytes_needed)
+                self.acquired = False
+            except Exception:
+                # Ignore errors during cleanup to prevent segfaults
+                pass
 
 
 class ResourceManager:

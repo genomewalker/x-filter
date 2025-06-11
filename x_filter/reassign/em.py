@@ -9,8 +9,17 @@ from typing import Tuple, Optional
 
 from x_filter.resource_management import ResourceManager
 from x_filter.reassign.anderson import FastAndersonAccelerator
+from x_filter.reassign.fast_kernels import (
+    ultra_fast_e_step_billion_prealloc,
+    ultra_fast_m_step_billion_prealloc, 
+    ultra_fast_likelihood_billion_prealloc,
+    ultra_fast_conservation_check_prealloc,
+    ultra_fast_conservation_fix_prealloc,
+    compute_statistics_billion
+)
 
 log = logging.getLogger("my_logger")
+
 
 class ArrayManager:
     """Manages memory-mapped arrays for EM algorithm using ResourceManager exclusively."""
@@ -19,8 +28,8 @@ class ArrayManager:
         self.resource_manager = resource_manager
         self.arrays = {}
         self.array_names = []
-        self.external_arrays = {}  # Track externally provided arrays
-        self.reused_arrays = set()  # Track which arrays we're reusing
+        self.external_arrays = {}
+        self.reused_arrays = set()
     
     def initialize(self, n_elements, max_subject, max_source, external_arrays=None):
         """Initialize all required arrays for EM algorithm using memory-mapped storage."""
@@ -49,9 +58,8 @@ class ArrayManager:
             )
             log.debug(f"Created new responsibilities array (shape: {(n_elements,)})")
             
-        # Create only the arrays we actually need for EM computation
-        # Use smaller initial sizes and grow as needed to minimize memory usage
-        initial_temp_size = min(max_source, 10000)  # Start smaller
+        # PRE-ALLOCATE ALL ARRAYS TO FULL SIZE - NO RESIZING DURING ITERATIONS
+        log.info(f"Pre-allocating all temp arrays to full size: {max_source:,} sources, {max_subject:,} subjects")
         
         self.arrays["weights"] = self.resource_manager.create_array(
             name="em_weights", shape=(max_subject + 1,), dtype=np.float64, temp=True
@@ -65,22 +73,51 @@ class ArrayManager:
             name="em_result_weights", shape=(max_subject + 1,), dtype=np.float64, temp=True
         )
         
-        # Pre-create common temporary arrays using memory-mapped storage
+        # CRITICAL: Pre-allocate temp arrays to FULL SIZE to avoid resizing
         self.arrays["temp_source_max"] = self.resource_manager.create_array(
-            name="em_temp_source_max", shape=(initial_temp_size,), dtype=np.float64, temp=True
+            name="em_temp_source_max", shape=(max_source,), dtype=np.float64, temp=True
         )
         self.arrays["temp_source_denom"] = self.resource_manager.create_array(
-            name="em_temp_source_denom", shape=(initial_temp_size,), dtype=np.float64, temp=True
+            name="em_temp_source_denom", shape=(max_source,), dtype=np.float64, temp=True
         )
         self.arrays["temp_weight_sums"] = self.resource_manager.create_array(
             name="em_temp_weight_sums", shape=(max_subject + 1,), dtype=np.float64, temp=True
         )
         
-        log.debug(f"Created temp arrays with initial size: {initial_temp_size}")
+        # ADDITIONAL: Pre-allocate arrays for validation and statistics
+        self.arrays["temp_source_counts"] = self.resource_manager.create_array(
+            name="em_temp_source_counts", shape=(max_source,), dtype=np.int64, temp=True
+        )
+        self.arrays["temp_validation_sums"] = self.resource_manager.create_array(
+            name="em_temp_validation_sums", shape=(max_source,), dtype=np.float64, temp=True
+        )
+        
+        # Pre-allocate arrays for previous iteration comparison
+        self.arrays["prev_responsibilities"] = self.resource_manager.create_array(
+            name="em_prev_responsibilities", shape=(n_elements,), dtype=np.float64, temp=True
+        )
+        self.arrays["prev_weights"] = self.resource_manager.create_array(
+            name="em_prev_weights", shape=(max_subject + 1,), dtype=np.float64, temp=True
+        )
+        
+        log.info(f"Pre-allocated all arrays - memory usage optimized, no resizing needed")
         
         # Track array names for cleanup (excluding external arrays)
         self.array_names = [name for name in self.arrays.keys() if name not in self.external_arrays]
         log.debug(f"ArrayManager initialized with {len(self.arrays)} memory-mapped arrays ({len(self.external_arrays)} external, {len(self.reused_arrays)} reused)")
+
+    def ensure_array_capacity(self, array_name, required_size, dtype=np.float64):
+        """Ensure array has required capacity - if not, resize. Used for dynamic sizing if needed."""
+        if array_name not in self.arrays:
+            self.arrays[array_name] = self.resource_manager.create_array(
+                name=f"em_{array_name}", shape=(required_size,), dtype=dtype, temp=True
+            )
+        elif len(self.arrays[array_name]) < required_size:
+            # This should NOT happen with proper pre-allocation, but failsafe
+            log.warning(f"Resizing array {array_name} from {len(self.arrays[array_name])} to {required_size}")
+            self.arrays[array_name] = self.resource_manager.create_array(
+                name=f"em_{array_name}_resized", shape=(required_size,), dtype=dtype, temp=True
+            )
 
     def cleanup(self):
         """Clean up all managed arrays, but preserve external arrays."""
@@ -92,6 +129,7 @@ class ArrayManager:
             if name not in self.external_arrays:
                 del self.arrays[name]
         self.array_names.clear()
+
 
 @njit(fastmath=True, parallel=True)
 def compute_responsibilities_from_bitscores(
@@ -530,7 +568,7 @@ def vectorized_log_likelihood(
     
     return total_log_likelihood
 
-def vectorized_bitscore_em_step(
+def bitscore_em_step(
     source_indices: np.ndarray,
     subject_indices: np.ndarray, 
     bit_scores: np.ndarray,
@@ -540,55 +578,34 @@ def vectorized_bitscore_em_step(
     verbose: bool = False
 ) -> np.ndarray:
     """
-    VECTORIZED EM step using all parallel NumPy/Numba operations.
+    Single EM step: E-step + M-step with verbose debugging.
+    Returns updated weights.
     """
-    max_source = np.max(source_indices) + 1
-    max_subject = len(current_weights)
-    
     if verbose:
-        log.debug(f"  Vectorized EM Step - Input weights range: {np.min(current_weights):.6f} to {np.max(current_weights):.6f}")
+        log.debug(f"  EM Step - Input weights range: {np.min(current_weights):.6f} to {np.max(current_weights):.6f}")
+        log.debug(f"  EM Step - Weight sum: {np.sum(current_weights):.6f}")
     
-    # Get or create temporary arrays for vectorized operations
-    if "temp_source_max" not in array_manager.arrays:
-        array_manager.arrays["temp_source_max"] = array_manager.resource_manager.create_array(
-            name="temp_source_max", shape=(max_source,), dtype=np.float64, temp=True
-        )
-    if "temp_source_denom" not in array_manager.arrays:
-        array_manager.arrays["temp_source_denom"] = array_manager.resource_manager.create_array(
-            name="temp_source_denom", shape=(max_source,), dtype=np.float64, temp=True
-        )
-    if "temp_weight_sums" not in array_manager.arrays:
-        array_manager.arrays["temp_weight_sums"] = array_manager.resource_manager.create_array(
-            name="temp_weight_sums", shape=(max_subject,), dtype=np.float64, temp=True
-        )
-    if "responsibilities" not in array_manager.arrays:
-        array_manager.arrays["responsibilities"] = array_manager.resource_manager.create_array(
-            name="em_responsibilities_temp", shape=(len(source_indices),), dtype=np.float64, temp=True
-        )
-    
-    # Vectorized E-step
-    vectorized_compute_responsibilities(
+    # E-step: Compute responsibilities from bit scores
+    compute_responsibilities_from_bitscores(
         source_indices,
         subject_indices,
         bit_scores,
         current_weights,
         lambda_scale,
-        array_manager.arrays["responsibilities"],
-        array_manager.arrays["temp_source_max"],
-        array_manager.arrays["temp_source_denom"]
+        array_manager.arrays["responsibilities"]
     )
     
     if verbose:
         resp = array_manager.arrays["responsibilities"]
-        log.debug(f"  Vectorized E-Step - Responsibility range: {np.min(resp):.6f} to {np.max(resp):.6f}")
-        log.debug(f"  Vectorized E-Step - High confidence (>0.9): {np.sum(resp > 0.9)} / {len(resp)} ({np.sum(resp > 0.9)/len(resp)*100:.1f}%)")
+        log.debug(f"  E-Step - Responsibility range: {np.min(resp):.6f} to {np.max(resp):.6f}")
+        log.debug(f"  E-Step - Mean responsibility: {np.mean(resp):.6f}")
+        log.debug(f"  E-Step - High confidence (>0.9): {np.sum(resp > 0.9)} / {len(resp)} ({np.sum(resp > 0.9)/len(resp)*100:.1f}%)")
     
-    # Vectorized M-step
-    vectorized_update_weights(
+    # M-step: Update weights from responsibilities
+    update_weights_from_responsibilities(
         subject_indices,
         array_manager.arrays["responsibilities"],
-        array_manager.arrays["new_weights"],
-        array_manager.arrays["temp_weight_sums"]
+        array_manager.arrays["new_weights"]
     )
     
     # AVOID COPYING: Use pre-allocated result array
@@ -596,268 +613,7 @@ def vectorized_bitscore_em_step(
     log.debug("Using pre-allocated result_weights array (no copy needed)")
     return array_manager.arrays["result_weights"]
 
-@njit(fastmath=True, parallel=True, cache=True)
-def safe_vectorized_compute_responsibilities(
-    source_indices: np.ndarray,      # Read indices  
-    subject_indices: np.ndarray,     # Protein indices
-    bit_scores: np.ndarray,          # Bit scores b_{rt}
-    weights: np.ndarray,             # Protein weights w_t
-    lambda_scale: float,             # Scale parameter λ
-    responsibilities: np.ndarray,    # Output: p_{rt}
-    temp_source_max: np.ndarray,     # Temp array for max values per source
-    temp_source_denom: np.ndarray    # Temp array for denominators per source
-) -> None:
-    """
-    SAFE VECTORIZED E-Step with proper bounds checking and thread safety.
-    """
-    n = len(source_indices)
-    max_source = len(temp_source_max)
-    max_subject = len(weights)
-    
-    # Bounds check
-    if n == 0 or max_source == 0 or max_subject == 0:
-        return
-    
-    # Clear temporary arrays with bounds checking
-    for i in range(max_source):
-        temp_source_max[i] = -np.inf
-        temp_source_denom[i] = 0.0
-    
-    # Bounds validation
-    max_source_idx = np.max(source_indices)
-    max_subject_idx = np.max(subject_indices)
-    
-    if max_source_idx >= max_source or max_subject_idx >= max_subject:
-        # Fallback to uniform probabilities if bounds are invalid
-        for i in range(n):
-            responsibilities[i] = 1e-15
-        return
-    
-    # Normalize bit scores to prevent overflow
-    min_score = np.min(bit_scores)
-    max_score = np.max(bit_scores)
-    score_range = max_score - min_score
-    
-    if score_range < 1e-10:
-        # All scores identical - safe uniform assignment
-        source_weight_sums = np.zeros(max_source, dtype=np.float64)
-        
-        # Sequential accumulation to avoid race conditions
-        for i in range(n):
-            source_idx = source_indices[i]
-            subject_idx = subject_indices[i]
-            if source_idx < max_source and subject_idx < max_subject:
-                source_weight_sums[source_idx] += weights[subject_idx]
-        
-        # Parallel assignment with bounds checking
-        for i in prange(n):
-            source_idx = source_indices[i]
-            subject_idx = subject_indices[i]
-            if source_idx < max_source and subject_idx < max_subject:
-                if source_weight_sums[source_idx] > 1e-15:
-                    responsibilities[i] = weights[subject_idx] / source_weight_sums[source_idx]
-                else:
-                    responsibilities[i] = 1e-15
-            else:
-                responsibilities[i] = 1e-15
-        return
-    
-    # Pass 1: Find max weighted score per source - sequential to avoid race conditions
-    for i in range(n):
-        source_idx = source_indices[i]
-        subject_idx = subject_indices[i]
-        
-        if source_idx < max_source and subject_idx < max_subject:
-            norm_score = (bit_scores[i] - min_score) / score_range
-            log_weight = np.log(max(weights[subject_idx], 1e-15))
-            weighted_score = log_weight + lambda_scale * norm_score
-            
-            if weighted_score > temp_source_max[source_idx]:
-                temp_source_max[source_idx] = weighted_score
-    
-    # Pass 2: Compute denominators - sequential to avoid race conditions
-    for i in range(n):
-        source_idx = source_indices[i]
-        subject_idx = subject_indices[i]
-        
-        if source_idx < max_source and subject_idx < max_subject:
-            max_val = temp_source_max[source_idx]
-            norm_score = (bit_scores[i] - min_score) / score_range
-            log_weight = np.log(max(weights[subject_idx], 1e-15))
-            weighted_score = log_weight + lambda_scale * norm_score
-            
-            if max_val > -np.inf:
-                exp_val = np.exp(weighted_score - max_val)
-                temp_source_denom[source_idx] += exp_val
-            else:
-                temp_source_denom[source_idx] += 1.0
-    
-    # Pass 3: Compute final responsibilities - parallel with bounds checking
-    for i in prange(n):
-        source_idx = source_indices[i]
-        subject_idx = subject_indices[i]
-        
-        if source_idx < max_source and subject_idx < max_subject:
-            max_val = temp_source_max[source_idx]
-            denom = temp_source_denom[source_idx]
-            
-            if denom > 1e-15 and max_val > -np.inf:
-                norm_score = (bit_scores[i] - min_score) / score_range
-                log_weight = np.log(max(weights[subject_idx], 1e-15))
-                weighted_score = log_weight + lambda_scale * norm_score
-                exp_val = np.exp(weighted_score - max_val)
-                responsibilities[i] = exp_val / denom
-            else:
-                responsibilities[i] = 1e-15
-        else:
-            responsibilities[i] = 1e-15
-        
-        responsibilities[i] = max(1e-15, min(1.0, responsibilities[i]))
-
-@njit(fastmath=True, parallel=True, cache=True)
-def safe_vectorized_update_weights(
-    subject_indices: np.ndarray,     # Protein indices
-    responsibilities: np.ndarray,    # Current responsibilities p_{rt}
-    new_weights: np.ndarray,         # Output: updated weights w_t
-    temp_weight_sums: np.ndarray     # Temp array for accumulation
-) -> None:
-    """
-    SAFE VECTORIZED M-Step with proper bounds checking.
-    Weights are normalized so that Σ w_t = 1.
-    w_t = (Σ_r p_{rt}) / (Σ_r' Σ_t'' p_{r't''})
-    """
-    max_subject = len(new_weights)
-    n_responsibilities = len(responsibilities)
-    n_subject_indices = len(subject_indices)
-    
-    # Bounds check
-    if max_subject == 0 or n_responsibilities == 0 or n_subject_indices == 0:
-        return
-    
-    if n_responsibilities != n_subject_indices:
-        return
-    
-    # Clear arrays with bounds checking
-    for i in range(max_subject):
-        temp_weight_sums[i] = 0.0
-    
-    # Bounds validation
-    max_subject_idx = np.max(subject_indices)
-    if max_subject_idx >= max_subject:
-        # Fallback to uniform weights
-        uniform_weight = 1.0 / max_subject
-        for i in range(max_subject):
-            new_weights[i] = uniform_weight
-        return
-    
-    # Sequential accumulation to avoid race conditions on shared temp_weight_sums
-    for i in range(n_subject_indices):
-        subject_idx = subject_indices[i]
-        if subject_idx < max_subject and i < n_responsibilities:
-            temp_weight_sums[subject_idx] += responsibilities[i]
-    
-    # Calculate sum of all responsibilities
-    sum_all_responsibilities = 0.0
-    # Ensure we iterate over the length of the responsibilities array
-    for i in range(n_responsibilities):
-        sum_all_responsibilities += responsibilities[i]
-
-    # FIXED: Parallel normalization with bounds checking
-    # The total sum of responsibilities should equal the number of unique reads,
-    # but we normalize by the actual sum to ensure proper probability distribution
-    if sum_all_responsibilities > 1e-15:
-        inv_total_responsibilities = 1.0 / sum_all_responsibilities
-        for t in prange(max_subject):
-            new_weights[t] = max(1e-15, temp_weight_sums[t] * inv_total_responsibilities)
-    else:
-        # Fallback to uniform weights if sum of responsibilities is too small
-        if max_subject > 0:
-            uniform_weight = 1.0 / max_subject
-            for t in prange(max_subject):
-                new_weights[t] = uniform_weight
-
-@njit(fastmath=True, cache=True)
-def safe_vectorized_log_likelihood(
-    source_indices: np.ndarray,
-    subject_indices: np.ndarray,
-    bit_scores: np.ndarray,
-    weights: np.ndarray,
-    lambda_scale: float,
-    temp_source_max: np.ndarray,     # Temp array for max values
-    temp_source_sum: np.ndarray      # Temp array for sum values
-) -> float:
-    """
-    SAFE VECTORIZED log-likelihood computation with bounds checking.
-    """
-    n = len(source_indices)
-    max_source = len(temp_source_max)
-    max_subject = len(weights)  # FIXED: Define max_subject properly
-    
-    # Bounds check
-    if n == 0 or max_source == 0 or max_subject == 0:
-        return -np.inf
-    
-    # Bounds validation
-    if len(subject_indices) != n or len(bit_scores) != n:
-        return -np.inf
-    
-    max_source_idx = np.max(source_indices)
-    max_subject_idx = np.max(subject_indices)
-    
-    if max_source_idx >= max_source or max_subject_idx >= max_subject:
-        return -np.inf
-    
-    # Clear temporary arrays
-    for i in range(max_source):
-        temp_source_max[i] = -np.inf
-        temp_source_sum[i] = 0.0
-    
-    # Normalize bit scores
-    min_score = np.min(bit_scores)
-    max_score = np.max(bit_scores)
-    score_range = max_score - min_score
-    
-    if score_range < 1e-10:
-        score_range = 1.0
-    
-    # Pass 1: Find max weighted score per source - sequential
-    for i in range(n):
-        source_idx = source_indices[i]
-        subject_idx = subject_indices[i]
-        
-        if source_idx < max_source and subject_idx < max_subject:
-            norm_score = (bit_scores[i] - min_score) / score_range
-            log_weight = np.log(max(weights[subject_idx], 1e-15))
-            weighted_score = log_weight + lambda_scale * norm_score
-            
-            if weighted_score > temp_source_max[source_idx]:
-                temp_source_max[source_idx] = weighted_score
-    
-    # Pass 2: Compute log-sum-exp per source - sequential
-    for i in range(n):
-        source_idx = source_indices[i]
-        subject_idx = subject_indices[i]
-        
-        if source_idx < max_source and subject_idx < max_subject:
-            max_val = temp_source_max[source_idx]
-            
-            if max_val > -np.inf:
-                norm_score = (bit_scores[i] - min_score) / score_range
-                log_weight = np.log(max(weights[subject_idx], 1e-15))
-                weighted_score = log_weight + lambda_scale * norm_score
-                exp_val = np.exp(weighted_score - max_val)
-                temp_source_sum[source_idx] += exp_val
-    
-    # Pass 3: Sum log-likelihood - sequential to avoid race conditions
-    total_log_likelihood = 0.0
-    for source_idx in range(max_source):
-        if temp_source_max[source_idx] > -np.inf and temp_source_sum[source_idx] > 0:
-            query_log_prob = temp_source_max[source_idx] + np.log(temp_source_sum[source_idx])
-            total_log_likelihood += query_log_prob
-    
-    return total_log_likelihood
-
-def safe_vectorized_bitscore_em_step(
+def ultra_fast_bitscore_em_step(
     source_indices: np.ndarray,
     subject_indices: np.ndarray, 
     bit_scores: np.ndarray,
@@ -867,54 +623,33 @@ def safe_vectorized_bitscore_em_step(
     verbose: bool = False
 ) -> np.ndarray:
     """
-    SAFE VECTORIZED EM step using memory-mapped arrays exclusively.
+    ULTRA-FAST EM step using pre-allocated arrays and optimized kernels.
+    NO array resizing or allocation during execution.
     """
     max_source = np.max(source_indices) + 1
     max_subject = len(current_weights)
+    n_alignments = len(source_indices)
     
     if verbose:
-        log.debug(f"  Safe Vectorized EM Step - Input weights range: {np.min(current_weights):.6f} to {np.max(current_weights):.6f}")
-        log.debug(f"  Safe Vectorized EM Step - Array sizes: source={max_source}, subject={max_subject}, alignments={len(source_indices)}")
+        log.debug(f"  Ultra-Fast EM Step - processing {n_alignments:,} alignments")
+        log.debug(f"  Ultra-Fast EM Step - {max_source:,} sources, {max_subject:,} subjects")
     
     try:
-        # MINIMIZE COPYING: Reuse existing arrays when possible
-        # Check if we can reuse existing temp arrays
-        reuse_temp_max = ("temp_source_max" in array_manager.arrays and 
-                         len(array_manager.arrays["temp_source_max"]) >= max_source)
-        reuse_temp_denom = ("temp_source_denom" in array_manager.arrays and 
-                           len(array_manager.arrays["temp_source_denom"]) >= max_source)
-        reuse_temp_sums = ("temp_weight_sums" in array_manager.arrays and 
-                          len(array_manager.arrays["temp_weight_sums"]) >= max_subject)
-        reuse_responsibilities = ("responsibilities" in array_manager.arrays and 
-                                len(array_manager.arrays["responsibilities"]) >= len(source_indices))
+        # CRITICAL: Use PRE-ALLOCATED arrays - no resizing or new allocation
+        # Arrays should already be sized correctly by ArrayManager.initialize()
         
-        # Only create new arrays if we can't reuse
-        if not reuse_temp_max:
-            log.debug(f"Creating new temp_source_max array (size: {max_source})")
-            array_manager.arrays["temp_source_max"] = array_manager.resource_manager.create_array(
-                name="em_temp_source_max_resized", shape=(max_source,), dtype=np.float64, temp=True
-            )
+        # Verify arrays are correctly sized (should never fail with proper pre-allocation)
+        assert len(array_manager.arrays["temp_source_max"]) >= max_source, \
+            f"temp_source_max too small: {len(array_manager.arrays['temp_source_max'])} < {max_source}"
+        assert len(array_manager.arrays["temp_source_denom"]) >= max_source, \
+            f"temp_source_denom too small: {len(array_manager.arrays['temp_source_denom'])} < {max_source}"
+        assert len(array_manager.arrays["temp_weight_sums"]) >= max_subject, \
+            f"temp_weight_sums too small: {len(array_manager.arrays['temp_weight_sums'])} < {max_subject}"
+        assert len(array_manager.arrays["responsibilities"]) >= n_alignments, \
+            f"responsibilities too small: {len(array_manager.arrays['responsibilities'])} < {n_alignments}"
         
-        if not reuse_temp_denom:
-            log.debug(f"Creating new temp_source_denom array (size: {max_source})")
-            array_manager.arrays["temp_source_denom"] = array_manager.resource_manager.create_array(
-                name="em_temp_source_denom_resized", shape=(max_source,), dtype=np.float64, temp=True
-            )
-        
-        if not reuse_temp_sums:
-            log.debug(f"Creating new temp_weight_sums array (size: {max_subject})")
-            array_manager.arrays["temp_weight_sums"] = array_manager.resource_manager.create_array(
-                name="em_temp_weight_sums_resized", shape=(max_subject,), dtype=np.float64, temp=True
-            )
-        
-        if not reuse_responsibilities:
-            log.debug(f"Creating new responsibilities array (size: {len(source_indices)})")
-            array_manager.arrays["responsibilities"] = array_manager.resource_manager.create_array(
-                name="em_responsibilities_temp_resized", shape=(len(source_indices),), dtype=np.float64, temp=True
-            )
-        
-        # Vectorized E-step
-        vectorized_compute_responsibilities(
+        # ULTRA-FAST E-step using pre-allocated arrays (NO allocation overhead)
+        ultra_fast_e_step_billion_prealloc(
             source_indices,
             subject_indices,
             bit_scores,
@@ -927,27 +662,99 @@ def safe_vectorized_bitscore_em_step(
         
         if verbose:
             resp = array_manager.arrays["responsibilities"]
-            log.debug(f"  Safe E-Step - Responsibility range: {np.min(resp):.6f} to {np.max(resp):.6f}")
-            log.debug(f"  Safe E-Step - High confidence (>0.9): {np.sum(resp > 0.9)} / {len(resp)} ({np.sum(resp > 0.9)/len(resp)*100:.1f}%)")
-    
-        # Vectorized M-step
-        vectorized_update_weights(
+            # Use ultra-fast statistics computation with pre-allocated arrays
+            thresholds = np.array([0.95, 0.90, 0.50, 0.01], dtype=np.float64)
+            counts = np.zeros(4, dtype=np.int64)
+            compute_statistics_billion(resp, thresholds, counts)
+            
+            log.debug(f"  Ultra E-Step - >95%: {counts[0]:,}, >90%: {counts[1]:,}, >50%: {counts[2]:,}, >1%: {counts[3]:,}")
+        
+        # ULTRA-FAST M-step using pre-allocated arrays (NO allocation overhead)
+        ultra_fast_m_step_billion_prealloc(
             subject_indices,
             array_manager.arrays["responsibilities"],
             array_manager.arrays["new_weights"],
             array_manager.arrays["temp_weight_sums"]
         )
         
-        # AVOID COPYING: Use pre-allocated result array
+        # Use pre-allocated result array (NO copying)
         array_manager.arrays["result_weights"][:] = array_manager.arrays["new_weights"]
-        log.debug("Using pre-allocated result_weights array (no copy needed)")
+        
         return array_manager.arrays["result_weights"]
 
     except Exception as e:
-        log.error(f"Error in safe vectorized EM step: {e}")
-        # Fallback using ResourceManager with pre-allocated array
+        log.error(f"Error in ultra-fast EM step: {e}")
+        # Fallback
         array_manager.arrays["result_weights"].fill(1.0 / max_subject)
         return array_manager.arrays["result_weights"]
+
+def ultra_fast_validate_conservation(
+    source_indices: np.ndarray,
+    responsibilities: np.ndarray,
+    array_manager: ArrayManager,
+    stage: str = "unknown"
+) -> bool:
+    """
+    ULTRA-FAST conservation validation using pre-allocated arrays.
+    """
+    try:
+        max_source = np.max(source_indices) + 1
+        n_alignments = len(source_indices)
+        
+        # Use pre-allocated arrays - no new allocation
+        assert len(array_manager.arrays["temp_validation_sums"]) >= max_source
+        assert len(array_manager.arrays["temp_source_counts"]) >= max_source
+        
+        # Use ultra-fast conservation check with pre-allocated arrays
+        violations = ultra_fast_conservation_check_prealloc(
+            source_indices,
+            responsibilities,
+            array_manager.arrays["temp_validation_sums"],
+            array_manager.arrays["temp_source_counts"]
+        )
+        
+        n_unique_reads = len(np.unique(source_indices))  # Could be optimized further
+        violation_rate = violations / n_unique_reads * 100 if n_unique_reads > 0 else 0
+        
+        if violations > 0:
+            log.warning(f"Ultra-fast validation {stage}: {violations:,}/{n_unique_reads:,} ({violation_rate:.2f}%) conservation violations")
+        
+        if violation_rate > 10:
+            log.error(f"Ultra-fast validation {stage}: Too many violations ({violation_rate:.2f}%)")
+            return False
+        
+        log.debug(f"Ultra-fast validation {stage} PASSED: {n_alignments:,} alignments, {violations:,} violations")
+        return True
+        
+    except Exception as e:
+        log.error(f"Ultra-fast validation {stage} failed: {e}")
+        return False
+
+def ultra_fast_fix_conservation(
+    source_indices: np.ndarray,
+    responsibilities: np.ndarray,
+    array_manager: ArrayManager
+) -> None:
+    """
+    ULTRA-FAST conservation fix using pre-allocated arrays.
+    """
+    try:
+        max_source = np.max(source_indices) + 1
+        
+        # Use pre-allocated array - no new allocation
+        assert len(array_manager.arrays["temp_validation_sums"]) >= max_source
+        
+        # Use ultra-fast conservation fix with pre-allocated arrays
+        ultra_fast_conservation_fix_prealloc(
+            source_indices,
+            responsibilities,
+            array_manager.arrays["temp_validation_sums"]
+        )
+        
+        log.debug("Ultra-fast conservation fix completed")
+        
+    except Exception as e:
+        log.error(f"Ultra-fast conservation fix failed: {e}")
 
 class ConvergenceAnalyzer:
     """Analyzes convergence patterns and provides detailed reporting."""
@@ -1421,7 +1228,7 @@ def accelerated_resolve_multimaps(
     lambda_scale=1.0,
 ):
     """
-    EM implementation with acceleration focused on CONVERGENCE SPEED (fewer iterations).
+    ULTRA-FAST EM implementation optimized for billion-scale datasets.
     """
     is_debug = log.isEnabledFor(logging.DEBUG)
     
@@ -1456,6 +1263,9 @@ def accelerated_resolve_multimaps(
             subject_indices = data["subject"]  # Direct reference to memory-mapped array
             bit_scores = data["var"]  # Direct reference to memory-mapped array
         
+        # CRITICAL FIX: Get n_elements from actual array length, not dictionary length
+        n_elements = len(source_indices)  # Use array length, not len(data)
+        
         # MINIMIZE COPYING: Only convert types if absolutely necessary for Numba
         # Check if conversion is needed before doing it
         if source_indices.dtype != np.int64:
@@ -1483,7 +1293,6 @@ def accelerated_resolve_multimaps(
                 log.warning(f"Unexpected bit_scores dtype: {bit_scores.dtype}")
                 bit_scores = bit_scores.astype(np.float64)
         
-        n_elements = len(data)
         max_source = np.max(source_indices) + 1
         max_subject = np.max(subject_indices) + 1
         
@@ -1549,43 +1358,6 @@ def accelerated_resolve_multimaps(
             lookback_window=4 if adaptive_convergence else 3
         )
         
-        # FAST Pre-compilation with minimal sample
-        log.info("Pre-compiling functions with minimal sample...")
-        sample_size = min(100, n_elements)  # Much smaller sample
-        sample_sources = min(10, max_source)
-        sample_subjects = min(10, max_subject)
-        
-        # Create tiny dummy arrays for compilation
-        dummy_responsibilities = resource_manager.create_array(
-            name="compile_dummy_resp", shape=(sample_size,), dtype=np.float64, temp=True
-        )
-        dummy_weights = resource_manager.create_array(
-            name="compile_dummy_weights", shape=(sample_subjects,), dtype=np.float64, temp=True
-        )
-        dummy_weights.fill(1.0 / sample_subjects)
-        
-        dummy_temp_max = resource_manager.create_array(
-            name="compile_dummy_max", shape=(sample_sources,), dtype=np.float64, temp=True
-        )
-        dummy_temp_denom = resource_manager.create_array(
-            name="compile_dummy_denom", shape=(sample_sources,), dtype=np.float64, temp=True
-        )
-        
-        try:
-            safe_vectorized_compute_responsibilities(
-                source_indices[:sample_size],
-                subject_indices[:sample_size],
-                bit_scores[:sample_size],
-                dummy_weights,
-                lambda_scale,
-                dummy_responsibilities,
-                dummy_temp_max,
-                dummy_temp_denom
-            )
-            log.info("Functions compiled successfully")
-        except Exception as e:
-            log.warning(f"Compilation warning: {e}")
-
         # Initialize array manager with external arrays (avoid copying)
         array_manager = ArrayManager(resource_manager)
         
@@ -1694,7 +1466,7 @@ def accelerated_resolve_multimaps(
         # Flag to track first iteration validation
         first_iteration_validated = False
         
-        with tqdm.tqdm(total=MAX_ITERS, desc=f"Enhanced {acceleration_method.upper()} EM") as pbar:
+        with tqdm.tqdm(total=MAX_ITERS, desc=f"Ultra-Fast {acceleration_method.upper()} EM") as pbar:
             while current_iter < MAX_ITERS:
                 try:
                     if is_debug:
@@ -1709,47 +1481,50 @@ def accelerated_resolve_multimaps(
                     acceleration_success = False
                     
                     # Define EM step function
-                    def enhanced_em_step_func(weights):
-                        return safe_vectorized_bitscore_em_step(
+                    def ultra_fast_em_step_func(weights):
+                        return ultra_fast_bitscore_em_step(
                             source_indices, subject_indices, bit_scores, weights,
                             array_manager, lambda_scale, verbose=is_debug
                         )
                     
-                    # FIRST ITERATION: Always use basic EM and validate
+                    # FIRST ITERATION: Use ultra-fast EM and validate
                     if current_iter == 0:
-                        log.info("Iteration 0: Computing initial responsibilities and validating...")
+                        log.info("Iteration 0: Ultra-fast initial responsibilities...")
                         basic_start_time = time.time()
-                        new_weights = enhanced_em_step_func(current_weights)
+                        new_weights = ultra_fast_em_step_func(current_weights)
                         basic_em_time = time.time() - basic_start_time
                         
-                        # VALIDATE AFTER FIRST E-STEP (when we have actual responsibilities)
+                        # ULTRA-FAST validation after first E-step
                         if not first_iteration_validated:
-                            log.info("Performing read conservation validation after first E-step...")
-                            validation_passed = validate_read_conservation(
-                                source_indices, subject_indices, array_manager.arrays["responsibilities"], "FIRST_ITERATION"
+                            log.info("Ultra-fast read conservation validation...")
+                            validation_passed = ultra_fast_validate_conservation(
+                                source_indices, array_manager.arrays["responsibilities"], 
+                                array_manager, "FIRST_ITERATION"
                             )
                             
                             if not validation_passed:
-                                log.error("First iteration read conservation validation FAILED")
-                                log.error("Attempting to fix responsibilities...")
-                                fix_responsibilities_conservation(
-                                    source_indices, array_manager.arrays["responsibilities"]
+                                log.error("First iteration validation FAILED")
+                                log.info("Ultra-fast conservation fix...")
+                                ultra_fast_fix_conservation(
+                                    source_indices, array_manager.arrays["responsibilities"], 
+                                    array_manager
                                 )
                                 
                                 # Re-validate
-                                if validate_read_conservation(
-                                    source_indices, subject_indices, array_manager.arrays["responsibilities"], "FINAL_FIXED"
+                                if ultra_fast_validate_conservation(
+                                    source_indices, array_manager.arrays["responsibilities"], 
+                                    array_manager, "FINAL_FIXED"
                                 ):
-                                    log.info("Successfully fixed first iteration responsibilities")
+                                    log.info("Ultra-fast fix successful")
                                 else:
-                                    log.error("Could not fix first iteration responsibilities - stopping")
+                                    log.error("Ultra-fast fix failed - stopping")
                                     return data
                             else:
-                                log.info("First iteration validation PASSED")
+                                log.info("Ultra-fast first iteration validation PASSED")
                             
                             first_iteration_validated = True
                     
-                    # SUBSEQUENT ITERATIONS: Try acceleration
+                    # SUBSEQUENT ITERATIONS: Use acceleration with ultra-fast base
                     elif (accelerator is not None and consecutive_failures < 3):
                         try:
                             acceleration_stats['total_attempts'] += 1
@@ -1758,7 +1533,7 @@ def accelerated_resolve_multimaps(
                                 log.debug(f"Attempting {acceleration_method} for faster convergence...")
                             
                             accel_start_time = time.time()
-                            accelerated_weights = accelerator.step(current_weights, enhanced_em_step_func)
+                            accelerated_weights = accelerator.step(current_weights, ultra_fast_em_step_func)
                             accelerated_time = time.time() - accel_start_time
                             
                             # Validate accelerated step
@@ -1788,21 +1563,21 @@ def accelerated_resolve_multimaps(
                                     else:
                                         # Fallback to basic EM
                                         basic_start_time = time.time()
-                                        new_weights = enhanced_em_step_func(current_weights)
+                                        new_weights = ultra_fast_em_step_func(current_weights)
                                         basic_em_time = time.time() - basic_start_time
                                         acceleration_stats['failures'] += 1
                                         consecutive_failures += 1
                                 else:
                                     # Fallback to basic EM
                                     basic_start_time = time.time()
-                                    new_weights = enhanced_em_step_func(current_weights)
+                                    new_weights = ultra_fast_em_step_func(current_weights)
                                     basic_em_time = time.time() - basic_start_time
                                     acceleration_stats['failures'] += 1
                                     consecutive_failures += 1
                             else:
                                 # Fallback to basic EM
                                 basic_start_time = time.time()
-                                new_weights = enhanced_em_step_func(current_weights)
+                                new_weights = ultra_fast_em_step_func(current_weights)
                                 basic_em_time = time.time() - basic_start_time
                                 acceleration_stats['failures'] += 1
                                 consecutive_failures += 1
@@ -1810,20 +1585,15 @@ def accelerated_resolve_multimaps(
                         except Exception as e:
                             # Fallback to basic EM
                             basic_start_time = time.time()
-                            new_weights = enhanced_em_step_func(current_weights)
+                            new_weights = ultra_fast_em_step_func(current_weights)
                             basic_em_time = time.time() - basic_start_time
                             acceleration_stats['failures'] += 1
                             consecutive_failures += 1
-                            if is_debug:
-                                log.debug(f"{acceleration_method.upper()} exception: {e}")
                     else:
-                        # Use basic EM step
+                        # Use ultra-fast EM step
                         basic_start_time = time.time()
-                        new_weights = enhanced_em_step_func(current_weights)
+                        new_weights = ultra_fast_em_step_func(current_weights)
                         basic_em_time = time.time() - basic_start_time
-                        
-                        if consecutive_failures > 0:
-                            consecutive_failures = max(0, consecutive_failures - 1)
                     
                     # Validate and normalize weights
                     if not np.all(np.isfinite(new_weights)):
@@ -1838,18 +1608,12 @@ def accelerated_resolve_multimaps(
                         new_weights.fill(1.0 / max_subject)
                         consecutive_failures += 1
                     
-                    # Compute likelihood and stability metrics
+                    # Compute likelihood using ultra-fast kernel
                     try:
-                        safe_vectorized_compute_responsibilities(
-                            source_indices, subject_indices, bit_scores, new_weights,
-                            lambda_scale, array_manager.arrays["responsibilities"],
+                        current_likelihood = ultra_fast_likelihood_billion_prealloc(
+                            source_indices, subject_indices, bit_scores, new_weights, lambda_scale,
                             array_manager.arrays["temp_source_max"],
                             array_manager.arrays["temp_source_denom"]
-                        )
-                        
-                        current_likelihood = safe_vectorized_log_likelihood(
-                            source_indices, subject_indices, bit_scores, new_weights, lambda_scale,
-                            array_manager.arrays["temp_source_max"], array_manager.arrays["temp_source_denom"]
                         )
                         
                         if not np.isfinite(current_likelihood):
@@ -1872,9 +1636,8 @@ def accelerated_resolve_multimaps(
                         prev_responsibilities[:] = current_responsibilities
                         
                     except Exception as e:
-                        log.warning(f"Likelihood computation failed at iteration {current_iter}: {e}")
+                        log.warning(f"Ultra-fast likelihood computation failed: {e}")
                         current_likelihood = prev_likelihood
-                        prob_stability = 1.0
                         consecutive_failures += 1
 
                     # Calculate changes
@@ -1979,38 +1742,41 @@ def accelerated_resolve_multimaps(
                         import traceback
                         log.debug(f"Full traceback: {traceback.format_exc()}")
         
-        # FINAL VALIDATION (only once, at the end)
-        log.info("Performing final read conservation validation...")
+        # FINAL ULTRA-FAST VALIDATION
+        log.info("Ultra-fast final validation...")
         
         try:
-            safe_vectorized_compute_responsibilities(
+            # Final E-step
+            ultra_fast_e_step_billion_prealloc(
                 source_indices, subject_indices, bit_scores, best_weights,
                 lambda_scale, array_manager.arrays["responsibilities"],
                 array_manager.arrays["temp_source_max"], array_manager.arrays["temp_source_denom"]
             )
         except Exception as e:
-            log.warning(f"Final E-step failed: {e}")
+            log.warning(f"Final ultra-fast E-step failed: {e}")
         
-        # COMPREHENSIVE FINAL VALIDATION
-        final_validation_passed = validate_read_conservation(
-            source_indices, subject_indices, array_manager.arrays["responsibilities"], "FINAL"
+        # Ultra-fast final validation
+        final_validation_passed = ultra_fast_validate_conservation(
+            source_indices, array_manager.arrays["responsibilities"], 
+            array_manager, "FINAL"
         )
         
         if not final_validation_passed:
-            log.error("FINAL read conservation validation FAILED")
-            log.info("Attempting final responsibility normalization...")
-            fix_responsibilities_conservation(
-                source_indices, array_manager.arrays["responsibilities"]
+            log.error("FINAL ultra-fast validation FAILED")
+            log.info("Final ultra-fast conservation fix...")
+            ultra_fast_fix_conservation(
+                source_indices, array_manager.arrays["responsibilities"], array_manager
             )
             
-            if validate_read_conservation(
-                source_indices, subject_indices, array_manager.arrays["responsibilities"], "FINAL_FIXED"
+            if ultra_fast_validate_conservation(
+                source_indices, array_manager.arrays["responsibilities"], 
+                array_manager, "FINAL_FIXED"
             ):
-                log.info("Final responsibilities successfully normalized")
+                log.info("Final ultra-fast fix successful")
             else:
-                log.error("Could not fix final responsibilities - results may be invalid")
+                log.error("Final ultra-fast fix failed")
         else:
-            log.info("FINAL read conservation validation PASSED")
+            log.info("FINAL ultra-fast validation PASSED")
         
         # Additional final statistics with detailed validation
         final_responsibilities = array_manager.arrays["responsibilities"]
@@ -2197,10 +1963,41 @@ def accelerated_resolve_multimaps(
             if iter_array is not None:
                 iter_array.fill(current_iter)  # Use fill instead of slice assignment
 
-        # Cleanup
+        # CRITICAL FIX: Cleanup in proper order to prevent segfaults
+        log.debug("Starting safe cleanup sequence...")
+        
+        # Step 1: Clear accelerator first (most likely source of segfault)
         if accelerator is not None:
-            accelerator.cleanup()
-        array_manager.cleanup()
+            try:
+                log.debug("Cleaning up accelerator...")
+                accelerator.cleanup()
+                accelerator = None
+                log.debug("Accelerator cleanup completed")
+            except Exception as e:
+                log.warning(f"Accelerator cleanup error (non-fatal): {e}")
+        
+        # Step 2: Clear array manager references
+        try:
+            log.debug("Cleaning up array manager...")
+            array_manager.cleanup()
+            log.debug("Array manager cleanup completed")
+        except Exception as e:
+            log.warning(f"Array manager cleanup error (non-fatal): {e}")
+        
+        # Step 3: Force garbage collection before resource manager cleanup
+        log.debug("Forcing garbage collection...")
+        gc.collect()
+        gc.collect()  # Double collection to be sure
+        
+        # Step 4: Resource manager cleanup last
+        try:
+            log.debug("Cleaning up resource manager...")
+            # Let resource manager handle its own cleanup in its destructor
+            # Don't explicitly call cleanup here to avoid double-free
+            resource_manager = None
+            log.debug("Resource manager cleanup completed")
+        except Exception as e:
+            log.warning(f"Resource manager cleanup error (non-fatal): {e}")
         
         elapsed_time = time.time() - start_time
         
@@ -2214,19 +2011,22 @@ def accelerated_resolve_multimaps(
         log.info(f"Performance: {n_elements/elapsed_time:.0f} alignments/second")
         
         # Final statistics
-        final_responsibilities = data["prob"]
-        high_conf = np.sum(final_responsibilities > 0.95) / len(final_responsibilities) * 100
-        medium_conf = np.sum(final_responsibilities > 0.5) / len(final_responsibilities) * 100
-        very_low_conf = np.sum(final_responsibilities < 0.01) / len(final_responsibilities) * 100
-        
-        log.info("")
-        log.info("FINAL ASSIGNMENT QUALITY:")
-        log.info(f"  High confidence (>95%): {high_conf:.1f}%")
-        log.info(f"  Medium confidence (>50%): {medium_conf:.1f}%")
-        log.info(f"  Low confidence (<1%): {very_low_conf:.1f}%")
+        try:
+            final_responsibilities = data["prob"]
+            high_conf = np.sum(final_responsibilities > 0.95) / len(final_responsibilities) * 100
+            medium_conf = np.sum(final_responsibilities > 0.5) / len(final_responsibilities) * 100
+            very_low_conf = np.sum(final_responsibilities < 0.01) / len(final_responsibilities) * 100
+            
+            log.info("")
+            log.info("FINAL ASSIGNMENT QUALITY:")
+            log.info(f"  High confidence (>95%): {high_conf:.1f}%")
+            log.info(f"  Medium confidence (>50%): {medium_conf:.1f}%")
+            log.info(f"  Low confidence (<1%): {very_low_conf:.1f}%")
+        except Exception as e:
+            log.warning(f"Error computing final statistics: {e}")
         
         # FIXED: More realistic acceleration performance report
-        if accelerator is not None:
+        if acceleration_stats['total_attempts'] > 0:
             total_attempts = acceleration_stats['total_attempts']
             successes = acceleration_stats['successes']
             success_rate = successes / max(total_attempts, 1) * 100
@@ -2320,13 +2120,6 @@ def accelerated_resolve_multimaps(
                 log.info(f"    Early convergence achieved - acceleration highly effective!")
             elif success_rate >= 70:
                 log.info(f"  ✅ STRONG: Acceleration significantly improving convergence rate")
-            
-            if hasattr(accelerator, 'get_performance_stats'):
-                try:
-                    hybrid_stats = accelerator.get_performance_stats()
-                    log.info(f"  Detailed stats: {hybrid_stats}")
-                except:
-                    pass
         else:
             log.info("")
             log.info("🔧 BASIC EM ANALYSIS:")
@@ -2336,18 +2129,33 @@ def accelerated_resolve_multimaps(
         
         # Convergence analysis report
         log.info("")
-        log.info(convergence_analyzer.get_report())
+        try:
+            log.info(convergence_analyzer.get_report())
+        except Exception as e:
+            log.warning(f"Error generating convergence report: {e}")
         
+        # Final cleanup and return
+        log.debug("Safe cleanup sequence completed")
         return data
         
     except Exception as e:
-        log.error(f"Critical error in accelerated_resolve_multimaps: {e}")
-        if is_debug:
-            import traceback
-            log.debug(f"Full traceback: {traceback.format_exc()}")
+        log.error(f"Critical error in ultra-fast EM: {e}")
+        # Emergency cleanup
+        try:
+            if 'accelerator' in locals() and accelerator is not None:
+                accelerator.cleanup()
+        except:
+            pass
+        try:
+            if 'array_manager' in locals():
+                array_manager.cleanup()
+        except:
+            pass
+        gc.collect()
         return data
         
     finally:
         # Restore original thread count
         set_num_threads(original_threads)
+        # Final garbage collection
         gc.collect()

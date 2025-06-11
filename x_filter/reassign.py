@@ -12,7 +12,7 @@ from pathlib import Path
 from typing import Dict, Any, Optional, Tuple, Union, List
 
 from x_filter.logging_setup import get_logger
-from x_filter.reassign.em import accelerated_resolve_multimaps
+from x_filter.reassign.em import accelerated_resolve_multimaps, ultra_fast_bitscore_em_step
 from x_filter.reassign.utils import memory_efficient_factorize, initialize_subject_weights
 from x_filter.reassign.confidence import implement_selection_mode
 from x_filter.db_manager import DatabaseManager
@@ -39,7 +39,8 @@ def reassign_reads_mmap(
     lbfgs_memory: int = 10,
 ) -> list:
     """
-    Perform read reassignment using memory-mapped arrays and corrected EM algorithm.
+    Perform read reassignment using ultra-fast memory-mapped EM algorithm.
+    Optimized for billion-scale datasets.
     
     Args:
         filtered_arrays: Dictionary of memory-mapped arrays containing alignment data
@@ -64,7 +65,7 @@ def reassign_reads_mmap(
         List of row IDs for reassigned alignments
     """
     
-    log.info(f"Starting read reassignment using {acceleration_method.upper()} acceleration")
+    log.info(f"Starting ultra-fast read reassignment using {acceleration_method.upper()} acceleration")
     
     # Initialize ResourceManager
     from x_filter.resource_management import ResourceManager
@@ -74,7 +75,7 @@ def reassign_reads_mmap(
         mmap_folder=mmap_dir
     )
     
-    # Extract arrays
+    # Extract arrays - AVOID UNNECESSARY COPYING
     bit_scores = filtered_arrays["bitScore"]
     subject_lengths = filtered_arrays["slen"] 
     subject_numeric_ids = filtered_arrays["subject_numeric_id"]
@@ -83,7 +84,7 @@ def reassign_reads_mmap(
     
     n_alignments = len(bit_scores)
     
-    log.info(f"Processing {n_alignments:,} alignments")
+    log.info(f"Processing {n_alignments:,} alignments with ultra-fast algorithms")
     
     # Compute unique IDs if not provided
     if len(unique_query_ids) == 0:
@@ -107,98 +108,72 @@ def reassign_reads_mmap(
     
     log.info(f"Using factorization chunk size: {factorization_chunk_size:,}")
     
-
-    # Create structured array for EM algorithm
-    dtype = np.dtype([# def initialize_subject_weights(em_data, mmap_dir, max_memory):
-#     """Initialize subject weights for EM algorithm using structured array."""
-#     # Get the maximum subject index to determine array size
-#     max_subject = np.max(em_data['subject']) + 1
+    # ULTRA-EFFICIENT DICTIONARY STRUCTURE - NO COPYING OF LARGE ARRAYS
+    log.info("Creating ultra-efficient EM data structure with zero-copy views...")
     
-#     log.info(f"Initializing uniform weights for {max_subject} subjects")
-    
-#     # Initialize with uniform weights (each subject gets equal probability)
-#     uniform_weight = 1.0 / max_subject
-    
-#     # Fill the s_W field in the structured array
-#     em_data['s_W'].fill(uniform_weight)
-    
-#     log.info("Subject weights initialized to uniform distribution in structured array")
-#     return em_data
-        ("source", "int64"),      # Query index (factorized)
-        ("subject", "int64"),     # Subject index (factorized)
-        ("var", "float64"),       # Bit score (for initialization and likelihood)
-        ("slen", "float64"),      # Subject length
-        ("s_W", "float64"),       # Subject weights
-        ("prob", "float64"),      # Probability (will be initialized by EM)
-        ("iter", "int64"),        # Iteration number
-        ("n_aln", "int64"),       # Number of alignments per read
-        ("max_prob", "float64"),  # Maximum probability per read
-        ("orig_idx", "int64"),    # Original row index
-    ])
-    
-    # Create memory-mapped structured array for EM input
-    log.info("Creating EM data structure using structured array...")
-    em_data_path = os.path.join(mmap_dir, "em_data.mmap")
-    em_data = np.memmap(em_data_path, dtype=dtype, mode="w+", shape=(n_alignments,))
-    
-    # Factorize IDs
+    # Factorize IDs FIRST to create new arrays only for these
     log.info("Factorizing query and subject IDs...")
     
-    em_data["source"], query_unique = memory_efficient_factorize(
+    factorized_source, query_unique = memory_efficient_factorize(
         query_numeric_ids, mmap_dir, threads=threads, chunk_size=factorization_chunk_size, max_memory=max_memory
     )
-    em_data["subject"], subject_unique = memory_efficient_factorize(
+    factorized_subject, subject_unique = memory_efficient_factorize(
         subject_numeric_ids, mmap_dir, threads=threads, chunk_size=factorization_chunk_size, max_memory=max_memory
     )
     
     log.info(f"Query factorization: {len(query_unique):,} unique queries mapped to indices 0-{len(query_unique)-1}")
     log.info(f"Subject factorization: {len(subject_unique):,} unique subjects mapped to indices 0-{len(subject_unique)-1}")
     
-    em_data["var"] = bit_scores.astype(np.float64)  # Bit scores
-    em_data["slen"] = subject_lengths.astype(np.float64)  # Subject lengths
-    em_data["orig_idx"] = original_indices  # Original row indices
+    # Create efficient dictionary with direct references - NO TYPE CONVERSION
+    log.info("Creating dictionary structure with zero-copy direct references...")
     
-    # Initialize remaining fields
-    em_data["s_W"] = 0.0  # Subject weights (will be computed)
-    em_data["prob"] = 0.0  # Probabilities (will be initialized by EM)
-    em_data["iter"] = 0  # Iteration counter
-    em_data["n_aln"] = 0  # Number of alignments per read (will be computed)
-    em_data["max_prob"] = 0.0  # Maximum probability per read (will be computed)
+    # ZERO-COPY: Direct references to original arrays (assume correct types)
+    em_data = {
+        "source": factorized_source,      # New array (factorized indices)
+        "subject": factorized_subject,    # New array (factorized indices)
+        "var": bit_scores,                # Direct reference - no copying, no conversion
+        "slen": subject_lengths,          # Direct reference - no copying, no conversion
+        "orig_idx": original_indices,     # Direct reference - no copying, no conversion
+        "s_W": np.zeros(n_alignments, dtype=np.float64),     # New array for subject weights
+        "prob": np.zeros(n_alignments, dtype=np.float64),    # New array for probabilities
+        "iter": np.zeros(n_alignments, dtype=np.int64),      # New array for iteration count
+        "n_aln": np.zeros(n_alignments, dtype=np.int64),     # New array for alignment count
+        "max_prob": np.zeros(n_alignments, dtype=np.float64), # New array for max probability
+    }
     
-    # Flush to disk
-    em_data.flush()
+    log.info(f"Dictionary-based EM structure created with {n_alignments:,} alignments")
+    log.info("Memory usage - ZERO-COPY optimization:")
+    log.info("  - Direct references (no copying): var, slen, orig_idx")
+    log.info("  - New arrays only: source, subject (factorized), s_W, prob, iter, n_aln, max_prob")
+    log.info(f"  - New memory allocation: ~{(5 * n_alignments * 8) / (1024**3):.2f} GB")
+    log.info(f"  - Original data types preserved: var={bit_scores.dtype}, slen={subject_lengths.dtype}, orig_idx={original_indices.dtype}")
+    log.info(f"Bit score range: {np.min(em_data['var']):.2f} to {np.max(em_data['var']):.2f}")
     
     # CRITICAL FIX: Ensure we're passing the correct number of elements
     log.info(f"EM data structure validation:")
-    log.info(f"  Structured array shape: {em_data.shape}")
-    log.info(f"  Field names: {em_data.dtype.names}")
-    log.info(f"  Total elements: {len(em_data):,}")
+    log.info(f"  Dictionary with {len(em_data)} fields: {list(em_data.keys())}")
+    log.info(f"  All arrays have length: {len(em_data['var']):,}")
     
     # Verify all arrays have the expected length
     expected_length = n_alignments
-    actual_length = len(em_data)
+    for field_name, array in em_data.items():
+        actual_length = len(array)
+        if actual_length != expected_length:
+            log.error(f"EM data length mismatch in field '{field_name}': expected {expected_length:,}, got {actual_length:,}")
+            return []
     
-    if actual_length != expected_length:
-        log.error(f"EM data length mismatch: expected {expected_length:,}, got {actual_length:,}")
-        return []
-    
-    log.info(f"EM structured array created with {n_alignments:,} alignments")
-    log.info(f"Bit score range: {np.min(em_data['var']):.2f} to {np.max(em_data['var']):.2f}")
-    
-    # Run corrected EM algorithm
-    log.info(f"Running {acceleration_method.upper()} EM algorithm")
+    # Run corrected EM algorithm with dictionary
+    log.info(f"Running ultra-fast {acceleration_method.upper()} EM algorithm with dictionary structure")
     
 
-    # Initialize subject weights - choose fast method
-    log.info("Initializing subject weights...")
+    # Initialize subject weights using fast method
+    log.info("Ultra-fast weight initialization...")
     
-    # For maximum speed, use ultra-fast uniform initialization
-    # For data-driven weights, use the optimized initialize_subject_weights
     initialized_data = initialize_subject_weights(
         em_data, mmap_dir=mmap_dir, max_memory=max_memory
     )
     
-    # Use corrected EM implementation
+    # Use ultra-fast EM implementation
     result = accelerated_resolve_multimaps(
         initialized_data,
         iters=reassign_iters,
@@ -212,7 +187,7 @@ def reassign_reads_mmap(
         lbfgs_memory=lbfgs_memory,
     )
     
-    log.info(f"{acceleration_method.upper()} algorithm completed")
+    log.info(f"Ultra-fast {acceleration_method.upper()} algorithm completed")
     log.info("Final EM results:")
     log.info(f"  - Final prob range: {np.min(result['prob']):.6f} to {np.max(result['prob']):.6f}")
     log.info(f"  - Mean final prob: {np.mean(result['prob']):.6f}")
@@ -262,7 +237,8 @@ def reassign_reads_mmap(
     for min_prob, max_prob, label in prob_ranges:
         mask = (result['prob'] >= min_prob) & (result['prob'] < max_prob)
         count = np.sum(mask)
-        percentage = count / len(result) * 100
+        # CRITICAL FIX: Use actual array length, not dictionary length
+        percentage = count / len(result['prob']) * 100
         log.info(f"  {label}: {count:,} alignments ({percentage:.1f}%)")
     
     # Apply selection mode filtering after EM algorithm
@@ -281,10 +257,20 @@ def reassign_reads_mmap(
         # Convert factorized indices back to original IDs
         log.info("Converting factorized indices to original IDs...")
         
+        # CRITICAL FIX: Get the actual number of alignments from the arrays, not dictionary length
+        if isinstance(result, dict):
+            actual_n_alignments = len(result['source'])  # Use array length, not dict length
+        elif hasattr(result, 'dtype') and result.dtype.names is not None:
+            actual_n_alignments = len(result)  # Structured array length
+        else:
+            actual_n_alignments = len(result) if hasattr(result, '__len__') else 0
+        
+        log.info(f"Processing {actual_n_alignments:,} alignments for ID conversion")
+        
         # Calculate chunk size for ID conversion
         chunk_size = resource_manager.calculate_optimal_chunk_size(
-            total_elements=len(result['source']),
-            element_size=result['source'].dtype.itemsize,
+            total_elements=actual_n_alignments,
+            element_size=8,  # Approximate size for int64
             operation_overhead=2.0,
             max_chunk_size=None
         )
@@ -296,15 +282,15 @@ def reassign_reads_mmap(
         original_subject_path = os.path.join(mmap_dir, "original_subject_ids.mmap")
         
         original_query_ids_mmap = np.memmap(
-            original_query_path, dtype=np.int64, mode='w+', shape=(len(result),)
+            original_query_path, dtype=np.int64, mode='w+', shape=(actual_n_alignments,)
         )
         original_subject_ids_mmap = np.memmap(
-            original_subject_path, dtype=np.int64, mode='w+', shape=(len(result),)
+            original_subject_path, dtype=np.int64, mode='w+', shape=(actual_n_alignments,)
         )
         
         # Process ID conversion in chunks - handle structured array result
-        for start_idx in range(0, len(result), chunk_size):
-            end_idx = min(start_idx + chunk_size, len(result))
+        for start_idx in range(0, actual_n_alignments, chunk_size):
+            end_idx = min(start_idx + chunk_size, actual_n_alignments)
             if hasattr(result, 'dtype') and result.dtype.names is not None:
                 # Structured array result
                 original_query_ids_mmap[start_idx:end_idx] = query_unique[result['source'][start_idx:end_idx]]
@@ -321,7 +307,7 @@ def reassign_reads_mmap(
         log.info("Creating PyArrow table...")
         
         pyarrow_chunk_size = resource_manager.calculate_optimal_chunk_size(
-            total_elements=len(result),
+            total_elements=actual_n_alignments,
             element_size=8,
             operation_overhead=3.0,
             max_chunk_size=None
@@ -337,8 +323,8 @@ def reassign_reads_mmap(
         parquet_path = os.path.join(mmap_dir, "read_prob_temp.parquet")
         
         with pq.ParquetWriter(parquet_path, schema) as writer:
-            for start_idx in range(0, len(result), pyarrow_chunk_size):
-                end_idx = min(start_idx + pyarrow_chunk_size, len(result))
+            for start_idx in range(0, actual_n_alignments, pyarrow_chunk_size):
+                end_idx = min(start_idx + pyarrow_chunk_size, actual_n_alignments)
                 
                 # Handle both structured array and dictionary results
                 if hasattr(result, 'dtype') and result.dtype.names is not None:
@@ -360,7 +346,7 @@ def reassign_reads_mmap(
                 
                 writer.write_batch(batch)
         
-        log.info(f"Wrote {len(result):,} alignments to Parquet file: {parquet_path}")
+        log.info(f"Wrote {actual_n_alignments:,} alignments to Parquet file: {parquet_path}")
 
         # Clean up memory-mapped arrays
         del original_query_ids_mmap, original_subject_ids_mmap
@@ -401,9 +387,9 @@ def reassign_reads_mmap(
             log.warning(f"Could not clean up temporary file {parquet_path}: {e}")
         
         log.info(f"Selection mode filtering completed:")
-        log.info(f"  Input alignments: {len(result):,}")
+        log.info(f"  Input alignments: {actual_n_alignments:,}")
         log.info(f"  Selected alignments: {len(selected_indices):,}")
-        log.info(f"  Filtered out: {len(result) - len(selected_indices):,} ({(len(result) - len(selected_indices))/len(result)*100:.1f}%)")
+        log.info(f"  Filtered out: {actual_n_alignments - len(selected_indices):,} ({(actual_n_alignments - len(selected_indices))/actual_n_alignments*100:.1f}%)")
         
         if len(selected_indices) > 0:
             # Handle structured array result for probability extraction
@@ -892,7 +878,7 @@ def ensure_data_has_prob_field(data, probabilities: np.ndarray, iterations: int)
             log.debug("Creating new structured array with prob field")
             # Create new dtype with prob field
             new_dtype = data.dtype.descr + [('prob', np.float64)]
-            new_data = np.empty(n_elements, dtype=new_dtype)
+            new_data = np.empty(len(data), dtype=new_dtype)  # Use len(data) for structured array
             
             # Copy existing fields
             for field_name in data.dtype.names:
@@ -911,7 +897,7 @@ def ensure_data_has_prob_field(data, probabilities: np.ndarray, iterations: int)
                 log.debug("Adding iter field to new structured array")
                 # Create another new dtype with both prob and iter fields
                 new_dtype = data.dtype.descr + [('iter', np.int32)]
-                newer_data = np.empty(n_elements, dtype=new_dtype)
+                newer_data = np.empty(len(data), dtype=new_dtype)  # Use len(data) for structured array
                 
                 # Copy all existing fields including prob
                 for field_name in data.dtype.names:
@@ -961,11 +947,27 @@ def reassign_multimapping_reads(
     if data is None:
         raise ValueError("Input data cannot be None")
     
+    # CRITICAL: Get n_elements from actual array length, not dictionary length
+    if isinstance(data, dict):
+        # For dictionary, get length from one of the main arrays
+        n_elements = len(data["source"]) if "source" in data else 0
+        if n_elements == 0 and "var" in data:
+            n_elements = len(data["var"])
+        expected_size = n_elements
+    elif hasattr(data, 'dtype') and data.dtype.names is not None:
+        # For structured array, use standard len()
+        n_elements = len(data)
+        expected_size = n_elements
+    else:
+        # Unknown structure - try to get length
+        n_elements = len(data) if hasattr(data, '__len__') else 0
+        expected_size = n_elements
+    
     # CRITICAL: Add comprehensive data flow tracing
-    trace_data_flow(data, "FUNCTION_INPUT", expected_size=55_000_000)
+    trace_data_flow(data, "FUNCTION_INPUT", expected_size=expected_size)
     
     # CRITICAL: Validate input data integrity
-    is_valid, n_elements, error_msg = validate_data_integrity(data, "INPUT")
+    is_valid, validated_elements, error_msg = validate_data_integrity(data, "INPUT")
     if not is_valid:
         log.error(f"Input data validation failed: {error_msg}")
         
@@ -978,7 +980,10 @@ def reassign_multimapping_reads(
         
         raise ValueError(f"Invalid input data: {error_msg}")
     
-    log.info(f"Input validation PASSED: {n_elements:,} alignments")
+    log.info(f"Input validation PASSED: {validated_elements:,} alignments")
+    
+    # Use validated_elements instead of n_elements for consistency
+    n_elements = validated_elements
     
     # CRITICAL: Early warning for very small datasets
     if n_elements < 1000:
