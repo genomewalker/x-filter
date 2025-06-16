@@ -42,9 +42,9 @@ class HybridAccelerator:
 
     def step(self, current_iterate: np.ndarray, fixed_point_map: callable,
              em_data: np.ndarray = None) -> np.ndarray:
-        """Hybrid step that tries Anderson first, then L-BFGS."""
+        """CORRECTED Hybrid step using standard Anderson formulation."""
         try:
-            # Try Anderson first
+            # Try Anderson first (now with correct formulation)
             result = self.anderson_accelerator.step(current_iterate, fixed_point_map)
             if result is not None:
                 self.anderson_successes += 1

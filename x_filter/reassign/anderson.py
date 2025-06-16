@@ -349,19 +349,20 @@ class FastAndersonAccelerator:
             raise ValueError("ResourceManager is required for memory-mapped Anderson accelerator")
         
         # Pre-allocate ALL arrays using ResourceManager (memory-mapped)
-        self.residual_diffs = resource_manager.create_array(
-            name="anderson_residual_diffs",
+        # CORRECTED: Store both iterates and residuals for proper Anderson
+        self.iterate_history = resource_manager.create_array(
+            name="anderson_iterate_history",
+            shape=(self.memory_depth, dimension),
+            dtype=np.float64, temp=True
+        )
+        self.residual_history = resource_manager.create_array(
+            name="anderson_residual_history",
             shape=(self.memory_depth, dimension),
             dtype=np.float64, temp=True
         )
         self.weights = resource_manager.create_array(
             name="anderson_weights",
             shape=(self.memory_depth,),
-            dtype=np.float64, temp=True
-        )
-        self.prev_residual = resource_manager.create_array(
-            name="anderson_prev_residual",
-            shape=(dimension,),
             dtype=np.float64, temp=True
         )
         self.temp_gram = resource_manager.create_array(
@@ -371,23 +372,13 @@ class FastAndersonAccelerator:
         )
         
         # Additional memory-mapped temporary arrays
-        self.temp_residual = resource_manager.create_array(
-            name="anderson_temp_residual",
-            shape=(dimension,),
-            dtype=np.float64, temp=True
-        )
-        self.temp_residual_diff = resource_manager.create_array(
-            name="anderson_temp_residual_diff",
+        self.temp_result = resource_manager.create_array(
+            name="anderson_temp_result",
             shape=(dimension,),
             dtype=np.float64, temp=True
         )
         self.temp_weighted_sum = resource_manager.create_array(
             name="anderson_temp_weighted_sum",
-            shape=(dimension,),
-            dtype=np.float64, temp=True
-        )
-        self.temp_result = resource_manager.create_array(
-            name="anderson_temp_result",
             shape=(dimension,),
             dtype=np.float64, temp=True
         )
@@ -407,7 +398,7 @@ class FastAndersonAccelerator:
     
     def step(self, current_iterate: np.ndarray, fixed_point_map: callable,
              em_data: np.ndarray = None) -> np.ndarray:
-        """Anderson step using correct mathematical formulation."""
+        """CORRECTED Anderson step using standard mathematical formulation."""
         self.total_attempts += 1
         
         try:
@@ -432,46 +423,176 @@ class FastAndersonAccelerator:
                 self.error_count += 1
                 return current_iterate
             
-            # CORRECT ANDERSON FORMULATION:
-            # f_k = F(x_k) - x_k (residual at current point)
-            for i in range(self.dimension):
-                self.temp_residual[i] = fx_k[i] - current_iterate[i]
+            # CORRECTED: Compute residual as f_k = F(x_k) - x_k
+            current_residual = fx_k - current_iterate
             
-            # For first iteration, just return F(x_k) and store f_k
+            # For first iteration, just return F(x_k) and store history
             if self.first_iteration:
+                self._store_history(current_iterate, current_residual)
                 self.first_iteration = False
-                for i in range(self.dimension):
-                    self.prev_residual[i] = self.temp_residual[i]
                 return self._clip_to_bounds(fx_k)
             
-            residual_norm = np.linalg.norm(self.temp_residual)
+            residual_norm = np.linalg.norm(current_residual)
             if not np.isfinite(residual_norm) or residual_norm < 1e-15:
-                for i in range(self.dimension):
-                    self.prev_residual[i] = self.temp_residual[i]
+                self._store_history(current_iterate, current_residual)
                 return self._clip_to_bounds(fx_k)
             
-            # Try Anderson acceleration if we have history
+            # Try Anderson acceleration if we have sufficient history
             if self.memory_used > 0:
                 try:
-                    result = self._safe_apply_anderson_acceleration_mmap(current_iterate, fx_k)
+                    result = self._apply_standard_anderson(current_iterate, fx_k, current_residual)
                     if result is not None and self._safe_validate_result_mmap(result, current_iterate, fx_k):
                         self.success_count += 1
+                        self._store_history(current_iterate, current_residual)
                         return result
                     
                 except Exception as e:
                     if self.is_debug:
                         log.debug(f"Anderson acceleration failed: {e}")
             
-            # Store residual and return basic F(x_k)
-            for i in range(self.dimension):
-                self.prev_residual[i] = self.temp_residual[i]
-            
+            # Store history and return basic F(x_k)
+            self._store_history(current_iterate, current_residual)
             return self._clip_to_bounds(fx_k)
             
         except Exception as e:
             log.warning(f"Critical Anderson error: {e}")
             self.error_count += 1
             return self._clip_to_bounds(current_iterate) if current_iterate is not None else None
+
+    def _store_history(self, iterate: np.ndarray, residual: np.ndarray):
+        """Store iterate and residual in circular buffer."""
+        pos = self.current_pos % self.memory_depth
+        
+        # Store current iterate and residual
+        self.iterate_history[pos] = iterate
+        self.residual_history[pos] = residual
+        
+        # Update counters
+        self.current_pos += 1
+        self.memory_used = min(self.memory_used + 1, self.memory_depth)
+
+    def _apply_standard_anderson(self, current_iterate: np.ndarray, fx_k: np.ndarray, 
+                                current_residual: np.ndarray) -> np.ndarray:
+        """Apply STANDARD Anderson acceleration formulation."""
+        try:
+            # STANDARD ANDERSON FORMULATION:
+            # 1. Solve: min ||Σ γ_i Δf_i||² subject to Σ γ_i = 1
+            # 2. Update: x_{k+1} = Σ γ_i F(x_{k-m+i})
+            
+            # Build residual difference matrix (Δf_i = f_i - f_{i-1})
+            if self.memory_used < 2:
+                # Not enough history for Anderson, return basic step
+                return fx_k
+            
+            # Compute residual differences
+            residual_diffs = np.zeros((self.memory_used - 1, self.dimension))
+            for i in range(self.memory_used - 1):
+                pos_curr = (self.current_pos - 1 - i) % self.memory_depth
+                pos_prev = (self.current_pos - 2 - i) % self.memory_depth
+                residual_diffs[i] = self.residual_history[pos_curr] - self.residual_history[pos_prev]
+            
+            # Solve Anderson system: find weights γ that minimize ||Σ γ_i Δf_i||²
+            success = self._solve_anderson_system_standard(residual_diffs, current_residual)
+            if not success:
+                return None
+            
+            # STANDARD UPDATE: x_{k+1} = Σ γ_i F(x_{k-m+i})
+            # Clear weighted sum
+            for i in range(self.dimension):
+                self.temp_weighted_sum[i] = 0.0
+            
+            # Compute weighted combination of function values
+            for i in range(self.memory_used):
+                pos = (self.current_pos - 1 - i) % self.memory_depth
+                weight = self.weights[i] if i < len(self.weights) else 0.0
+                
+                # F(x_i) = x_i + f_i (since f_i = F(x_i) - x_i)
+                for j in range(self.dimension):
+                    fx_i = self.iterate_history[pos, j] + self.residual_history[pos, j]
+                    self.temp_weighted_sum[j] += weight * fx_i
+            
+            # Add current point with remaining weight
+            current_weight = 1.0 - np.sum(self.weights[:self.memory_used])
+            for i in range(self.dimension):
+                self.temp_result[i] = self.temp_weighted_sum[i] + current_weight * fx_k[i]
+            
+            # Apply conservative damping
+            damping = 0.8
+            for i in range(self.dimension):
+                self.temp_result[i] = (1 - damping) * fx_k[i] + damping * self.temp_result[i]
+            
+            return self._clip_to_bounds(self.temp_result)
+
+        except Exception as e:
+            if self.is_debug:
+                log.debug(f"Standard Anderson acceleration failed: {e}")
+            return None
+
+    def _solve_anderson_system_standard(self, residual_diffs: np.ndarray, 
+                                      current_residual: np.ndarray) -> bool:
+        """Solve standard Anderson system with proper constraint."""
+        try:
+            m = len(residual_diffs)  # Number of residual differences
+            if m == 0:
+                return False
+            
+            # Clear gram matrix
+            for i in range(m):
+                for j in range(m):
+                    self.temp_gram[i, j] = 0.0
+            
+            # Build Gram matrix G_ij = <Δf_i, Δf_j>
+            for i in range(m):
+                for j in range(i, m):
+                    dot_product = np.dot(residual_diffs[i], residual_diffs[j])
+                    self.temp_gram[i, j] = dot_product
+                    self.temp_gram[j, i] = dot_product  # Symmetric
+            
+            # Add regularization
+            reg = 1e-8
+            for i in range(m):
+                self.temp_gram[i, i] += reg
+            
+            # Solve constrained system: G γ = e, where e is vector of ones
+            # This gives the solution to min ||Σ γ_i Δf_i||² subject to Σ γ_i = 1
+            
+            # Use simple iterative method for small systems
+            # Initialize with uniform weights
+            for i in range(m):
+                self.weights[i] = 1.0 / m
+            
+            # Iterative refinement
+            for iteration in range(5):
+                new_weights = np.zeros(m)
+                
+                # Solve G * new_weights = ones
+                for i in range(m):
+                    target = 1.0 / m  # Target: uniform constraint
+                    sum_off_diag = 0.0
+                    
+                    for j in range(m):
+                        if i != j:
+                            sum_off_diag += self.temp_gram[i, j] * self.weights[j]
+                    
+                    if abs(self.temp_gram[i, i]) > 1e-12:
+                        new_weights[i] = (target - sum_off_diag) / self.temp_gram[i, i]
+                    else:
+                        new_weights[i] = 1.0 / m
+                
+                # Normalize to satisfy constraint Σ γ_i = 1
+                total = np.sum(new_weights)
+                if total > 1e-12:
+                    for i in range(m):
+                        self.weights[i] = new_weights[i] / total
+                else:
+                    for i in range(m):
+                        self.weights[i] = 1.0 / m
+            
+            return True
+            
+        except Exception as e:
+            log.debug(f"Anderson system solve failed: {e}")
+            return False
 
     def _safe_apply_anderson_acceleration_mmap(self, current_iterate, fx_k):
         """Apply Anderson acceleration using correct mathematical formulation."""

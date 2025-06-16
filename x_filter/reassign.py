@@ -4,13 +4,14 @@ Implements SQUAREM EM algorithm for probabilistic read assignment.
 """
 import os
 import numpy as np
-import pyarrow as pa
-import pyarrow.parquet as pq
 import numba
 from numba import njit, prange
 from pathlib import Path
 from typing import Dict, Any, Optional, Tuple, Union, List
-
+import gc
+import pyarrow as pa
+import pyarrow.parquet as pq
+from x_filter.resource_management import ResourceManager
 from x_filter.logging_setup import get_logger
 from x_filter.reassign.em import accelerated_resolve_multimaps, ultra_fast_bitscore_em_step
 from x_filter.reassign.utils import memory_efficient_factorize, initialize_subject_weights
@@ -29,7 +30,7 @@ def reassign_reads_mmap(
     min_improvement: float = 1e-4,
     adaptive_convergence: bool = False,
     max_memory: Optional[str] = None,
-    selection_mode: str = "hard_cutoff",
+    selection_mode: str = "primary",  # Keep primary but with improved logic
     reference_bias: float = 0.0,
     handle_ties: str = "keep_all",
     min_assignment_confidence: float = 0.01,
@@ -37,10 +38,13 @@ def reassign_reads_mmap(
     acceleration_method: str = "hybrid",
     anderson_memory: int = 10,
     lbfgs_memory: int = 10,
+    # Enhanced parameters
+    lambda_scale: float = 3.0,
+    temperature: float = 0.03,
+    use_enhanced_em: bool = True,
 ) -> list:
     """
-    Perform read reassignment using ultra-fast memory-mapped EM algorithm.
-    Optimized for billion-scale datasets.
+    Enhanced read reassignment with guaranteed read coverage.
     
     Args:
         filtered_arrays: Dictionary of memory-mapped arrays containing alignment data
@@ -60,6 +64,9 @@ def reassign_reads_mmap(
         acceleration_method: Method for acceleration ('anderson', 'lbfgs', 'hybrid')
         anderson_memory: Memory depth for Anderson acceleration
         lbfgs_memory: Memory depth for L-BFGS acceleration
+        lambda_scale: Scaling factor for lambda in EM algorithm
+        temperature: Temperature parameter for probability scaling
+        use_enhanced_em: Whether to use enhanced EM implementation
         
     Returns:
         List of row IDs for reassigned alignments
@@ -85,17 +92,6 @@ def reassign_reads_mmap(
     n_alignments = len(bit_scores)
     
     log.info(f"Processing {n_alignments:,} alignments with ultra-fast algorithms")
-    
-    # Compute unique IDs if not provided
-    if len(unique_query_ids) == 0:
-        log.info("Computing unique query IDs...")
-        unique_query_ids = np.unique(query_numeric_ids)
-    if len(unique_subject_ids) == 0:
-        log.info("Computing unique subject IDs...")
-        unique_subject_ids = np.unique(subject_numeric_ids)
-    
-    log.info(f"Unique queries: {len(unique_query_ids):,}")
-    log.info(f"Unique subjects: {len(unique_subject_ids):,}")
     
     # Calculate optimal chunk size for factorization
     factorization_chunk_size = resource_manager.calculate_optimal_chunk_size(
@@ -173,7 +169,7 @@ def reassign_reads_mmap(
         em_data, mmap_dir=mmap_dir, max_memory=max_memory
     )
     
-    # Use ultra-fast EM implementation
+    # Use enhanced EM implementation
     result = accelerated_resolve_multimaps(
         initialized_data,
         iters=reassign_iters,
@@ -185,6 +181,9 @@ def reassign_reads_mmap(
         acceleration_method=acceleration_method,
         anderson_memory=anderson_memory,
         lbfgs_memory=lbfgs_memory,
+        lambda_scale=lambda_scale,  # Pass enhanced parameters
+        temperature=temperature,
+        use_enhanced_em=use_enhanced_em,
     )
     
     log.info(f"Ultra-fast {acceleration_method.upper()} algorithm completed")
@@ -225,7 +224,7 @@ def reassign_reads_mmap(
     
     # Probability distribution statistics
     prob_ranges = [
-        (0.95, 1.00, "Very High (0.95-1.00)"),
+        (0.95, 1.01, "Very High (0.95-1.00)"),  # Changed: 1.01 to include 1.0
         (0.90, 0.95, "High (0.90-0.95)"),
         (0.80, 0.90, "Medium-High (0.80-0.90)"),
         (0.70, 0.80, "Medium (0.70-0.80)"),
@@ -235,27 +234,46 @@ def reassign_reads_mmap(
     
     log.info("PROBABILITY DISTRIBUTION:")
     for min_prob, max_prob, label in prob_ranges:
-        mask = (result['prob'] >= min_prob) & (result['prob'] < max_prob)
+        if min_prob == 0.95:  # Special case for the highest range
+            mask = result['prob'] >= min_prob  # Use >= for the top range
+        else:
+            mask = (result['prob'] >= min_prob) & (result['prob'] < max_prob)
         count = np.sum(mask)
-        # CRITICAL FIX: Use actual array length, not dictionary length
         percentage = count / len(result['prob']) * 100
         log.info(f"  {label}: {count:,} alignments ({percentage:.1f}%)")
     
+    # Add verification of the discrepancy
+    prob_exactly_1 = np.sum(result['prob'] == 1.0)
+    prob_095_to_099 = np.sum((result['prob'] >= 0.95) & (result['prob'] < 1.0))
+    prob_095_or_higher = np.sum(result['prob'] >= 0.95)
+    
+    log.info("")
+    log.info("PROBABILITY DISTRIBUTION VERIFICATION:")
+    log.info(f"  Exactly 1.0: {prob_exactly_1:,} alignments")
+    log.info(f"  [0.95, 1.0): {prob_095_to_099:,} alignments") 
+    log.info(f"  >= 0.95: {prob_095_or_higher:,} alignments")
+    log.info(f"  Sum check: {prob_exactly_1 + prob_095_to_099} = {prob_095_or_higher}")
+
     # Apply selection mode filtering after EM algorithm
     log.info("")
     log.info("=" * 80)
     log.info("APPLYING SELECTION MODE FILTERING")
     log.info("=" * 80)
     
+    # Initialize variables at the start to avoid reference errors
+    original_query_ids = None
+    original_subject_ids = None
+    
     try:
-        log.info(f"Applying selection mode: {selection_mode}")
+        log.info(f"🔧 Selection mode: {selection_mode}")
         if selection_mode != "hard_cutoff":
-            log.info(f"Min assignment confidence: {min_assignment_confidence}")
-            log.info(f"Min confidence margin: {min_confidence_margin}")
-            log.info(f"Handle ties: {handle_ties}")
+            log.info(f"⚙️  Parameters:")
+            log.info(f"  • Min confidence: {min_assignment_confidence}")
+            log.info(f"  • Min margin: {min_confidence_margin}")
+            log.info(f"  • Handle ties: {handle_ties}")
         
         # Convert factorized indices back to original IDs
-        log.info("Converting factorized indices to original IDs...")
+        log.info("🔄 Converting indices to original IDs...")
         
         # CRITICAL FIX: Get the actual number of alignments from the arrays, not dictionary length
         if isinstance(result, dict):
@@ -265,7 +283,7 @@ def reassign_reads_mmap(
         else:
             actual_n_alignments = len(result) if hasattr(result, '__len__') else 0
         
-        log.info(f"Processing {actual_n_alignments:,} alignments for ID conversion")
+        log.debug(f"Processing {actual_n_alignments:,} alignments for ID conversion")
         
         # Calculate chunk size for ID conversion
         chunk_size = resource_manager.calculate_optimal_chunk_size(
@@ -275,7 +293,7 @@ def reassign_reads_mmap(
             max_chunk_size=None
         )
         
-        log.info(f"Using chunk size: {chunk_size:,} for ID conversion")
+        log.debug(f"Using chunk size: {chunk_size:,} for ID conversion")
         
         # Create memory-mapped arrays for original IDs
         original_query_path = os.path.join(mmap_dir, "original_query_ids.mmap")
@@ -304,13 +322,14 @@ def reassign_reads_mmap(
         original_subject_ids_mmap.flush()
         
         # Create PyArrow table - handle structured array result
-        log.info("Creating PyArrow table...")
+        log.info("📊 Creating analysis table...")
         
         pyarrow_chunk_size = resource_manager.calculate_optimal_chunk_size(
             total_elements=actual_n_alignments,
             element_size=8,
             operation_overhead=3.0,
-            max_chunk_size=None
+            min_chunk_size=1_000_000,
+            max_chunk_size=100_000_000  # Limit to avoid excessive memory usage
         )
         
         schema = pa.schema([
@@ -346,7 +365,7 @@ def reassign_reads_mmap(
                 
                 writer.write_batch(batch)
         
-        log.info(f"Wrote {actual_n_alignments:,} alignments to Parquet file: {parquet_path}")
+        log.debug(f"Analysis table created: {actual_n_alignments:,} alignments")
 
         # Clean up memory-mapped arrays
         del original_query_ids_mmap, original_subject_ids_mmap
@@ -386,10 +405,10 @@ def reassign_reads_mmap(
         except Exception as e:
             log.warning(f"Could not clean up temporary file {parquet_path}: {e}")
         
-        log.info(f"Selection mode filtering completed:")
-        log.info(f"  Input alignments: {actual_n_alignments:,}")
-        log.info(f"  Selected alignments: {len(selected_indices):,}")
-        log.info(f"  Filtered out: {actual_n_alignments - len(selected_indices):,} ({(actual_n_alignments - len(selected_indices))/actual_n_alignments*100:.1f}%)")
+        log.info(f"✅ Selection filtering complete:")
+        log.info(f"  📊 Input alignments: {actual_n_alignments:,}")
+        log.info(f"  ✅ Selected alignments: {len(selected_indices):,}")
+        log.info(f"  🗑️  Filtered out: {actual_n_alignments - len(selected_indices):,} ({(actual_n_alignments - len(selected_indices))/actual_n_alignments*100:.1f}%)")
         
         if len(selected_indices) > 0:
             # Handle structured array result for probability extraction
@@ -397,17 +416,17 @@ def reassign_reads_mmap(
                 selected_probs = result["prob"][np.isin(result["orig_idx"], selected_indices)]
             else:
                 selected_probs = result["prob"][np.isin(result["orig_idx"], selected_indices)]
-            log.info(f"  Selected prob range: {np.min(selected_probs):.4f} to {np.max(selected_probs):.4f}")
-            log.info(f"  Selected prob mean: {np.mean(selected_probs):.4f}")
+            log.info(f"  📈 Selected prob range: {np.min(selected_probs):.4f} to {np.max(selected_probs):.4f}")
+            log.info(f"  📊 Selected prob mean: {np.mean(selected_probs):.4f}")
     
     except Exception as e:
-        log.error(f"Error during selection mode filtering: {str(e)}")
-        log.info("Falling back to returning all alignments without selection filtering")
+        log.error(f"❌ Error during selection filtering: {str(e)}")
+        log.info("🔄 Falling back to returning all alignments")
         return result["orig_idx"].tolist()
     
     # Ensure we always return a valid list
     if selected_indices is None or len(selected_indices) == 0:
-        log.warning("No alignments selected by filtering criteria")
+        log.warning("⚠️  No alignments selected by filtering criteria")
         return []
     
     return selected_indices.tolist()

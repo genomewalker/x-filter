@@ -199,7 +199,7 @@ def implement_selection_mode(
     log.info(f"  Adaptive margin: {adaptive_margin:.6f}")
     
     if selection_mode == "primary":
-        log.info("Using enhanced primary selection with dataset-adaptive thresholds")
+        log.info("Using primary selection with dataset-adaptive thresholds")
         
         # Create selection query based on dataset type
         if dataset_type == "HIGHLY_MULTIMAPPING":

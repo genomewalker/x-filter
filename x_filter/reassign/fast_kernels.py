@@ -483,3 +483,193 @@ ultra_fast_conservation_check = ultra_fast_conservation_check_prealloc
 ultra_fast_conservation_fix = ultra_fast_conservation_fix_prealloc
 ultra_fast_global_normalization = ultra_fast_global_normalization_fix
 ultra_fast_perfect_conservation = ultra_fast_perfect_conservation_fix
+
+@njit(types.void(types.int64[:], types.int64[:], types.float64[:], types.float64[:], 
+                 types.float64, types.float64[:], types.float64[:], types.float64[:], types.float64), 
+      fastmath=True, parallel=True, cache=True, nogil=True)
+def ultra_fast_enhanced_e_step(
+    source_indices: np.ndarray,
+    subject_indices: np.ndarray,
+    bit_scores: np.ndarray,
+    weights: np.ndarray,
+    lambda_scale: float,
+    responsibilities: np.ndarray,
+    temp_max: np.ndarray,
+    temp_sum: np.ndarray,
+    temperature: float = 0.1
+) -> None:
+    """
+    Ultra-fast enhanced E-step with temperature scaling and score transformation.
+    """
+    n_alignments = len(source_indices)
+    max_source = len(temp_max)
+    
+    if n_alignments == 0:
+        return
+    
+    # Clear temp arrays
+    for i in prange(max_source):
+        temp_max[i] = -1e30
+        temp_sum[i] = 0.0
+    
+    # Enhanced score normalization
+    min_score = bit_scores[0]
+    max_score = bit_scores[0]
+    
+    for i in prange(1, n_alignments):
+        score = bit_scores[i]
+        if score < min_score:
+            min_score = score
+        if score > max_score:
+            max_score = score
+    
+    score_range = max_score - min_score
+    
+    if score_range < 1e-12:
+        # Uniform case with enhanced weight handling
+        for i in prange(max_source):
+            temp_sum[i] = 0.0
+        
+        for i in prange(n_alignments):
+            source_idx = source_indices[i]
+            subject_idx = subject_indices[i]
+            if source_idx < max_source:
+                temp_sum[source_idx] += weights[subject_idx]
+        
+        for i in prange(n_alignments):
+            source_idx = source_indices[i]
+            subject_idx = subject_indices[i]
+            if source_idx < max_source and temp_sum[source_idx] > 1e-15:
+                responsibilities[i] = weights[subject_idx] / temp_sum[source_idx]
+            else:
+                responsibilities[i] = 1e-15
+        return
+    
+    inv_score_range = 1.0 / score_range
+    inv_temperature = 1.0 / temperature
+    
+    # Pass 1: Enhanced max finding with score transformation
+    for i in prange(n_alignments):
+        source_idx = source_indices[i]
+        subject_idx = subject_indices[i]
+        
+        if source_idx < max_source:
+            # Enhanced score transformation: quadratic + exponential scaling
+            norm_score = (bit_scores[i] - min_score) * inv_score_range
+            
+            # Apply sigmoid transformation for better separation
+            sigmoid_score = 1.0 / (1.0 + np.exp(-10.0 * (norm_score - 0.5)))
+            
+            # Apply exponential scaling
+            enhanced_score = np.exp(2.0 * sigmoid_score) - 1.0
+            
+            weight_val = weights[subject_idx]
+            log_weight = np.log(max(weight_val, 1e-15))
+            
+            # Temperature-scaled weighted score
+            weighted_score = log_weight + (lambda_scale * enhanced_score) * inv_temperature
+            
+            if weighted_score > temp_max[source_idx]:
+                temp_max[source_idx] = weighted_score
+    
+    # Pass 2: Enhanced sum computation
+    for i in prange(n_alignments):
+        source_idx = source_indices[i]
+        subject_idx = subject_indices[i]
+        
+        if source_idx < max_source:
+            max_val = temp_max[source_idx]
+            if max_val > -1e29:
+                norm_score = (bit_scores[i] - min_score) * inv_score_range
+                sigmoid_score = 1.0 / (1.0 + np.exp(-10.0 * (norm_score - 0.5)))
+                enhanced_score = np.exp(2.0 * sigmoid_score) - 1.0
+                
+                weight_val = weights[subject_idx]
+                log_weight = np.log(max(weight_val, 1e-15))
+                weighted_score = log_weight + (lambda_scale * enhanced_score) * inv_temperature
+                
+                diff = weighted_score - max_val
+                if diff > -15.0:
+                    exp_val = np.exp(diff)
+                    temp_sum[source_idx] += exp_val
+    
+    # Pass 3: Enhanced responsibility computation
+    for i in prange(n_alignments):
+        source_idx = source_indices[i]
+        subject_idx = subject_indices[i]
+        
+        if source_idx < max_source:
+            max_val = temp_max[source_idx]
+            sum_val = temp_sum[source_idx]
+            
+            if sum_val > 1e-15 and max_val > -1e29:
+                norm_score = (bit_scores[i] - min_score) * inv_score_range
+                sigmoid_score = 1.0 / (1.0 + np.exp(-10.0 * (norm_score - 0.5)))
+                enhanced_score = np.exp(2.0 * sigmoid_score) - 1.0
+                
+                weight_val = weights[subject_idx]
+                log_weight = np.log(max(weight_val, 1e-15))
+                weighted_score = log_weight + (lambda_scale * enhanced_score) * inv_temperature
+                
+                diff = weighted_score - max_val
+                if diff > -15.0:
+                    exp_val = np.exp(diff)
+                    prob = exp_val / sum_val
+                    # Apply probability sharpening
+                    sharpened_prob = prob ** (1.0 / temperature)
+                    responsibilities[i] = max(1e-15, min(1.0, sharpened_prob))
+                else:
+                    responsibilities[i] = 1e-15
+            else:
+                responsibilities[i] = 1e-15
+        else:
+            responsibilities[i] = 1e-15
+
+@njit(types.void(types.int64[:], types.float64[:], types.float64[:], types.float64[:], types.float64), 
+      fastmath=True, parallel=True, cache=True, nogil=True)
+def ultra_fast_enhanced_m_step(
+    subject_indices: np.ndarray,
+    responsibilities: np.ndarray,
+    new_weights: np.ndarray,
+    temp_sums: np.ndarray,
+    regularization: float = 1e-8
+) -> None:
+    """
+    Enhanced M-step with regularization to prevent overfitting.
+    """
+    n_alignments = len(subject_indices)
+    max_subject = len(new_weights)
+    
+    if n_alignments == 0:
+        return
+    
+    # Clear arrays
+    for i in prange(max_subject):
+        temp_sums[i] = regularization  # Add small regularization
+        new_weights[i] = 0.0
+    
+    # Accumulate with enhanced precision
+    for i in prange(n_alignments):
+        subject_idx = subject_indices[i]
+        if subject_idx < max_subject:
+            resp_val = responsibilities[i]
+            # Apply response transformation to reduce noise
+            enhanced_resp = resp_val * resp_val * resp_val  # Cubic transformation
+            temp_sums[subject_idx] += enhanced_resp
+    
+    # Enhanced normalization with regularization
+    total_sum = regularization * max_subject
+    for i in prange(max_subject):
+        total_sum += temp_sums[i]
+    
+    if total_sum > 1e-15:
+        inv_total = 1.0 / total_sum
+        for i in prange(max_subject):
+            new_weights[i] = max(1e-15, temp_sums[i] * inv_total)
+    else:
+        if max_subject > 0:
+            uniform_weight = 1.0 / max_subject
+            for i in prange(max_subject):
+                new_weights[i] = uniform_weight
+
+# ...existing code...

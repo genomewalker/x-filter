@@ -615,6 +615,166 @@ def bitscore_em_step(
     log.debug("Using pre-allocated result_weights array (no copy needed)")
     return array_manager.arrays["result_weights"]
 
+@njit(fastmath=True, parallel=True)
+def enhanced_compute_responsibilities_from_bitscores(
+    source_indices: np.ndarray,      
+    subject_indices: np.ndarray,     
+    bit_scores: np.ndarray,          
+    weights: np.ndarray,             
+    lambda_scale: float,             
+    responsibilities: np.ndarray,
+    temp_source_max: np.ndarray,
+    temp_source_denom: np.ndarray,
+    temperature: float = 0.1  # Add temperature parameter for sharpening
+) -> None:
+    """
+    Enhanced E-Step with temperature scaling for better separation.
+    Lower temperature creates sharper probability distributions.
+    """
+    n = len(source_indices)
+    max_source = len(temp_source_max)
+    
+    # Clear temporary arrays
+    for i in prange(max_source):
+        temp_source_max[i] = -np.inf
+        temp_source_denom[i] = 0.0
+    
+    # Enhanced score normalization with better scaling
+    min_score = np.min(bit_scores)
+    max_score = np.max(bit_scores)
+    score_range = max_score - min_score
+    
+    if score_range < 1e-10:
+        # Uniform case with weight-based assignment
+        source_weight_sums = np.zeros(max_source, dtype=np.float64)
+        for i in range(n):
+            source_idx = source_indices[i]
+            subject_idx = subject_indices[i]
+            source_weight_sums[source_idx] += weights[subject_idx]
+        
+        for i in prange(n):
+            source_idx = source_indices[i]
+            subject_idx = subject_indices[i]
+            if source_weight_sums[source_idx] > 1e-15:
+                responsibilities[i] = weights[subject_idx] / source_weight_sums[source_idx]
+            else:
+                responsibilities[i] = 1e-15
+        return
+    
+    # Enhanced normalization with quadratic scaling for better separation
+    inv_score_range = 1.0 / score_range
+    
+    # Pass 1: Find max weighted score per source with enhanced scaling
+    for i in prange(n):
+        source_idx = source_indices[i]
+        subject_idx = subject_indices[i]
+        
+        if source_idx < max_source:
+            # Enhanced score transformation for better separation
+            norm_score = (bit_scores[i] - min_score) * inv_score_range
+            # Apply quadratic transformation to emphasize high scores
+            enhanced_score = norm_score * norm_score
+            
+            log_weight = np.log(max(weights[subject_idx], 1e-15))
+            # Scale by lambda and apply temperature
+            weighted_score = log_weight + (lambda_scale * enhanced_score) / temperature
+            
+            if weighted_score > temp_source_max[source_idx]:
+                temp_source_max[source_idx] = weighted_score
+    
+    # Pass 2: Compute denominators with temperature scaling
+    for i in prange(n):
+        source_idx = source_indices[i]
+        subject_idx = subject_indices[i]
+        
+        if source_idx < max_source:
+            max_val = temp_source_max[source_idx]
+            if max_val > -np.inf:
+                norm_score = (bit_scores[i] - min_score) * inv_score_range
+                enhanced_score = norm_score * norm_score
+                log_weight = np.log(max(weights[subject_idx], 1e-15))
+                weighted_score = log_weight + (lambda_scale * enhanced_score) / temperature
+                
+                exp_val = np.exp(weighted_score - max_val)
+                temp_source_denom[source_idx] += exp_val
+    
+    # Pass 3: Compute final responsibilities with enhanced precision
+    for i in prange(n):
+        source_idx = source_indices[i]
+        subject_idx = subject_indices[i]
+        
+        if source_idx < max_source:
+            max_val = temp_source_max[source_idx]
+            denom = temp_source_denom[source_idx]
+            
+            if denom > 1e-15 and max_val > -np.inf:
+                norm_score = (bit_scores[i] - min_score) * inv_score_range
+                enhanced_score = norm_score * norm_score
+                log_weight = np.log(max(weights[subject_idx], 1e-15))
+                weighted_score = log_weight + (lambda_scale * enhanced_score) / temperature
+                
+                exp_val = np.exp(weighted_score - max_val)
+                prob = exp_val / denom
+                responsibilities[i] = max(1e-15, min(1.0, prob))
+            else:
+                responsibilities[i] = 1e-15
+        else:
+            responsibilities[i] = 1e-15
+
+def enhanced_bitscore_em_step(
+    source_indices: np.ndarray,
+    subject_indices: np.ndarray, 
+    bit_scores: np.ndarray,
+    current_weights: np.ndarray,
+    array_manager: ArrayManager,
+    lambda_scale: float = 2.0,  # Increased lambda for better separation
+    temperature: float = 0.05,  # Lower temperature for sharper probabilities
+    verbose: bool = False
+) -> np.ndarray:
+    """
+    Enhanced EM step with better parameter tuning for improved separation.
+    """
+    if verbose:
+        log.debug(f"  Enhanced EM Step - λ={lambda_scale}, T={temperature}")
+        log.debug(f"  Input weights range: {np.min(current_weights):.6f} to {np.max(current_weights):.6f}")
+    
+    # Enhanced E-step with temperature scaling
+    enhanced_compute_responsibilities_from_bitscores(
+        source_indices,
+        subject_indices,
+        bit_scores,
+        current_weights,
+        lambda_scale,
+        array_manager.arrays["responsibilities"],
+        array_manager.arrays["temp_source_max"],
+        array_manager.arrays["temp_source_denom"],
+        temperature
+    )
+    
+    if verbose:
+        resp = array_manager.arrays["responsibilities"]
+        high_conf = np.sum(resp > 0.95) / len(resp) * 100
+        med_conf = np.sum(resp > 0.5) / len(resp) * 100
+        low_conf = np.sum(resp < 0.01) / len(resp) * 100
+        log.debug(f"  Enhanced E-Step - High conf: {high_conf:.1f}%, Med: {med_conf:.1f}%, Low: {low_conf:.1f}%")
+    
+    # Standard M-step
+    update_weights_from_responsibilities(
+        subject_indices,
+        array_manager.arrays["responsibilities"],
+        array_manager.arrays["new_weights"]
+    )
+    
+    # Apply weight smoothing to prevent overfitting
+    smoothing_factor = 0.95
+    array_manager.arrays["new_weights"][:] = (
+        smoothing_factor * array_manager.arrays["new_weights"] + 
+        (1 - smoothing_factor) * current_weights
+    )
+    
+    array_manager.arrays["result_weights"][:] = array_manager.arrays["new_weights"]
+    return array_manager.arrays["result_weights"]
+
 def ultra_fast_bitscore_em_step(
     source_indices: np.ndarray,
     subject_indices: np.ndarray, 
@@ -1293,10 +1453,12 @@ def accelerated_resolve_multimaps(
     acceleration_method="anderson",
     anderson_memory=10,
     lbfgs_memory=10,
-    lambda_scale=1.0,
+    lambda_scale=2.0,  # Increased default lambda
+    temperature=0.05,  # Added temperature parameter
+    use_enhanced_em=True,  # Flag to use enhanced EM
 ):
     """
-    ULTRA-FAST EM implementation optimized for billion-scale datasets.
+    Enhanced EM implementation with better parameter tuning.
     """
     is_debug = log.isEnabledFor(logging.DEBUG)
     
