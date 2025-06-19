@@ -1,19 +1,18 @@
-import logging
-import time
-import sys
-import os
-import gc
-import psutil
-import argparse
-import pandas as pd
-import numpy as np
 from pathlib import Path
 from numba import njit, prange
 from contextlib import contextmanager, redirect_stderr, redirect_stdout
 from os import devnull
 from itertools import chain
 from typing import List, Dict, Tuple, Union, Any, Optional
-
+import logging
+import time
+import numpy as np
+import pandas as pd
+import psutil
+import gc
+import argparse
+import sys
+import os
 from x_filter import __version__
 from x_filter.common import detect_input_type, validate_mmap_folder, get_open_func
 from x_filter.logging_setup import get_logger
@@ -65,13 +64,14 @@ DEFAULTS = {
     "acceleration_method": "hybrid",
     "anderson_memory": 10,
     "lbfgs_memory": 10,
-    "lambda_scale": 1.0,
+    "lambda_scale": 3.0,  # Balanced lambda scale for stable convergence
     "min_improvement": 1e-4,
     "max_consecutive_failures": 3,
     "convergence_threshold": 1e-4,
     "n_iters": 20,
-    "assignment_threshold": 0.5,  # Add missing key with default value
-    "confidence_threshold": 0.9,  # Add missing key with default value
+    "assignment_threshold": 0.5,
+    "confidence_threshold": 0.9,
+    "random_seed": 42,
 }
 
 HELP_MESSAGES = {
@@ -749,6 +749,15 @@ def get_arguments(
         metavar="STR",
         help=HELP_MESSAGES["max_memory"],
     )
+    parser.add_argument(
+        "--seed",
+        type=lambda x: int(
+            check_values(x, minval=0, maxval=2**31 - 1, parser=parser, var="--seed")
+        ),
+        default=DEFAULTS["random_seed"],
+        help="Deterministic seed for random number generation",
+    )
+        
     parser.add_argument(
         "--tmp-dir",
         type=str,

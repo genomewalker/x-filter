@@ -169,6 +169,76 @@ def load_existing_mmap_arrays(
     return mmap_arrays
 
 
+def detect_tsv_headers(file_path: str) -> bool:
+    """
+    Detect if TSV file has column headers by checking the first row.
+    
+    Args:
+        file_path: Path to TSV file (can be a glob pattern for directories)
+        
+    Returns:
+        bool: True if headers are detected, False otherwise
+    """
+    import glob
+    
+    # Handle glob patterns for directories
+    if '*' in file_path:
+        files = glob.glob(file_path)
+        if not files:
+            raise ValueError(f"No files found matching pattern: {file_path}")
+        # Use first file for header detection
+        actual_file = files[0]
+    else:
+        actual_file = file_path
+    
+    try:
+        # Read first few lines to detect headers
+        if actual_file.endswith('.gz'):
+            import gzip
+            with gzip.open(actual_file, 'rt') as f:
+                first_line = f.readline().strip()
+                second_line = f.readline().strip()
+        else:
+            with open(actual_file, 'r') as f:
+                first_line = f.readline().strip()
+                second_line = f.readline().strip()
+        
+        if not first_line or not second_line:
+            return False
+            
+        first_fields = first_line.split('\t')
+        second_fields = second_line.split('\t')
+        
+        # Check if first line contains expected column names
+        expected_headers = {
+            'queryId', 'subjectId', 'percIdentity', 'alnLength', 'mismatchCount',
+            'gapOpenCount', 'queryStart', 'queryEnd', 'subjectStart', 'subjectEnd',
+            'eVal', 'bitScore', 'qlen', 'slen'
+        }
+        
+        # Convert to lowercase for case-insensitive comparison
+        first_fields_lower = [f.lower() for f in first_fields]
+        
+        # Check if at least 10 of the expected headers are present
+        matches = sum(1 for header in expected_headers if header.lower() in first_fields_lower)
+        
+        # Also check if second line contains numeric data (typical for BLAST results)
+        try:
+            # Try to parse some numeric fields from second line
+            float(second_fields[2])  # percIdentity
+            int(second_fields[3])    # alnLength
+            float(second_fields[10]) # eVal
+            float(second_fields[11]) # bitScore
+            return matches >= 10  # If we can parse numbers and have headers, it's a header file
+        except (ValueError, IndexError):
+            # If we can't parse second line as numbers but first line looks like headers
+            return matches >= 10
+            
+    except Exception as e:
+        log.warning(f"Could not detect headers in {actual_file}: {e}")
+        return False
+
+
 def create_filtered_blast_table(
     db_file: str,
     input_file: str,
@@ -210,7 +280,7 @@ def create_filtered_blast_table(
                 import glob
                 if glob.glob(pattern):
                     csv_source = pattern
-                    log.info(f"Reading TSV files from pattern: {pattern}")
+                    log.info(f"📁 Reading TSV files from pattern: {pattern}")
                     break
             
             if csv_source is None:
@@ -218,52 +288,110 @@ def create_filtered_blast_table(
         else:
             # Single file
             csv_source = input_file
-            log.info(f"Reading single TSV file: {csv_source}")
+            log.info(f"📄 Reading single TSV file: {csv_source}")
+
+        # Detect if files have headers
+        has_headers = detect_tsv_headers(csv_source)
+        log.info(f"📋 Headers detected: {'Yes' if has_headers else 'No'}")
 
         # Get number of columns from input file
+        read_csv_options = "header=true" if has_headers else "header=false"
         num_columns = len(
             db_manager.execute(
-                f"SELECT * FROM read_csv_auto('{csv_source}') LIMIT 1"
+                f"SELECT * FROM read_csv_auto('{csv_source}', {read_csv_options}) LIMIT 1"
             ).description
         )
-        log.info(f"Detected {num_columns} columns in input file(s)")
+        log.info(f"📊 Detected {num_columns} columns in input file(s)")
+
+        # Define column references based on whether we have headers
+        if has_headers:
+            # Use actual column names
+            col_refs = {
+                'queryId': 'queryId',
+                'subjectId': 'subjectId', 
+                'percIdentity': 'percIdentity',
+                'alnLength': 'alnLength',
+                'mismatchCount': 'mismatchCount',
+                'gapOpenCount': 'gapOpenCount',
+                'queryStart': 'queryStart',
+                'queryEnd': 'queryEnd',
+                'subjectStart': 'subjectStart',
+                'subjectEnd': 'subjectEnd',
+                'eVal': 'eVal',
+                'bitScore': 'bitScore',
+                'qlen': 'qlen',
+                'slen': 'slen'
+            }
+            # Additional columns for 17-column format
+            if num_columns >= 17:
+                col_refs.update({
+                    'cigar': 'cigar',
+                    'qaln': 'qaln', 
+                    'taln': 'taln'
+                })
+        else:
+            # Use positional column references
+            col_refs = {
+                'queryId': 'column00',
+                'subjectId': 'column01',
+                'percIdentity': 'column02', 
+                'alnLength': 'column03',
+                'mismatchCount': 'column04',
+                'gapOpenCount': 'column05',
+                'queryStart': 'column06',
+                'queryEnd': 'column07',
+                'subjectStart': 'column08',
+                'subjectEnd': 'column09',
+                'eVal': 'column10',
+                'bitScore': 'column11',
+                'qlen': 'column12',
+                'slen': 'column13'
+            }
+            # Additional columns for 17-column format  
+            if num_columns >= 17:
+                col_refs.update({
+                    'cigar': 'column14',
+                    'qaln': 'column15',
+                    'taln': 'column16'
+                })
 
         additional_columns = (
-            ",\n                column14 AS cigar,\n                column15 AS qaln,\n                column16 AS taln"
-            if num_columns == 17
-            else ""
+            f",\n                {col_refs['cigar']} AS cigar,\n                {col_refs['qaln']} AS qaln,\n                {col_refs['taln']} AS taln"
+            if num_columns >= 17 else ""
         )
 
         # Create filtered table with explicit type casts - include percent identity filter
+        log.info(f"🔍 Applying filters: E-value ≤ {evalue_threshold}, Bit score ≥ {bitscore_threshold}, Identity ≥ {percent_identity_threshold}%")
+        
         create_table_sql = f"""
             CREATE TABLE filtered_blast AS
             WITH input_data AS (
                 SELECT *,
-                    CAST(column10 AS DOUBLE) as evalue,
-                    CAST(column11 AS FLOAT) as bitscore,
-                    CAST(column02 AS FLOAT) as percIdentity
-                FROM read_csv_auto('{csv_source}', parallel=true)
-                WHERE CAST(column10 AS DOUBLE) <= {evalue_threshold} 
-                AND CAST(column11 AS FLOAT) >= {bitscore_threshold}
-                AND CAST(column02 AS FLOAT) >= {percent_identity_threshold}
+                    CAST({col_refs['eVal']} AS DOUBLE) as evalue,
+                    CAST({col_refs['bitScore']} AS FLOAT) as bitscore,
+                    CAST({col_refs['percIdentity']} AS FLOAT) as percIdentity_cast
+                FROM read_csv_auto('{csv_source}', parallel=true, {read_csv_options})
+                WHERE CAST({col_refs['eVal']} AS DOUBLE) <= {evalue_threshold} 
+                AND CAST({col_refs['bitScore']} AS FLOAT) >= {bitscore_threshold}
+                AND CAST({col_refs['percIdentity']} AS FLOAT) >= {percent_identity_threshold}
             )
             SELECT
-                column00 AS queryId,
-                CAST(hash(column01) % 9223372036854775807 AS BIGINT) AS subject_numeric_id,
-                CAST(hash(column00) % 9223372036854775807 AS BIGINT) AS query_numeric_id,
-                column01 AS subjectId,
-                CAST(column02 AS FLOAT4) AS percIdentity,
-                CAST(column03 AS INTEGER) AS alnLength,
-                CAST(column04 AS SMALLINT) AS mismatchCount,
-                CAST(column05 AS SMALLINT) AS gapOpenCount,
-                CAST(column06 AS INTEGER) AS queryStart,
-                CAST(column07 AS INTEGER) AS queryEnd,
-                CAST(column08 AS INTEGER) AS subjectStart,
-                CAST(column09 AS INTEGER) AS subjectEnd,
+                {col_refs['queryId']} AS queryId,
+                CAST(hash({col_refs['subjectId']}) % 9223372036854775807 AS BIGINT) AS subject_numeric_id,
+                CAST(hash({col_refs['queryId']}) % 9223372036854775807 AS BIGINT) AS query_numeric_id,
+                {col_refs['subjectId']} AS subjectId,
+                CAST({col_refs['percIdentity']} AS FLOAT4) AS percIdentity,
+                CAST({col_refs['alnLength']} AS INTEGER) AS alnLength,
+                CAST({col_refs['mismatchCount']} AS SMALLINT) AS mismatchCount,
+                CAST({col_refs['gapOpenCount']} AS SMALLINT) AS gapOpenCount,
+                CAST({col_refs['queryStart']} AS INTEGER) AS queryStart,
+                CAST({col_refs['queryEnd']} AS INTEGER) AS queryEnd,
+                CAST({col_refs['subjectStart']} AS INTEGER) AS subjectStart,
+                CAST({col_refs['subjectEnd']} AS INTEGER) AS subjectEnd,
                 evalue AS eVal,
                 CAST(bitscore AS FLOAT4) AS bitScore,
-                CAST(column12 AS INTEGER) AS qlen,
-                CAST(column13 AS INTEGER) AS slen{additional_columns}
+                CAST({col_refs['qlen']} AS INTEGER) AS qlen,
+                CAST({col_refs['slen']} AS INTEGER) AS slen{additional_columns}
             FROM input_data
         """
         db_manager.execute(create_table_sql)
@@ -272,7 +400,7 @@ def create_filtered_blast_table(
         total_rows = db_manager.execute(
             "SELECT COUNT(*) FROM filtered_blast"
         ).fetchone()[0]
-        log.info(f"Number of alignments after filtering: {total_rows:,}")
+        log.info(f"✅ Filtering complete: {total_rows:,} alignments retained")
 
     return total_rows
 
@@ -664,19 +792,11 @@ def export_to_parquet(
             )
     """
 
-    log.debug(
-        f"""
-        Parquet export settings:
-        - Row group size: {chunk_size:,} rows ({(chunk_size * sum(np.dtype(ci.numpy_type).itemsize for ci in columns_info.values())) / (1024*1024):.2f} MB)
-        - Compression: {compression.upper()}
-        - Compression level: {compression_level}
-        - Total rows: {total_rows:,}
-        - Number of groups: {math.ceil(total_rows / chunk_size)}
-    """
-    )
-
+    log.info(f"💾 Exporting to Parquet format (row groups: {chunk_size:,} rows)")
+    
     db_manager.execute(export_sql)
-
+    
+    log.info(f"✅ Export complete: {output_path}")
     return output_path
 
 
@@ -730,19 +850,11 @@ def export_to_parquet_with_rowid(
         )
     """
 
-    log.info(f"Exporting directly to Parquet with rowid (single scan)")
-    log.debug(
-        f"""
-        Optimized Parquet export settings:
-        - Row group size: {chunk_size:,} rows ({(chunk_size * sum(np.dtype(ci.numpy_type).itemsize for ci in columns_info.values())) / (1024*1024):.2f} MB)
-        - Compression: {compression.upper()}
-        - Compression level: {compression_level}
-        - Total rows: {total_rows:,}
-        - Single table scan with rowid included
-    """
-    )
-
+    log.info(f"💾 Exporting to Parquet format (row groups: {chunk_size:,} rows)")
+    
     db_manager.execute(export_sql)
+    
+    log.info(f"✅ Export complete: {output_path}")
     return output_path
 
 
@@ -933,8 +1045,6 @@ def process_parquet_to_memmap(
 ) -> Dict[str, np.memmap]:
     """Convert database to parquet and then to memory-mapped arrays"""
 
-    setup_logging()
-
     column_specs = {
         name: ColumnInfo.from_tuple(name, type_info)
         for name, type_info in columns_info.items()
@@ -966,16 +1076,24 @@ def process_parquet_to_memmap(
         parquet_file = db_file
 
     # Verify parquet file and get group sizes
+    log.info("🔍 Verifying Parquet file integrity...")
     group_sizes = verify_parquet_file(parquet_file, total_rows)
+    log.info(f"✅ Parquet verification complete: {len(group_sizes)} row groups")
 
     # Create memmap arrays
+    log.info("🗂️  Creating memory-mapped arrays...")
     memmap_arrays = {}
+    total_memmap_size = 0
     for name, col_info in column_specs.items():
         dtype = np.dtype(col_info.numpy_type)
         path = os.path.join(memmap_dir, f"{name}.dat")
+        size = total_rows * dtype.itemsize
+        total_memmap_size += size
         memmap_arrays[name] = np.memmap(
             path, mode="w+", dtype=dtype, shape=(total_rows,)
         )
+
+    log.info(f"📊 Memory-mapped arrays: {format_memory_size(total_memmap_size)} total")
 
     # Calculate chunk sizes
     chunk_size = math.ceil(total_rows / num_threads)
@@ -985,7 +1103,14 @@ def process_parquet_to_memmap(
     ]
 
     # Process in parallel
-    pbar = tqdm(total=total_rows, desc="Converting to memmap", leave=False, ncols=80)
+    log.info(f"⚡ Converting to memory-mapped format using {num_threads} threads...")
+    pbar = tqdm(
+        total=total_rows, 
+        desc="Converting to memmap", 
+        leave=False, 
+        ncols=80,
+        bar_format='{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}]'
+    )
 
     try:
         with ThreadPoolExecutor(max_workers=num_threads) as exe:
@@ -1010,6 +1135,7 @@ def process_parquet_to_memmap(
         pbar.close()
 
         # Switch to read mode
+        log.info("🔄 Finalizing memory-mapped arrays...")
         read_arrays = {}
         for name, col_info in column_specs.items():
             memmap_arrays[name].flush()
@@ -1032,9 +1158,11 @@ def process_parquet_to_memmap(
             else:
                 # If it's a single file
                 os.remove(parquet_file)
+            log.debug("🗑️  Cleaned up temporary Parquet files")
         except Exception as e:
             log.warning(f"Failed to remove temporary Parquet data: {e}")
 
+    log.info(f"✅ Memory-mapped conversion complete: {len(read_arrays)} arrays ready")
     return read_arrays
 
 
@@ -1279,11 +1407,12 @@ def process_input_data(
         "rowid": ("BIGINT", "int64"),  # Add rowid as replacement for row_hash
     }
 
-    log.info(f"Starting processing of input file: {input_file}")
+    log.info(f"🚀 Starting data processing pipeline")
+    log.info(f"📂 Input: {input_file}")
 
     # Detect input type and create database/view
     input_type = detect_input_type(input_file)
-    log.info(f"Detected input type: {input_type}")
+    log.info(f"🔍 Detected input type: {input_type.upper()}")
 
     # Process input based on type
     if input_type == "parquet":
@@ -1310,7 +1439,7 @@ def process_input_data(
 
     # Choose conversion method based on dataset size and user preference
     if use_direct_conversion and total_rows > 1_000_000:
-        log.info("Using direct DuckDB to memmap conversion for better performance")
+        log.info("⚡ Using direct DuckDB → memmap conversion (high performance)")
         read_arrays = process_db_to_memmap_direct(
             db_file=db_file,
             total_rows=total_rows,
@@ -1321,7 +1450,7 @@ def process_input_data(
             max_memory=max_memory,
         )
     else:
-        log.info("Using Parquet intermediate conversion")
+        log.info("💾 Using Parquet intermediate format")
         # Process Parquet to memory-mapped arrays
         read_arrays = process_parquet_to_memmap(
             db_file=db_file,
@@ -1335,7 +1464,7 @@ def process_input_data(
             output_files=output_files,
         )
     
-    log.info(f"Processed {len(read_arrays)} columns into memory-mapped arrays")
+    log.info(f"✅ Data processing complete: {len(read_arrays)} column arrays ready")
     return read_arrays, db_file
 
 

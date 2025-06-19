@@ -14,13 +14,17 @@ class HybridAccelerator:
     
     def __init__(self, dimension: int, anderson_memory: int = 10, lbfgs_memory: int = 10,
                  n_queries: int = None, n_subjects: int = None,
-                 mmap_dir: str = None, resource_manager=None):
+                 mmap_dir: str = None, resource_manager=None):  # Remove random_seed parameter
         self.dimension = dimension
         self.anderson_memory = anderson_memory
         self.lbfgs_memory = lbfgs_memory
         self.resource_manager = resource_manager
         
-        # Initialize both accelerators
+        # Set default random seed
+        random_seed = 42
+        np.random.seed(random_seed)
+        
+        # Initialize both accelerators without seed (they have defaults)
         self.anderson_accelerator = FastAndersonAccelerator(
             dimension=dimension,
             memory_depth=anderson_memory,

@@ -30,7 +30,7 @@ def reassign_reads_mmap(
     min_improvement: float = 1e-4,
     adaptive_convergence: bool = False,
     max_memory: Optional[str] = None,
-    selection_mode: str = "primary",  # Keep primary but with improved logic
+    selection_mode: str = "primary",
     reference_bias: float = 0.0,
     handle_ties: str = "keep_all",
     min_assignment_confidence: float = 0.01,
@@ -38,13 +38,13 @@ def reassign_reads_mmap(
     acceleration_method: str = "hybrid",
     anderson_memory: int = 10,
     lbfgs_memory: int = 10,
-    # Enhanced parameters
     lambda_scale: float = 3.0,
     temperature: float = 0.03,
     use_enhanced_em: bool = True,
+    random_seed: int = 42,
 ) -> list:
     """
-    Enhanced read reassignment with guaranteed read coverage.
+    Enhanced read reassignment with deterministic behavior.
     
     Args:
         filtered_arrays: Dictionary of memory-mapped arrays containing alignment data
@@ -72,7 +72,10 @@ def reassign_reads_mmap(
         List of row IDs for reassigned alignments
     """
     
-    log.info(f"Starting ultra-fast read reassignment using {acceleration_method.upper()} acceleration")
+    log.info(f"Starting deterministic read reassignment using {acceleration_method.upper()} acceleration (seed: {random_seed})")
+    
+    # Set global random seed for reproducibility
+    np.random.seed(random_seed)
     
     # Initialize ResourceManager
     from x_filter.resource_management import ResourceManager
@@ -169,7 +172,7 @@ def reassign_reads_mmap(
         em_data, mmap_dir=mmap_dir, max_memory=max_memory
     )
     
-    # Use enhanced EM implementation
+    # Use enhanced EM implementation with seed
     result = accelerated_resolve_multimaps(
         initialized_data,
         iters=reassign_iters,
@@ -184,6 +187,7 @@ def reassign_reads_mmap(
         lambda_scale=lambda_scale,  # Pass enhanced parameters
         temperature=temperature,
         use_enhanced_em=use_enhanced_em,
+        random_seed=random_seed,  # Pass seed to EM
     )
     
     log.info(f"Ultra-fast {acceleration_method.upper()} algorithm completed")
@@ -390,57 +394,56 @@ def reassign_reads_mmap(
                 SELECT * FROM read_parquet('{parquet_path}')
             """)
             
-            implement_selection_mode(
+            selected_results = implement_selection_mode(
                 con, selection_mode, reference_bias, handle_ties,
-                min_assignment_confidence, min_confidence_margin
+                min_assignment_confidence, min_confidence_margin,
+                random_seed
             )
             
-            selected_indices = con.execute("""
-                SELECT selected_rowid FROM selected_alignments ORDER BY selected_rowid
-            """).fetchnumpy()['selected_rowid']
-        
-        # Clean up
-        try:
-            os.unlink(parquet_path)
-        except Exception as e:
-            log.warning(f"Could not clean up temporary file {parquet_path}: {e}")
-        
-        log.info(f"✅ Selection filtering complete:")
-        log.info(f"  📊 Input alignments: {actual_n_alignments:,}")
-        log.info(f"  ✅ Selected alignments: {len(selected_indices):,}")
-        log.info(f"  🗑️  Filtered out: {actual_n_alignments - len(selected_indices):,} ({(actual_n_alignments - len(selected_indices))/actual_n_alignments*100:.1f}%)")
-        
-        if len(selected_indices) > 0:
-            # Handle structured array result for probability extraction
-            if hasattr(result, 'dtype') and result.dtype.names is not None:
-                selected_probs = result["prob"][np.isin(result["orig_idx"], selected_indices)]
-            else:
-                selected_probs = result["prob"][np.isin(result["orig_idx"], selected_indices)]
-            log.info(f"  📈 Selected prob range: {np.min(selected_probs):.4f} to {np.max(selected_probs):.4f}")
-            log.info(f"  📊 Selected prob mean: {np.mean(selected_probs):.4f}")
-    
+            # Clean up temporary parquet file
+            try:
+                os.unlink(parquet_path)
+            except OSError:
+                pass
+            
+            log.info(f"Selection mode filtering completed: {len(selected_results):,} alignments selected")
+            
+            # Extract selected row IDs
+            selected_rowids = [row[0] for row in selected_results]
+            return selected_rowids
+            
     except Exception as e:
-        log.error(f"❌ Error during selection filtering: {str(e)}")
-        log.info("🔄 Falling back to returning all alignments")
-        return result["orig_idx"].tolist()
-    
-    # Ensure we always return a valid list
-    if selected_indices is None or len(selected_indices) == 0:
-        log.warning("⚠️  No alignments selected by filtering criteria")
-        return []
-    
-    return selected_indices.tolist()
+        log.error(f"Error in selection mode processing: {e}")
+        import traceback
+        log.error(f"Full traceback: {traceback.format_exc()}")
+        
+        # Clean up any temporary files
+        try:
+            if original_query_ids is not None:
+                del original_query_ids
+            if original_subject_ids is not None:
+                del original_subject_ids
+            if 'parquet_path' in locals():
+                os.unlink(parquet_path)
+        except:
+            pass
+        
+        # Return all original indices as fallback
+        return list(range(n_alignments))
 
 def reassign(args):
     """Entry point function for CLI that calls reassign_reads_mmap with arguments from argparse"""
-    log.info(f"Starting reassignment with acceleration method: {getattr(args, 'acceleration_method', 'hybrid')}")
+    # Extract seed from args or use default
+    random_seed = getattr(args, 'random_seed', 42)
+    
+    log.info(f"Starting reassignment with acceleration method: {getattr(args, 'acceleration_method', 'hybrid')} (seed: {random_seed})")
     
     # Extract parameters from args object
     filtered_arrays = getattr(args, 'filtered_arrays', {})
     mmap_dir = getattr(args, 'mmap_dir', '/tmp')
     threads = getattr(args, 'threads', 1)
     reassign_iters = getattr(args, 'n_iters', 25)
-    min_improvement = getattr(args, 'min_improvement', 1e-4)  # Simplified
+    min_improvement = getattr(args, 'min_improvement', 1e-4)
     adaptive_convergence = getattr(args, 'adaptive_convergence', False)
     max_memory = getattr(args, 'max_memory', None)
     
@@ -459,8 +462,8 @@ def reassign(args):
     # Call the actual reassignment implementation
     return reassign_reads_mmap(
         filtered_arrays=filtered_arrays,
-        unique_query_ids=np.array([]),  # Will be computed inside the function
-        unique_subject_ids=np.array([]),  # Will be computed inside the function
+        unique_query_ids=np.array([]),
+        unique_subject_ids=np.array([]),
         mmap_dir=mmap_dir,
         threads=threads,
         reassign_iters=reassign_iters,
@@ -475,6 +478,7 @@ def reassign(args):
         acceleration_method=acceleration_method,
         anderson_memory=anderson_memory,
         lbfgs_memory=lbfgs_memory,
+        random_seed=random_seed,
     )
 
 @njit(fastmath=True, parallel=True)
@@ -955,68 +959,45 @@ def reassign_multimapping_reads(
     max_memory: Union[str, int] = None,
     threads: int = None,
     adaptive_convergence: bool = False,
+    random_seed: int = 42,
     **kwargs
 ) -> Dict[str, Any]:
     """
-    Main function to reassign multi-mapping reads using EM algorithm.
+    Main function to reassign multi-mapping reads using EM algorithm with deterministic behavior.
     """
-    log.info("Starting multi-mapping read reassignment")
+    log.info(f"Starting deterministic multi-mapping read reassignment (seed: {random_seed})")
+    
+    # Set global random seed
+    np.random.seed(random_seed)
     
     # Validate input data
     if data is None:
         raise ValueError("Input data cannot be None")
     
-    # CRITICAL: Get n_elements from actual array length, not dictionary length
+    # Get n_elements from actual array length
     if isinstance(data, dict):
-        # For dictionary, get length from one of the main arrays
         n_elements = len(data["source"]) if "source" in data else 0
         if n_elements == 0 and "var" in data:
             n_elements = len(data["var"])
         expected_size = n_elements
     elif hasattr(data, 'dtype') and data.dtype.names is not None:
-        # For structured array, use standard len()
         n_elements = len(data)
         expected_size = n_elements
     else:
-        # Unknown structure - try to get length
         n_elements = len(data) if hasattr(data, '__len__') else 0
         expected_size = n_elements
     
-    # CRITICAL: Add comprehensive data flow tracing
-    trace_data_flow(data, "FUNCTION_INPUT", expected_size=expected_size)
-    
-    # CRITICAL: Validate input data integrity
+    # Validate input data integrity
     is_valid, validated_elements, error_msg = validate_data_integrity(data, "INPUT")
     if not is_valid:
         log.error(f"Input data validation failed: {error_msg}")
-        
-        # CRITICAL: This is where we need to investigate!
-        log.error("=== CRITICAL DATA LOSS INVESTIGATION ===")
-        log.error("The input data to this function already contains only a few elements")
-        log.error("This means the data loss occurred BEFORE this function was called")
-        log.error("Check the calling code and data processing pipeline!")
-        log.error("=== END INVESTIGATION ===")
-        
         raise ValueError(f"Invalid input data: {error_msg}")
     
     log.info(f"Input validation PASSED: {validated_elements:,} alignments")
-    
-    # Use validated_elements instead of n_elements for consistency
     n_elements = validated_elements
     
-    # CRITICAL: Early warning for very small datasets
-    if n_elements < 1000:
-        log.error("=== CRITICAL: MASSIVE DATA LOSS DETECTED ===")
-        log.error(f"Expected ~55M alignments but only received {n_elements}")
-        log.error("This indicates a severe problem in the data processing pipeline")
-        log.error("The data loss occurred BEFORE the EM algorithm")
-        log.error("=== INVESTIGATION REQUIRED ===")
-        
-        # Still try to process what we have, but with warnings
-        log.warning("Attempting to process the small dataset anyway...")
-    
     try:
-        # Call the EM algorithm
+        # Call the EM algorithm with seed
         result_data = accelerated_resolve_multimaps(
             data=data,
             iters=max_iterations,
@@ -1027,42 +1008,34 @@ def reassign_multimapping_reads(
             adaptive_convergence=adaptive_convergence,
             acceleration_method=acceleration_method,
             lambda_scale=lambda_scale,
+            random_seed=random_seed,
             **kwargs
         )
-        
-        # CRITICAL: Trace data flow after EM
-        trace_data_flow(result_data, "EM_OUTPUT", expected_size=n_elements)
-        
-        # CRITICAL: Validate output data integrity
+
+        # Validate output data integrity
         is_valid, output_elements, error_msg = validate_data_integrity(result_data, "OUTPUT")
         if not is_valid:
             log.error(f"Output data validation failed: {error_msg}")
-            # Try to return original data with uniform probabilities as fallback
             uniform_probs = np.full(n_elements, 1.0 / n_elements, dtype=np.float64)
             return ensure_data_has_prob_field(data, uniform_probs, 0)
         
         # Ensure the result has the required fields
         if isinstance(result_data, dict) and "prob" in result_data:
             log.info(f"EM algorithm completed successfully: {output_elements:,} alignments processed")
-            # CRITICAL: Verify prob array has correct length
             if len(result_data["prob"]) != n_elements:
                 log.error(f"Probability array length mismatch: expected {n_elements}, got {len(result_data['prob'])}")
-                # Return fallback
                 uniform_probs = np.full(n_elements, 1.0 / n_elements, dtype=np.float64)
                 return ensure_data_has_prob_field(data, uniform_probs, 0)
             return result_data
         elif hasattr(result_data, 'dtype') and result_data.dtype.names is not None and "prob" in result_data.dtype.names:
             log.info(f"EM algorithm completed successfully: {output_elements:,} alignments processed")
-            # CRITICAL: Verify structured array has correct length
             if len(result_data) != n_elements:
                 log.error(f"Result array length mismatch: expected {n_elements}, got {len(result_data)}")
-                # Return fallback
                 uniform_probs = np.full(n_elements, 1.0 / n_elements, dtype=np.float64)
                 return ensure_data_has_prob_field(data, uniform_probs, 0)
             return result_data
         else:
             log.error("EM algorithm did not return probability assignments")
-            # Create a fallback with uniform probabilities
             uniform_probs = np.full(n_elements, 1.0 / n_elements, dtype=np.float64)
             return ensure_data_has_prob_field(data, uniform_probs, 0)
     
@@ -1070,7 +1043,6 @@ def reassign_multimapping_reads(
         log.error(f"Error in reassignment: {e}")
         import traceback
         log.error(f"Full traceback: {traceback.format_exc()}")
-        # Return original data with uniform probabilities as fallback
         uniform_probs = np.full(n_elements, 1.0 / n_elements, dtype=np.float64)
         return ensure_data_has_prob_field(data, uniform_probs, 0)
 

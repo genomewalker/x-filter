@@ -15,9 +15,12 @@ from x_filter.reassign.fast_kernels import (
     ultra_fast_likelihood_billion_prealloc,
     ultra_fast_conservation_check_prealloc,
     ultra_fast_conservation_fix_prealloc,
-    ultra_fast_perfect_conservation_fix,  # ADD THIS
+    ultra_fast_perfect_conservation_fix,
     ultra_fast_global_normalization_fix,
-    compute_statistics_billion
+    compute_statistics_billion,
+    deterministic_initialize_responsibilities,
+    deterministic_normalize_responsibilities,
+    deterministic_initialize_weights
 )
 
 log = logging.getLogger("my_logger")
@@ -59,20 +62,24 @@ class ArrayManager:
                 name="em_responsibilities", shape=(n_elements,), dtype=np.float64, temp=True
             )
             log.debug(f"Created new responsibilities array (shape: {(n_elements,)})")
-            
+        
+        # CRITICAL FIX: Calculate actual max values from the data
+        max_source = np.max(self.arrays["source"]) + 1
+        max_subject = np.max(self.arrays["subject"]) + 1  # Calculate from actual data
+        
         # PRE-ALLOCATE ALL ARRAYS TO FULL SIZE - NO RESIZING DURING ITERATIONS
         log.info(f"Pre-allocating all temp arrays to full size: {max_source:,} sources, {max_subject:,} subjects")
         
         self.arrays["weights"] = self.resource_manager.create_array(
-            name="em_weights", shape=(max_subject + 1,), dtype=np.float64, temp=True
+            name="em_weights", shape=(max_subject,), dtype=np.float64, temp=True  # Remove +1
         )
         self.arrays["new_weights"] = self.resource_manager.create_array(
-            name="em_new_weights", shape=(max_subject + 1,), dtype=np.float64, temp=True
+            name="em_new_weights", shape=(max_subject,), dtype=np.float64, temp=True  # Remove +1
         )
         
         # Pre-allocate dedicated result array to avoid copying
         self.arrays["result_weights"] = self.resource_manager.create_array(
-            name="em_result_weights", shape=(max_subject + 1,), dtype=np.float64, temp=True
+            name="em_result_weights", shape=(max_subject,), dtype=np.float64, temp=True  # Remove +1
         )
         
         # CRITICAL: Pre-allocate temp arrays to FULL SIZE to avoid resizing
@@ -83,7 +90,7 @@ class ArrayManager:
             name="em_temp_source_denom", shape=(max_source,), dtype=np.float64, temp=True
         )
         self.arrays["temp_weight_sums"] = self.resource_manager.create_array(
-            name="em_temp_weight_sums", shape=(max_subject + 1,), dtype=np.float64, temp=True
+            name="em_temp_weight_sums", shape=(max_subject,), dtype=np.float64, temp=True  # Remove +1
         )
         
         # ADDITIONAL: Pre-allocate arrays for validation and statistics
@@ -99,7 +106,7 @@ class ArrayManager:
             name="em_prev_responsibilities", shape=(n_elements,), dtype=np.float64, temp=True
         )
         self.arrays["prev_weights"] = self.resource_manager.create_array(
-            name="em_prev_weights", shape=(max_subject + 1,), dtype=np.float64, temp=True
+            name="em_prev_weights", shape=(max_subject,), dtype=np.float64, temp=True  # Remove +1
         )
         
         log.info(f"Pre-allocated all arrays - memory usage optimized, no resizing needed")
@@ -615,21 +622,20 @@ def bitscore_em_step(
     log.debug("Using pre-allocated result_weights array (no copy needed)")
     return array_manager.arrays["result_weights"]
 
-@njit(fastmath=True, parallel=True)
-def enhanced_compute_responsibilities_from_bitscores(
-    source_indices: np.ndarray,      
-    subject_indices: np.ndarray,     
-    bit_scores: np.ndarray,          
-    weights: np.ndarray,             
-    lambda_scale: float,             
-    responsibilities: np.ndarray,
-    temp_source_max: np.ndarray,
-    temp_source_denom: np.ndarray,
-    temperature: float = 0.1  # Add temperature parameter for sharpening
+@njit(fastmath=True, parallel=True, cache=True)
+def vectorized_compute_responsibilities(
+    source_indices: np.ndarray,      # Read indices  
+    subject_indices: np.ndarray,     # Protein indices
+    bit_scores: np.ndarray,          # Bit scores b_{rt}
+    weights: np.ndarray,             # Protein weights w_t
+    lambda_scale: float,             # Scale parameter λ
+    responsibilities: np.ndarray,    # Output: p_{rt}
+    temp_source_max: np.ndarray,     # Temp array for max values per source
+    temp_source_denom: np.ndarray    # Temp array for denominators per source
 ) -> None:
     """
-    Enhanced E-Step with temperature scaling for better separation.
-    Lower temperature creates sharper probability distributions.
+    VECTORIZED E-Step: Compute responsibilities from bit scores using parallel softmax.
+    All operations are fully vectorized and parallelized.
     """
     n = len(source_indices)
     max_source = len(temp_source_max)
@@ -639,15 +645,15 @@ def enhanced_compute_responsibilities_from_bitscores(
         temp_source_max[i] = -np.inf
         temp_source_denom[i] = 0.0
     
-    # Enhanced score normalization with better scaling
+    # Normalize bit scores to prevent overflow - vectorized
     min_score = np.min(bit_scores)
     max_score = np.max(bit_scores)
     score_range = max_score - min_score
     
     if score_range < 1e-10:
-        # Uniform case with weight-based assignment
+        # All scores identical - parallel uniform assignment based on weights
         source_weight_sums = np.zeros(max_source, dtype=np.float64)
-        for i in range(n):
+        for i in prange(n):
             source_idx = source_indices[i]
             subject_idx = subject_indices[i]
             source_weight_sums[source_idx] += weights[subject_idx]
@@ -661,121 +667,163 @@ def enhanced_compute_responsibilities_from_bitscores(
                 responsibilities[i] = 1e-15
         return
     
-    # Enhanced normalization with quadratic scaling for better separation
-    inv_score_range = 1.0 / score_range
-    
-    # Pass 1: Find max weighted score per source with enhanced scaling
+    # Pass 1: Find max weighted score per source - fully parallel
     for i in prange(n):
         source_idx = source_indices[i]
         subject_idx = subject_indices[i]
+        # Vectorized normalization and weighting
+        norm_score = (bit_scores[i] - min_score) / score_range
+        log_weight = np.log(max(weights[subject_idx], 1e-15))
+        weighted_score = log_weight + lambda_scale * norm_score
         
-        if source_idx < max_source:
-            # Enhanced score transformation for better separation
-            norm_score = (bit_scores[i] - min_score) * inv_score_range
-            # Apply quadratic transformation to emphasize high scores
-            enhanced_score = norm_score * norm_score
-            
+        # Atomic max update (thread-safe)
+        if weighted_score > temp_source_max[source_idx]:
+            temp_source_max[source_idx] = weighted_score
+    
+    # Pass 2: Compute denominators - fully parallel
+    for i in prange(n):
+        source_idx = source_indices[i]
+        subject_idx = subject_indices[i]
+        max_val = temp_source_max[source_idx]
+        
+        norm_score = (bit_scores[i] - min_score) / score_range
+        log_weight = np.log(max(weights[subject_idx], 1e-15))
+        weighted_score = log_weight + lambda_scale * norm_score
+        
+        if max_val > -np.inf:
+            exp_val = np.exp(weighted_score - max_val)
+            temp_source_denom[source_idx] += exp_val
+        else:
+            temp_source_denom[source_idx] += 1.0
+    
+    # Pass 3: Compute final responsibilities - fully parallel
+    for i in prange(n):
+        source_idx = source_indices[i]
+        subject_idx = subject_indices[i]
+        max_val = temp_source_max[source_idx]
+        denom = temp_source_denom[source_idx]
+        
+        if denom > 1e-15 and max_val > -np.inf:
+            norm_score = (bit_scores[i] - min_score) / score_range
             log_weight = np.log(max(weights[subject_idx], 1e-15))
-            # Scale by lambda and apply temperature
-            weighted_score = log_weight + (lambda_scale * enhanced_score) / temperature
+            weighted_score = log_weight + lambda_scale * norm_score
+            exp_val = np.exp(weighted_score - max_val)
+            responsibilities[i] = exp_val / denom
+        else:
+            responsibilities[i] = 1e-15
+        
+        responsibilities[i] = max(1e-15, min(1.0, responsibilities[i]))
+
+@njit(fastmath=True, parallel=True, cache=True)
+def vectorized_update_weights(
+    subject_indices: np.ndarray,     # Protein indices
+    responsibilities: np.ndarray,    # Current responsibilities p_{rt}
+    new_weights: np.ndarray,         # Output: updated weights w_t
+    temp_weight_sums: np.ndarray     # Temp array for accumulation
+) -> None:
+    """
+    VECTORIZED M-Step: Update protein weights using parallel reduction.
+    """
+    max_subject = len(new_weights)
+    total_reads = len(subject_indices)
+    
+    # Clear arrays
+    for i in prange(max_subject):
+        temp_weight_sums[i] = 0.0
+    
+    # Parallel accumulation of responsibilities per protein
+    for i in prange(len(subject_indices)):
+        subject_idx = subject_indices[i]
+        temp_weight_sums[subject_idx] += responsibilities[i]
+    
+    # Parallel normalization
+    if total_reads > 0:
+        inv_total = 1.0 / total_reads
+        for t in prange(max_subject):
+            new_weights[t] = max(1e-15, temp_weight_sums[t] * inv_total)
+
+@njit(fastmath=True, cache=True)
+def vectorized_log_likelihood(
+    source_indices: np.ndarray,
+    subject_indices: np.ndarray,
+    bit_scores: np.ndarray,
+    weights: np.ndarray,
+    lambda_scale: float,
+    temp_source_max: np.ndarray,     # Temp array for max values
+    temp_source_sum: np.ndarray      # Temp array for sum values
+) -> float:
+    """
+    VECTORIZED log-likelihood computation using parallel reduction.
+    """
+    n = len(source_indices)
+    max_source = len(temp_source_max)
+    max_subject = len(weights)  # FIXED: Define max_subject properly
+    
+    # Bounds check
+    if n == 0 or max_source == 0 or max_subject == 0:
+        return -np.inf
+    
+    # Bounds validation
+    if len(subject_indices) != n or len(bit_scores) != n:
+        return -np.inf
+    
+    max_source_idx = np.max(source_indices)
+    max_subject_idx = np.max(subject_indices)
+    
+    if max_source_idx >= max_source or max_subject_idx >= max_subject:
+        return -np.inf
+    
+    # Clear temporary arrays
+    for i in range(max_source):
+        temp_source_max[i] = -np.inf
+        temp_source_sum[i] = 0.0
+    
+    # Normalize bit scores
+    min_score = np.min(bit_scores)
+    max_score = np.max(bit_scores)
+    score_range = max_score - min_score
+    
+    if score_range < 1e-10:
+        score_range = 1.0
+    
+    # Pass 1: Find max weighted score per source - sequential
+    for i in range(n):
+        source_idx = source_indices[i]
+        subject_idx = subject_indices[i]
+        
+        if source_idx < max_source and subject_idx < max_subject:
+            norm_score = (bit_scores[i] - min_score) / score_range
+            log_weight = np.log(max(weights[subject_idx], 1e-15))
+            weighted_score = log_weight + lambda_scale * norm_score
             
             if weighted_score > temp_source_max[source_idx]:
                 temp_source_max[source_idx] = weighted_score
     
-    # Pass 2: Compute denominators with temperature scaling
-    for i in prange(n):
+    # Pass 2: Compute log-sum-exp per source - sequential
+    for i in range(n):
         source_idx = source_indices[i]
         subject_idx = subject_indices[i]
         
-        if source_idx < max_source:
+        if source_idx < max_source and subject_idx < max_subject:
             max_val = temp_source_max[source_idx]
-            if max_val > -np.inf:
-                norm_score = (bit_scores[i] - min_score) * inv_score_range
-                enhanced_score = norm_score * norm_score
-                log_weight = np.log(max(weights[subject_idx], 1e-15))
-                weighted_score = log_weight + (lambda_scale * enhanced_score) / temperature
-                
-                exp_val = np.exp(weighted_score - max_val)
-                temp_source_denom[source_idx] += exp_val
-    
-    # Pass 3: Compute final responsibilities with enhanced precision
-    for i in prange(n):
-        source_idx = source_indices[i]
-        subject_idx = subject_indices[i]
-        
-        if source_idx < max_source:
-            max_val = temp_source_max[source_idx]
-            denom = temp_source_denom[source_idx]
             
-            if denom > 1e-15 and max_val > -np.inf:
-                norm_score = (bit_scores[i] - min_score) * inv_score_range
-                enhanced_score = norm_score * norm_score
+            if max_val > -np.inf:
+                norm_score = (bit_scores[i] - min_score) / score_range
                 log_weight = np.log(max(weights[subject_idx], 1e-15))
-                weighted_score = log_weight + (lambda_scale * enhanced_score) / temperature
-                
+                weighted_score = log_weight + lambda_scale * norm_score
                 exp_val = np.exp(weighted_score - max_val)
-                prob = exp_val / denom
-                responsibilities[i] = max(1e-15, min(1.0, prob))
-            else:
-                responsibilities[i] = 1e-15
-        else:
-            responsibilities[i] = 1e-15
+                temp_source_sum[source_idx] += exp_val
+    
+    # Pass 3: Sum log-likelihood - sequential to avoid race conditions
+    total_log_likelihood = 0.0
+    for source_idx in range(max_source):
+        if temp_source_max[source_idx] > -np.inf and temp_source_sum[source_idx] > 0:
+            query_log_prob = temp_source_max[source_idx] + np.log(temp_source_sum[source_idx])
+            total_log_likelihood += query_log_prob
+    
+    return total_log_likelihood
 
-def enhanced_bitscore_em_step(
-    source_indices: np.ndarray,
-    subject_indices: np.ndarray, 
-    bit_scores: np.ndarray,
-    current_weights: np.ndarray,
-    array_manager: ArrayManager,
-    lambda_scale: float = 2.0,  # Increased lambda for better separation
-    temperature: float = 0.05,  # Lower temperature for sharper probabilities
-    verbose: bool = False
-) -> np.ndarray:
-    """
-    Enhanced EM step with better parameter tuning for improved separation.
-    """
-    if verbose:
-        log.debug(f"  Enhanced EM Step - λ={lambda_scale}, T={temperature}")
-        log.debug(f"  Input weights range: {np.min(current_weights):.6f} to {np.max(current_weights):.6f}")
-    
-    # Enhanced E-step with temperature scaling
-    enhanced_compute_responsibilities_from_bitscores(
-        source_indices,
-        subject_indices,
-        bit_scores,
-        current_weights,
-        lambda_scale,
-        array_manager.arrays["responsibilities"],
-        array_manager.arrays["temp_source_max"],
-        array_manager.arrays["temp_source_denom"],
-        temperature
-    )
-    
-    if verbose:
-        resp = array_manager.arrays["responsibilities"]
-        high_conf = np.sum(resp > 0.95) / len(resp) * 100
-        med_conf = np.sum(resp > 0.5) / len(resp) * 100
-        low_conf = np.sum(resp < 0.01) / len(resp) * 100
-        log.debug(f"  Enhanced E-Step - High conf: {high_conf:.1f}%, Med: {med_conf:.1f}%, Low: {low_conf:.1f}%")
-    
-    # Standard M-step
-    update_weights_from_responsibilities(
-        subject_indices,
-        array_manager.arrays["responsibilities"],
-        array_manager.arrays["new_weights"]
-    )
-    
-    # Apply weight smoothing to prevent overfitting
-    smoothing_factor = 0.95
-    array_manager.arrays["new_weights"][:] = (
-        smoothing_factor * array_manager.arrays["new_weights"] + 
-        (1 - smoothing_factor) * current_weights
-    )
-    
-    array_manager.arrays["result_weights"][:] = array_manager.arrays["new_weights"]
-    return array_manager.arrays["result_weights"]
-
-def ultra_fast_bitscore_em_step(
+def bitscore_em_step(
     source_indices: np.ndarray,
     subject_indices: np.ndarray, 
     bit_scores: np.ndarray,
@@ -785,32 +833,588 @@ def ultra_fast_bitscore_em_step(
     verbose: bool = False
 ) -> np.ndarray:
     """
-    ULTRA-FAST EM step using pre-allocated arrays and optimized kernels.
-    NO array resizing or allocation during execution.
+    Single EM step: E-step + M-step with verbose debugging.
+    Returns updated weights.
+    """
+    if verbose:
+        log.debug(f"  EM Step - Input weights range: {np.min(current_weights):.6f} to {np.max(current_weights):.6f}")
+        log.debug(f"  EM Step - Weight sum: {np.sum(current_weights):.6f}")
+    
+    # E-step: Compute responsibilities from bit scores
+    compute_responsibilities_from_bitscores(
+        source_indices,
+        subject_indices,
+        bit_scores,
+        current_weights,
+        lambda_scale,
+        array_manager.arrays["responsibilities"]
+    )
+    
+    if verbose:
+        resp = array_manager.arrays["responsibilities"]
+        log.debug(f"  E-Step - Responsibility range: {np.min(resp):.6f} to {np.max(resp):.6f}")
+        log.debug(f"  E-Step - Mean responsibility: {np.mean(resp):.6f}")
+        log.debug(f"  E-Step - High confidence (>0.9): {np.sum(resp > 0.9)} / {len(resp)} ({np.sum(resp > 0.9)/len(resp)*100:.1f}%)")
+    
+    # M-step: Update weights from responsibilities
+    update_weights_from_responsibilities(
+        subject_indices,
+        array_manager.arrays["responsibilities"],
+        array_manager.arrays["new_weights"]
+    )
+    
+    # AVOID COPYING: Use pre-allocated result array
+    array_manager.arrays["result_weights"][:] = array_manager.arrays["new_weights"]
+    log.debug("Using pre-allocated result_weights array (no copy needed)")
+    return array_manager.arrays["result_weights"]
+
+@njit(fastmath=True, parallel=True, cache=True)
+def vectorized_compute_responsibilities(
+    source_indices: np.ndarray,      # Read indices  
+    subject_indices: np.ndarray,     # Protein indices
+    bit_scores: np.ndarray,          # Bit scores b_{rt}
+    weights: np.ndarray,             # Protein weights w_t
+    lambda_scale: float,             # Scale parameter λ
+    responsibilities: np.ndarray,    # Output: p_{rt}
+    temp_source_max: np.ndarray,     # Temp array for max values per source
+    temp_source_denom: np.ndarray    # Temp array for denominators per source
+) -> None:
+    """
+    VECTORIZED E-Step: Compute responsibilities from bit scores using parallel softmax.
+    All operations are fully vectorized and parallelized.
+    """
+    n = len(source_indices)
+    max_source = len(temp_source_max)
+    
+    # Clear temporary arrays
+    for i in prange(max_source):
+        temp_source_max[i] = -np.inf
+        temp_source_denom[i] = 0.0
+    
+    # Normalize bit scores to prevent overflow - vectorized
+    min_score = np.min(bit_scores)
+    max_score = np.max(bit_scores)
+    score_range = max_score - min_score
+    
+    if score_range < 1e-10:
+        # All scores identical - parallel uniform assignment based on weights
+        source_weight_sums = np.zeros(max_source, dtype=np.float64)
+        for i in prange(n):
+            source_idx = source_indices[i]
+            subject_idx = subject_indices[i]
+            source_weight_sums[source_idx] += weights[subject_idx]
+        
+        for i in prange(n):
+            source_idx = source_indices[i]
+            subject_idx = subject_indices[i]
+            if source_weight_sums[source_idx] > 1e-15:
+                responsibilities[i] = weights[subject_idx] / source_weight_sums[source_idx]
+            else:
+                responsibilities[i] = 1e-15
+        return
+    
+    # Pass 1: Find max weighted score per source - fully parallel
+    for i in prange(n):
+        source_idx = source_indices[i]
+        subject_idx = subject_indices[i]
+        # Vectorized normalization and weighting
+        norm_score = (bit_scores[i] - min_score) / score_range
+        log_weight = np.log(max(weights[subject_idx], 1e-15))
+        weighted_score = log_weight + lambda_scale * norm_score
+        
+        # Atomic max update (thread-safe)
+        if weighted_score > temp_source_max[source_idx]:
+            temp_source_max[source_idx] = weighted_score
+    
+    # Pass 2: Compute denominators - fully parallel
+    for i in prange(n):
+        source_idx = source_indices[i]
+        subject_idx = subject_indices[i]
+        max_val = temp_source_max[source_idx]
+        
+        norm_score = (bit_scores[i] - min_score) / score_range
+        log_weight = np.log(max(weights[subject_idx], 1e-15))
+        weighted_score = log_weight + lambda_scale * norm_score
+        
+        if max_val > -np.inf:
+            exp_val = np.exp(weighted_score - max_val)
+            temp_source_denom[source_idx] += exp_val
+        else:
+            temp_source_denom[source_idx] += 1.0
+    
+    # Pass 3: Compute final responsibilities - fully parallel
+    for i in prange(n):
+        source_idx = source_indices[i]
+        subject_idx = subject_indices[i]
+        max_val = temp_source_max[source_idx]
+        denom = temp_source_denom[source_idx]
+        
+        if denom > 1e-15 and max_val > -np.inf:
+            norm_score = (bit_scores[i] - min_score) / score_range
+            log_weight = np.log(max(weights[subject_idx], 1e-15))
+            weighted_score = log_weight + lambda_scale * norm_score
+            exp_val = np.exp(weighted_score - max_val)
+            responsibilities[i] = exp_val / denom
+        else:
+            responsibilities[i] = 1e-15
+        
+        responsibilities[i] = max(1e-15, min(1.0, responsibilities[i]))
+
+@njit(fastmath=True, parallel=True, cache=True)
+def vectorized_update_weights(
+    subject_indices: np.ndarray,     # Protein indices
+    responsibilities: np.ndarray,    # Current responsibilities p_{rt}
+    new_weights: np.ndarray,         # Output: updated weights w_t
+    temp_weight_sums: np.ndarray     # Temp array for accumulation
+) -> None:
+    """
+    VECTORIZED M-Step: Update protein weights using parallel reduction.
+    """
+    max_subject = len(new_weights)
+    total_reads = len(subject_indices)
+    
+    # Clear arrays
+    for i in prange(max_subject):
+        temp_weight_sums[i] = 0.0
+    
+    # Parallel accumulation of responsibilities per protein
+    for i in prange(len(subject_indices)):
+        subject_idx = subject_indices[i]
+        temp_weight_sums[subject_idx] += responsibilities[i]
+    
+    # Parallel normalization
+    if total_reads > 0:
+        inv_total = 1.0 / total_reads
+        for t in prange(max_subject):
+            new_weights[t] = max(1e-15, temp_weight_sums[t] * inv_total)
+
+@njit(fastmath=True, cache=True)
+def vectorized_log_likelihood(
+    source_indices: np.ndarray,
+    subject_indices: np.ndarray,
+    bit_scores: np.ndarray,
+    weights: np.ndarray,
+    lambda_scale: float,
+    temp_source_max: np.ndarray,     # Temp array for max values
+    temp_source_sum: np.ndarray      # Temp array for sum values
+) -> float:
+    """
+    VECTORIZED log-likelihood computation using parallel reduction.
+    """
+    n = len(source_indices)
+    max_source = len(temp_source_max)
+    max_subject = len(weights)  # FIXED: Define max_subject properly
+    
+    # Bounds check
+    if n == 0 or max_source == 0 or max_subject == 0:
+        return -np.inf
+    
+    # Bounds validation
+    if len(subject_indices) != n or len(bit_scores) != n:
+        return -np.inf
+    
+    max_source_idx = np.max(source_indices)
+    max_subject_idx = np.max(subject_indices)
+    
+    if max_source_idx >= max_source or max_subject_idx >= max_subject:
+        return -np.inf
+    
+    # Clear temporary arrays
+    for i in range(max_source):
+        temp_source_max[i] = -np.inf
+        temp_source_sum[i] = 0.0
+    
+    # Normalize bit scores
+    min_score = np.min(bit_scores)
+    max_score = np.max(bit_scores)
+    score_range = max_score - min_score
+    
+    if score_range < 1e-10:
+        score_range = 1.0
+    
+    # Pass 1: Find max weighted score per source - sequential
+    for i in range(n):
+        source_idx = source_indices[i]
+        subject_idx = subject_indices[i]
+        
+        if source_idx < max_source and subject_idx < max_subject:
+            norm_score = (bit_scores[i] - min_score) / score_range
+            log_weight = np.log(max(weights[subject_idx], 1e-15))
+            weighted_score = log_weight + lambda_scale * norm_score
+            
+            if weighted_score > temp_source_max[source_idx]:
+                temp_source_max[source_idx] = weighted_score
+    
+    # Pass 2: Compute log-sum-exp per source - sequential
+    for i in range(n):
+        source_idx = source_indices[i]
+        subject_idx = subject_indices[i]
+        
+        if source_idx < max_source and subject_idx < max_subject:
+            max_val = temp_source_max[source_idx]
+            
+            if max_val > -np.inf:
+                norm_score = (bit_scores[i] - min_score) / score_range
+                log_weight = np.log(max(weights[subject_idx], 1e-15))
+                weighted_score = log_weight + lambda_scale * norm_score
+                exp_val = np.exp(weighted_score - max_val)
+                temp_source_sum[source_idx] += exp_val
+    
+    # Pass 3: Sum log-likelihood - sequential to avoid race conditions
+    total_log_likelihood = 0.0
+    for source_idx in range(max_source):
+        if temp_source_max[source_idx] > -np.inf and temp_source_sum[source_idx] > 0:
+            query_log_prob = temp_source_max[source_idx] + np.log(temp_source_sum[source_idx])
+            total_log_likelihood += query_log_prob
+    
+    return total_log_likelihood
+
+def bitscore_em_step(
+    source_indices: np.ndarray,
+    subject_indices: np.ndarray, 
+    bit_scores: np.ndarray,
+    current_weights: np.ndarray,
+    array_manager: ArrayManager,
+    lambda_scale: float = 1.0,
+    verbose: bool = False
+) -> np.ndarray:
+    """
+    Single EM step: E-step + M-step with verbose debugging.
+    Returns updated weights.
+    """
+    if verbose:
+        log.debug(f"  EM Step - Input weights range: {np.min(current_weights):.6f} to {np.max(current_weights):.6f}")
+        log.debug(f"  EM Step - Weight sum: {np.sum(current_weights):.6f}")
+    
+    # E-step: Compute responsibilities from bit scores
+    compute_responsibilities_from_bitscores(
+        source_indices,
+        subject_indices,
+        bit_scores,
+        current_weights,
+        lambda_scale,
+        array_manager.arrays["responsibilities"]
+    )
+    
+    if verbose:
+        resp = array_manager.arrays["responsibilities"]
+        log.debug(f"  E-Step - Responsibility range: {np.min(resp):.6f} to {np.max(resp):.6f}")
+        log.debug(f"  E-Step - Mean responsibility: {np.mean(resp):.6f}")
+        log.debug(f"  E-Step - High confidence (>0.9): {np.sum(resp > 0.9)} / {len(resp)} ({np.sum(resp > 0.9)/len(resp)*100:.1f}%)")
+    
+    # M-step: Update weights from responsibilities
+    update_weights_from_responsibilities(
+        subject_indices,
+        array_manager.arrays["responsibilities"],
+        array_manager.arrays["new_weights"]
+    )
+    
+    # AVOID COPYING: Use pre-allocated result array
+    array_manager.arrays["result_weights"][:] = array_manager.arrays["new_weights"]
+    log.debug("Using pre-allocated result_weights array (no copy needed)")
+    return array_manager.arrays["result_weights"]
+
+@njit(fastmath=True, parallel=True, cache=True)
+def vectorized_compute_responsibilities(
+    source_indices: np.ndarray,      # Read indices  
+    subject_indices: np.ndarray,     # Protein indices
+    bit_scores: np.ndarray,          # Bit scores b_{rt}
+    weights: np.ndarray,             # Protein weights w_t
+    lambda_scale: float,             # Scale parameter λ
+    responsibilities: np.ndarray,    # Output: p_{rt}
+    temp_source_max: np.ndarray,     # Temp array for max values per source
+    temp_source_denom: np.ndarray    # Temp array for denominators per source
+) -> None:
+    """
+    VECTORIZED E-Step: Compute responsibilities from bit scores using parallel softmax.
+    All operations are fully vectorized and parallelized.
+    """
+    n = len(source_indices)
+    max_source = len(temp_source_max)
+    
+    # Clear temporary arrays
+    for i in prange(max_source):
+        temp_source_max[i] = -np.inf
+        temp_source_denom[i] = 0.0
+    
+    # Normalize bit scores to prevent overflow - vectorized
+    min_score = np.min(bit_scores)
+    max_score = np.max(bit_scores)
+    score_range = max_score - min_score
+    
+    if score_range < 1e-10:
+        # All scores identical - parallel uniform assignment based on weights
+        source_weight_sums = np.zeros(max_source, dtype=np.float64)
+        for i in prange(n):
+            source_idx = source_indices[i]
+            subject_idx = subject_indices[i]
+            source_weight_sums[source_idx] += weights[subject_idx]
+        
+        for i in prange(n):
+            source_idx = source_indices[i]
+            subject_idx = subject_indices[i]
+            if source_weight_sums[source_idx] > 1e-15:
+                responsibilities[i] = weights[subject_idx] / source_weight_sums[source_idx]
+            else:
+                responsibilities[i] = 1e-15
+        return
+    
+    # Pass 1: Find max weighted score per source - fully parallel
+    for i in prange(n):
+        source_idx = source_indices[i]
+        subject_idx = subject_indices[i]
+        # Vectorized normalization and weighting
+        norm_score = (bit_scores[i] - min_score) / score_range
+        log_weight = np.log(max(weights[subject_idx], 1e-15))
+        weighted_score = log_weight + lambda_scale * norm_score
+        
+        # Atomic max update (thread-safe)
+        if weighted_score > temp_source_max[source_idx]:
+            temp_source_max[source_idx] = weighted_score
+    
+    # Pass 2: Compute denominators - fully parallel
+    for i in prange(n):
+        source_idx = source_indices[i]
+        subject_idx = subject_indices[i]
+        max_val = temp_source_max[source_idx]
+        
+        norm_score = (bit_scores[i] - min_score) / score_range
+        log_weight = np.log(max(weights[subject_idx], 1e-15))
+        weighted_score = log_weight + lambda_scale * norm_score
+        
+        if max_val > -np.inf:
+            exp_val = np.exp(weighted_score - max_val)
+            temp_source_denom[source_idx] += exp_val
+        else:
+            temp_source_denom[source_idx] += 1.0
+    
+    # Pass 3: Compute final responsibilities - fully parallel
+    for i in prange(n):
+        source_idx = source_indices[i]
+        subject_idx = subject_indices[i]
+        max_val = temp_source_max[source_idx]
+        denom = temp_source_denom[source_idx]
+        
+        if denom > 1e-15 and max_val > -np.inf:
+            norm_score = (bit_scores[i] - min_score) / score_range
+            log_weight = np.log(max(weights[subject_idx], 1e-15))
+            weighted_score = log_weight + lambda_scale * norm_score
+            exp_val = np.exp(weighted_score - max_val)
+            responsibilities[i] = exp_val / denom
+        else:
+            responsibilities[i] = 1e-15
+        
+        responsibilities[i] = max(1e-15, min(1.0, responsibilities[i]))
+
+@njit(fastmath=True, parallel=True, cache=True)
+def vectorized_update_weights(
+    subject_indices: np.ndarray,     # Protein indices
+    responsibilities: np.ndarray,    # Current responsibilities p_{rt}
+    new_weights: np.ndarray,         # Output: updated weights w_t
+    temp_weight_sums: np.ndarray     # Temp array for accumulation
+) -> None:
+    """
+    VECTORIZED M-Step: Update protein weights using parallel reduction.
+    """
+    max_subject = len(new_weights)
+    total_reads = len(subject_indices)
+    
+    # Clear arrays
+    for i in prange(max_subject):
+        temp_weight_sums[i] = 0.0
+    
+    # Parallel accumulation of responsibilities per protein
+    for i in prange(len(subject_indices)):
+        subject_idx = subject_indices[i]
+        temp_weight_sums[subject_idx] += responsibilities[i]
+    
+    # Parallel normalization
+    if total_reads > 0:
+        inv_total = 1.0 / total_reads
+        for t in prange(max_subject):
+            new_weights[t] = max(1e-15, temp_weight_sums[t] * inv_total)
+
+@njit(fastmath=True, cache=True)
+def vectorized_log_likelihood(
+    source_indices: np.ndarray,
+    subject_indices: np.ndarray,
+    bit_scores: np.ndarray,
+    weights: np.ndarray,
+    lambda_scale: float,
+    temp_source_max: np.ndarray,     # Temp array for max values
+    temp_source_sum: np.ndarray      # Temp array for sum values
+) -> float:
+    """
+    VECTORIZED log-likelihood computation using parallel reduction.
+    """
+    n = len(source_indices)
+    max_source = len(temp_source_max)
+    max_subject = len(weights)  # FIXED: Define max_subject properly
+    
+    # Bounds check
+    if n == 0 or max_source == 0 or max_subject == 0:
+        return -np.inf
+    
+    # Bounds validation
+    if len(subject_indices) != n or len(bit_scores) != n:
+        return -np.inf
+    
+    max_source_idx = np.max(source_indices)
+    max_subject_idx = np.max(subject_indices)
+    
+    if max_source_idx >= max_source or max_subject_idx >= max_subject:
+        return -np.inf
+    
+    # Clear temporary arrays
+    for i in range(max_source):
+        temp_source_max[i] = -np.inf
+        temp_source_sum[i] = 0.0
+    
+    # Normalize bit scores
+    min_score = np.min(bit_scores)
+    max_score = np.max(bit_scores)
+    score_range = max_score - min_score
+    
+    if score_range < 1e-10:
+        score_range = 1.0
+    
+    # Pass 1: Find max weighted score per source - sequential
+    for i in range(n):
+        source_idx = source_indices[i]
+        subject_idx = subject_indices[i]
+        
+        if source_idx < max_source and subject_idx < max_subject:
+            norm_score = (bit_scores[i] - min_score) / score_range
+            log_weight = np.log(max(weights[subject_idx], 1e-15))
+            weighted_score = log_weight + lambda_scale * norm_score
+            
+            if weighted_score > temp_source_max[source_idx]:
+                temp_source_max[source_idx] = weighted_score
+    
+    # Pass 2: Compute log-sum-exp per source - sequential
+    for i in range(n):
+        source_idx = source_indices[i]
+        subject_idx = subject_indices[i]
+        
+        if source_idx < max_source and subject_idx < max_subject:
+            max_val = temp_source_max[source_idx]
+            
+            if max_val > -np.inf:
+                norm_score = (bit_scores[i] - min_score) / score_range
+                log_weight = np.log(max(weights[subject_idx], 1e-15))
+                weighted_score = log_weight + lambda_scale * norm_score
+                exp_val = np.exp(weighted_score - max_val)
+                temp_source_sum[source_idx] += exp_val
+    
+    # Pass 3: Sum log-likelihood - sequential to avoid race conditions
+    total_log_likelihood = 0.0
+    for source_idx in range(max_source):
+        if temp_source_max[source_idx] > -np.inf and temp_source_sum[source_idx] > 0:
+            query_log_prob = temp_source_max[source_idx] + np.log(temp_source_sum[source_idx])
+            total_log_likelihood += query_log_prob
+    
+    return total_log_likelihood
+
+def bitscore_em_step(
+    source_indices: np.ndarray,
+    subject_indices: np.ndarray, 
+    bit_scores: np.ndarray,
+    current_weights: np.ndarray,
+    array_manager: ArrayManager,
+    lambda_scale: float = 1.0,
+    verbose: bool = False
+) -> np.ndarray:
+    """
+    Single EM step: E-step + M-step with verbose debugging.
+    Returns updated weights.
+    """
+    if verbose:
+        log.debug(f"  EM Step - Input weights range: {np.min(current_weights):.6f} to {np.max(current_weights):.6f}")
+        log.debug(f"  EM Step - Weight sum: {np.sum(current_weights):.6f}")
+    
+    # E-step: Compute responsibilities from bit scores
+    compute_responsibilities_from_bitscores(
+        source_indices,
+        subject_indices,
+        bit_scores,
+        current_weights,
+        lambda_scale,
+        array_manager.arrays["responsibilities"]
+    )
+    
+    if verbose:
+        resp = array_manager.arrays["responsibilities"]
+        log.debug(f"  E-Step - Responsibility range: {np.min(resp):.6f} to {np.max(resp):.6f}")
+        log.debug(f"  E-Step - Mean responsibility: {np.mean(resp):.6f}")
+        log.debug(f"  E-Step - High confidence (>0.9): {np.sum(resp > 0.9)} / {len(resp)} ({np.sum(resp > 0.9)/len(resp)*100:.1f}%)")
+    
+    # M-step: Update weights from responsibilities
+    update_weights_from_responsibilities(
+        subject_indices,
+        array_manager.arrays["responsibilities"],
+        array_manager.arrays["new_weights"]
+    )
+    
+    # AVOID COPYING: Use pre-allocated result array
+    array_manager.arrays["result_weights"][:] = array_manager.arrays["new_weights"]
+    log.debug("Using pre-allocated result_weights array (no copy needed)")
+    return array_manager.arrays["result_weights"]
+
+def ultra_fast_bitscore_em_step(
+    source_indices: np.ndarray,
+    subject_indices: np.ndarray, 
+    bit_scores: np.ndarray,
+    current_weights: np.ndarray,
+    array_manager: ArrayManager,
+    lambda_scale: float = 1.0,
+    verbose: bool = False,
+    random_seed: int = 42
+) -> np.ndarray:
+    """
+    ULTRA-FAST EM step using pre-allocated arrays and deterministic operations.
     """
     max_source = np.max(source_indices) + 1
-    max_subject = len(current_weights)
+    max_subject = np.max(subject_indices) + 1  # Fix: Calculate from data, not assume from current_weights
     n_alignments = len(source_indices)
     
     if verbose:
-        log.debug(f"  Ultra-Fast EM Step - processing {n_alignments:,} alignments")
+        log.debug(f"  Ultra-Fast EM Step - processing {n_alignments:,} alignments (seed: {random_seed})")
         log.debug(f"  Ultra-Fast EM Step - {max_source:,} sources, {max_subject:,} subjects")
+        log.debug(f"  Current weights shape: {current_weights.shape}, max_subject: {max_subject}")
+    
+    # Ensure current_weights has the right size
+    if len(current_weights) < max_subject:
+        log.error(f"Current weights array too small: {len(current_weights)} < {max_subject}")
+        # Resize current_weights to match data
+        new_current_weights = np.zeros(max_subject, dtype=np.float64)
+        new_current_weights[:len(current_weights)] = current_weights
+        # Add uniform weights for new subjects
+        if max_subject > len(current_weights):
+            new_subjects = max_subject - len(current_weights)
+            uniform_weight = 1.0 / max_subject
+            new_current_weights[len(current_weights):] = uniform_weight
+            # Renormalize
+            new_current_weights = new_current_weights / np.sum(new_current_weights)
+        current_weights = new_current_weights
+    elif len(current_weights) > max_subject:
+        log.debug(f"Current weights array larger than needed: {len(current_weights)} > {max_subject}, truncating")
+        current_weights = current_weights[:max_subject]
+    
+    # Ensure array_manager arrays have the right size
+    if len(array_manager.arrays["new_weights"]) < max_subject:
+        log.warning(f"Resizing new_weights array from {len(array_manager.arrays['new_weights'])} to {max_subject}")
+        array_manager.arrays["new_weights"] = array_manager.resource_manager.create_array(
+            name="em_new_weights_resized", shape=(max_subject,), dtype=np.float64, temp=True
+        )
+    
+    if len(array_manager.arrays["temp_weight_sums"]) < max_subject:
+        log.warning(f"Resizing temp_weight_sums array from {len(array_manager.arrays['temp_weight_sums'])} to {max_subject}")
+        array_manager.arrays["temp_weight_sums"] = array_manager.resource_manager.create_array(
+            name="em_temp_weight_sums_resized", shape=(max_subject,), dtype=np.float64, temp=True
+        )
     
     try:
-        # CRITICAL: Use PRE-ALLOCATED arrays - no resizing or new allocation
-        # Arrays should already be sized correctly by ArrayManager.initialize()
-        
-        # Verify arrays are correctly sized (should never fail with proper pre-allocation)
-        assert len(array_manager.arrays["temp_source_max"]) >= max_source, \
-            f"temp_source_max too small: {len(array_manager.arrays['temp_source_max'])} < {max_source}"
-        assert len(array_manager.arrays["temp_source_denom"]) >= max_source, \
-            f"temp_source_denom too small: {len(array_manager.arrays['temp_source_denom'])} < {max_source}"
-        assert len(array_manager.arrays["temp_weight_sums"]) >= max_subject, \
-            f"temp_weight_sums too small: {len(array_manager.arrays['temp_weight_sums'])} < {max_subject}"
-        assert len(array_manager.arrays["responsibilities"]) >= n_alignments, \
-            f"responsibilities too small: {len(array_manager.arrays['responsibilities'])} < {n_alignments}"
-        
-        # ULTRA-FAST E-step using pre-allocated arrays (NO allocation overhead)
+        # Use deterministic E-step (ultra-fast but deterministic)
         ultra_fast_e_step_billion_prealloc(
             source_indices,
             subject_indices,
@@ -822,33 +1426,43 @@ def ultra_fast_bitscore_em_step(
             array_manager.arrays["temp_source_denom"]
         )
         
-        if verbose:
-            resp = array_manager.arrays["responsibilities"]
-            # Use ultra-fast statistics computation with pre-allocated arrays
-            thresholds = np.array([0.95, 0.90, 0.50, 0.01], dtype=np.float64)
-            counts = np.zeros(4, dtype=np.int64)
-            compute_statistics_billion(resp, thresholds, counts)
-            
-            log.debug(f"  Ultra E-Step - >95%: {counts[0]:,}, >90%: {counts[1]:,}, >50%: {counts[2]:,}, >1%: {counts[3]:,}")
+        # Ensure deterministic normalization
+        deterministic_normalize_responsibilities(
+            source_indices,
+            array_manager.arrays["responsibilities"],
+            array_manager.arrays["temp_validation_sums"],
+            random_seed
+        )
         
-        # ULTRA-FAST M-step using pre-allocated arrays (NO allocation overhead)
+        # Ensure result_weights array has the right size
+        if "result_weights" not in array_manager.arrays or len(array_manager.arrays["result_weights"]) != max_subject:
+            array_manager.arrays["result_weights"] = array_manager.resource_manager.create_array(
+                name="em_result_weights", shape=(max_subject,), dtype=np.float64, temp=True
+            )
+        
+        # ULTRA-FAST M-step using pre-allocated arrays
         ultra_fast_m_step_billion_prealloc(
             subject_indices,
             array_manager.arrays["responsibilities"],
-            array_manager.arrays["new_weights"],
-            array_manager.arrays["temp_weight_sums"]
+            array_manager.arrays["new_weights"][:max_subject],  # Use only the needed portion
+            array_manager.arrays["temp_weight_sums"][:max_subject]  # Use only the needed portion
         )
         
         # Use pre-allocated result array (NO copying)
-        array_manager.arrays["result_weights"][:] = array_manager.arrays["new_weights"]
+        array_manager.arrays["result_weights"][:max_subject] = array_manager.arrays["new_weights"][:max_subject]
         
-        return array_manager.arrays["result_weights"]
+        return array_manager.arrays["result_weights"][:max_subject]  # Return only the needed portion
 
     except Exception as e:
         log.error(f"Error in ultra-fast EM step: {e}")
-        # Fallback
-        array_manager.arrays["result_weights"].fill(1.0 / max_subject)
-        return array_manager.arrays["result_weights"]
+        # Fallback - create properly sized uniform weights
+        fallback_weights = np.full(max_subject, 1.0 / max_subject, dtype=np.float64)
+        if "result_weights" not in array_manager.arrays or len(array_manager.arrays["result_weights"]) != max_subject:
+            array_manager.arrays["result_weights"] = array_manager.resource_manager.create_array(
+                name="em_result_weights_fallback", shape=(max_subject,), dtype=np.float64, temp=True
+            )
+        array_manager.arrays["result_weights"][:max_subject] = fallback_weights
+        return array_manager.arrays["result_weights"][:max_subject]
 
 def ultra_fast_validate_conservation(
     source_indices: np.ndarray,
@@ -873,7 +1487,8 @@ def ultra_fast_validate_conservation(
             source_indices,
             responsibilities,
             array_manager.arrays["temp_validation_sums"],
-            array_manager.arrays["temp_source_counts"]
+            array_manager.arrays["temp_source_counts"],
+            
         )
         
         # STRICT: We expect ZERO violations after proper fixing
@@ -1180,7 +1795,7 @@ class ConvergenceAnalyzer:
         self.convergence_strength_history = []  # Track how strong convergence signals are
         self.false_convergence_count = 0  # Track false convergence attempts
         self.convergence_momentum = 0.0  # Track convergence momentum
-        
+    
     def add_iteration(self, likelihood, weight_change, acceleration_used, prob_stability, 
                      acceleration_improvement=0.0, basic_em_time=0.0, accelerated_time=0.0):
         """Add iteration data for analysis."""
@@ -1360,7 +1975,7 @@ class ConvergenceAnalyzer:
             
         # Layer 3: ADEQUATE convergence (practical threshold)
         elif (confidence >= 0.5 and (has_strong_primary or has_dataset_signal) and 
-              robustness_score >= 0.2 and iteration >= 12):  # Practical
+              robustness_score >=  0.2 and iteration >= 12):  # Practical
             reasons = [f"{signal[0]}({signal[1]:.2e})" for signal in convergence_signals]
             reason = f"Adequate evidence: {', '.join(reasons)} (robustness: {robustness_score:.2f})"
             return True, reason, confidence
@@ -1391,6 +2006,7 @@ class ConvergenceAnalyzer:
         # Calculate relative magnitude of oscillations
         mean_val = np.mean(values)
         oscillation_magnitude = np.std(values) / max(abs(mean_val), 1e-10)
+
         
         # RELAXED: More tolerant oscillation detection for large datasets
         if sign_changes >= len(diffs) * 0.4 and oscillation_magnitude < self.min_improvement * 100:  # Much more tolerant
@@ -1453,14 +2069,18 @@ def accelerated_resolve_multimaps(
     acceleration_method="anderson",
     anderson_memory=10,
     lbfgs_memory=10,
-    lambda_scale=2.0,  # Increased default lambda
-    temperature=0.05,  # Added temperature parameter
-    use_enhanced_em=True,  # Flag to use enhanced EM
+    lambda_scale=2.0,
+    temperature=0.05,
+    use_enhanced_em=True,
+    random_seed=42,
 ):
     """
-    Enhanced EM implementation with better parameter tuning.
+    Enhanced EM implementation with deterministic initialization.
     """
     is_debug = log.isEnabledFor(logging.DEBUG)
+    
+    # Set numpy random seed for global determinism
+    np.random.seed(random_seed)
     
     # Store original thread count and set new one
     original_threads = get_num_threads()
@@ -1476,6 +2096,7 @@ def accelerated_resolve_multimaps(
     
     log.info(f"Using memory-mapped arrays exclusively for all EM operations")
     log.info(f"Memory-mapped storage location: {resource_manager.mmap_folder}")
+    log.info(f"Using deterministic seed: {random_seed}")
 
     start_time = time.time()
     
@@ -1495,6 +2116,13 @@ def accelerated_resolve_multimaps(
         
         # CRITICAL FIX: Get n_elements from actual array length, not dictionary length
         n_elements = len(source_indices)  # Use array length, not len(data)
+        
+        # CRITICAL FIX: Calculate actual max values from the data
+        max_source = np.max(source_indices) + 1
+        max_subject = np.max(subject_indices) + 1  # Calculate from actual data
+        
+        # Calculate n_unique_reads for conservation checks
+        n_unique_reads = len(np.unique(source_indices))
         
         # MINIMIZE COPYING: Only convert types if absolutely necessary for Numba
         # Check if conversion is needed before doing it
@@ -1523,71 +2151,11 @@ def accelerated_resolve_multimaps(
                 log.warning(f"Unexpected bit_scores dtype: {bit_scores.dtype}")
                 bit_scores = bit_scores.astype(np.float64)
         
-        max_source = np.max(source_indices) + 1
-        max_subject = np.max(subject_indices) + 1
-        
-        log.info("=" * 80)
-        log.info(f"ENHANCED {acceleration_method.upper()} EM ALGORITHM")
-        log.info("=" * 80)
-        log.info(f"Dataset size: {n_elements:,} alignments")
-        log.info(f"Reads: {max_source:,}, Proteins: {max_subject:,}")
-        log.info(f"Bit score range: {np.min(bit_scores):.1f} to {np.max(bit_scores):.1f}")
-        log.info(f"Lambda scale parameter: {lambda_scale}")
-        log.info(f"Min improvement threshold: {min_improvement:.2e}")
-        log.info(f"Adaptive convergence: {adaptive_convergence}")
-        log.info(f"Using {threads} threads")
-        
-        # FAST INITIAL READ VALIDATION (no expensive computations)
-        log.info("Performing fast initial data validation...")
-        unique_reads = np.unique(source_indices)
-        n_unique_reads = len(unique_reads)
-        
-        # Count alignments per read using fast bincount
-        max_read_id = np.max(source_indices)
-        min_read_id = np.min(source_indices)
-        read_id_range = max_read_id - min_read_id + 1
-        
-        if read_id_range <= n_unique_reads * 2:  # Dense read IDs - fast path
-            read_counts = np.bincount(source_indices - min_read_id, minlength=read_id_range)
-            reads_with_data = np.sum(read_counts > 0)
-            single_mapping_reads = np.sum(read_counts == 1)
-            multi_mapping_reads = np.sum(read_counts > 1)
-            max_alignments_per_read = np.max(read_counts)
-        else:  # Sparse read IDs - slower but still faster than full E-step
-            read_counts = np.bincount(source_indices)
-            reads_with_data = np.sum(read_counts > 0)
-            single_mapping_reads = np.sum(read_counts == 1)
-            multi_mapping_reads = np.sum(read_counts > 1)
-            max_alignments_per_read = np.max(read_counts)
-        
-        avg_alignments_per_read = n_elements / n_unique_reads
-        
-        log.info("INITIAL READ STATISTICS:")
-        log.info(f"  Total alignments: {n_elements:,}")
-        log.info(f"  Unique reads: {n_unique_reads:,}")
-        log.info(f"  Single-mapping reads: {single_mapping_reads:,} ({single_mapping_reads/n_unique_reads*100:.1f}%)")
-        log.info(f"  Multi-mapping reads: {multi_mapping_reads:,} ({multi_mapping_reads/n_unique_reads*100:.1f}%)")
-        log.info(f"  Max alignments per read: {max_alignments_per_read}")
-        log.info(f"  Average alignments per read: {avg_alignments_per_read:.2f}")
-        
-        # Basic data integrity checks (fast)
-        if not np.all(np.isfinite(bit_scores)):
-            log.error("Invalid bit scores detected")
-            return data
-        
-        if np.any(source_indices < 0) or np.any(subject_indices < 0):
-            log.error("Invalid negative indices detected")
-            return data
-        
-        # REMOVED: Expensive initial responsibility computation for validation
-        # We'll validate during the first iteration instead
-        
-        # Enhanced convergence analyzer
         convergence_analyzer = ConvergenceAnalyzer(
             min_improvement=min_improvement,
             lookback_window=4 if adaptive_convergence else 3
         )
-        
+
         # Initialize array manager with external arrays (avoid copying)
         array_manager = ArrayManager(resource_manager)
         
@@ -1614,10 +2182,10 @@ def accelerated_resolve_multimaps(
         
         array_manager.initialize(n_elements, max_subject, max_source, external_arrays=external_data)
         
-        # Initialize weights only (no expensive E-step yet)
-        log.info("Initializing protein weights uniformly...")
+        # Initialize weights deterministically
+        log.info("Initializing protein weights deterministically...")
         current_weights = array_manager.arrays["weights"]
-        current_weights.fill(1.0 / max_subject)
+        deterministic_initialize_weights(current_weights, random_seed)
         
         log.info("Starting ENHANCED EM algorithm")
         
@@ -1664,20 +2232,23 @@ def accelerated_resolve_multimaps(
                 if acceleration_method == "anderson":
                     from x_filter.reassign.anderson import FastAndersonAccelerator
                     accelerator = FastAndersonAccelerator(
-                        accelerator_dimension, anderson_memory, resource_manager=resource_manager
+                        accelerator_dimension, anderson_memory, 
+                        resource_manager=resource_manager
                     )
                 elif acceleration_method == "lbfgs":
                     from x_filter.reassign.quasi_newton import FastLBFGSAccelerator
                     accelerator = FastLBFGSAccelerator(
-                        accelerator_dimension, lbfgs_memory, resource_manager=resource_manager
+                        accelerator_dimension, lbfgs_memory, 
+                        resource_manager=resource_manager
                     )
                 elif acceleration_method == "hybrid":
                     from x_filter.reassign.hybrid import HybridAccelerator
                     accelerator = HybridAccelerator(
-                        accelerator_dimension, anderson_memory, lbfgs_memory, resource_manager=resource_manager
+                        accelerator_dimension, anderson_memory, lbfgs_memory, 
+                        resource_manager=resource_manager
                     )
                 
-                log.info(f"Using {acceleration_method.upper()} acceleration to reduce iterations needed")
+                log.info(f"Using {acceleration_method.upper()} acceleration with seed {random_seed}")
                 
             except Exception as e:
                 log.warning(f"Failed to initialize {acceleration_method} accelerator: {e}")
@@ -1686,7 +2257,7 @@ def accelerated_resolve_multimaps(
         else:
             accelerator = None
             log.info(f"Using basic EM (acceleration disabled or dimension too small: {accelerator_dimension})")
-        
+
         convergence_history = []
         consecutive_failures = 0
         max_consecutive_failures = 3
@@ -1714,9 +2285,37 @@ def accelerated_resolve_multimaps(
                     def ultra_fast_em_step_func(weights):
                         return ultra_fast_bitscore_em_step(
                             source_indices, subject_indices, bit_scores, weights,
-                            array_manager, lambda_scale, verbose=is_debug
+                            array_manager, lambda_scale, verbose=is_debug, random_seed=random_seed
                         )
                     
+                    # FIRST ITERATION: Use deterministic initialization
+                    if current_iter == 0:
+                        log.info("Iteration 0: Deterministic initialization...")
+                        basic_start_time = time.time()
+                        
+                        # Deterministic initialization of responsibilities
+                        deterministic_initialize_responsibilities(
+                            source_indices, subject_indices, bit_scores,
+                            array_manager.arrays["responsibilities"], random_seed
+                        )
+                        
+                        # Normalize deterministically
+                        deterministic_normalize_responsibilities(
+                            source_indices, array_manager.arrays["responsibilities"],
+                            array_manager.arrays["temp_validation_sums"], random_seed
+                        )
+                        
+                        # M-step to update weights
+                        ultra_fast_m_step_billion_prealloc(
+                            subject_indices,
+                            array_manager.arrays["responsibilities"],
+                            array_manager.arrays["new_weights"],
+                            array_manager.arrays["temp_weight_sums"]
+                        )
+                        
+                        new_weights = array_manager.arrays["new_weights"]
+                        basic_em_time = time.time() - basic_start_time
+
                     # FIRST ITERATION: Use ultra-fast EM and validate
                     if current_iter == 0:
                         log.info("Iteration 0: Ultra-fast initial responsibilities...")
@@ -1811,7 +2410,6 @@ def accelerated_resolve_multimaps(
                                 basic_em_time = time.time() - basic_start_time
                                 acceleration_stats['failures'] += 1
                                 consecutive_failures += 1
-                        
                         except Exception as e:
                             # Fallback to basic EM
                             basic_start_time = time.time()
@@ -2019,7 +2617,7 @@ def accelerated_resolve_multimaps(
         min_read_id = np.min(source_indices)
         read_id_range = max_read_id - min_read_id + 1
         
-        if read_id_range <= n_unique_reads * 2:  # Dense read IDs - ultra-fast path
+        if read_id_range <= n_unique_reads * 2: # Dense read IDs - ultra-fast path
             # VECTORIZED: Single-pass probability sum and count calculation
             read_prob_sums = np.bincount(
                 source_indices - min_read_id, 

@@ -61,10 +61,11 @@ def implement_selection_mode(
     reference_bias: float, 
     handle_ties: str, 
     min_assignment_confidence: float, 
-    min_confidence_margin: float
+    min_confidence_margin: float,
+    random_seed: int = 42  # Add seed parameter
 ):
     """
-    Implement the selected strategy for handling read assignments.
+    Implement the selected strategy for handling read assignments with deterministic behavior.
     
     Args:
         con: DuckDB connection
@@ -73,8 +74,12 @@ def implement_selection_mode(
         handle_ties: How to handle tied best hits ('keep_all', 'keep_one', 'discard')
         min_assignment_confidence: Minimum probability threshold
         min_confidence_margin: Minimum probability difference to second-best
+        random_seed: Seed for deterministic tie-breaking
     """
-    log.info(f"Implementing {selection_mode} selection mode...")
+    log.info(f"Implementing {selection_mode} selection mode with seed {random_seed}...")
+    
+    # Set deterministic seed for consistent tie-breaking
+    con.execute(f"SELECT setseed({random_seed / 2147483647.0})")  # Normalize seed to [0,1]
     
     # Log current filtering parameters for debugging
     log.info(f"Filtering parameters:")
@@ -199,17 +204,16 @@ def implement_selection_mode(
     log.info(f"  Adaptive margin: {adaptive_margin:.6f}")
     
     if selection_mode == "primary":
-        log.info("Using primary selection with dataset-adaptive thresholds")
+        log.info("Using primary selection with dataset-adaptive thresholds and deterministic tie-breaking")
         
-        # Create selection query based on dataset type
+        # Create selection query based on dataset type with deterministic ordering
         if dataset_type == "HIGHLY_MULTIMAPPING":
-            # For highly multi-mapping: be very permissive, keep many alternatives
             selection_query = f"""
                 CREATE TABLE selected_alignments AS
                 WITH ranked_probs AS (
                     SELECT *,
-                        ROW_NUMBER() OVER (PARTITION BY read_id ORDER BY prob DESC) as rank,
-                        LAG(prob, 1, 0) OVER (PARTITION BY read_id ORDER BY prob DESC) as second_best_prob,
+                        ROW_NUMBER() OVER (PARTITION BY read_id ORDER BY prob DESC, orig_idx ASC) as rank,
+                        LAG(prob, 1, 0) OVER (PARTITION BY read_id ORDER BY prob DESC, orig_idx ASC) as second_best_prob,
                         COUNT(*) OVER (PARTITION BY read_id) as total_alignments_for_read,
                         MAX(prob) OVER (PARTITION BY read_id) as max_prob_for_read,
                         quantile_cont(prob, 0.5) OVER (PARTITION BY read_id) as median_prob_for_read
@@ -240,16 +244,16 @@ def implement_selection_mode(
                     OR
                     -- Keep anything above median for reads with many alignments
                     (total_alignments_for_read > 20 AND prob >= median_prob_for_read AND rank <= 30)
+                ORDER BY read_id, prob DESC, orig_idx ASC  -- Deterministic ordering
             """
             
         elif dataset_type == "MOSTLY_UNIQUE":
-            # For mostly unique: be more selective
             selection_query = f"""
                 CREATE TABLE selected_alignments AS
                 WITH ranked_probs AS (
                     SELECT *,
-                        ROW_NUMBER() OVER (PARTITION BY read_id ORDER BY prob DESC) as rank,
-                        LAG(prob, 1, 0) OVER (PARTITION BY read_id ORDER BY prob DESC) as second_best_prob,
+                        ROW_NUMBER() OVER (PARTITION BY read_id ORDER BY prob DESC, orig_idx ASC) as rank,
+                        LAG(prob, 1, 0) OVER (PARTITION BY read_id ORDER BY prob DESC, orig_idx ASC) as second_best_prob,
                         COUNT(*) OVER (PARTITION BY read_id) as total_alignments_for_read,
                         MAX(prob) OVER (PARTITION BY read_id) as max_prob_for_read
                     FROM read_prob
@@ -275,16 +279,16 @@ def implement_selection_mode(
                     OR
                     -- Single-mapping reads with decent probability
                     (total_alignments_for_read = 1 AND prob >= {adaptive_min_conf * 0.5})
+                ORDER BY read_id, prob DESC, orig_idx ASC  -- Deterministic ordering
             """
             
         else:  # MIXED_MAPPING
-            # Balanced approach
             selection_query = f"""
                 CREATE TABLE selected_alignments AS
                 WITH ranked_probs AS (
                     SELECT *,
-                        ROW_NUMBER() OVER (PARTITION BY read_id ORDER BY prob DESC) as rank,
-                        LAG(prob, 1, 0) OVER (PARTITION BY read_id ORDER BY prob DESC) as second_best_prob,
+                        ROW_NUMBER() OVER (PARTITION BY read_id ORDER BY prob DESC, orig_idx ASC) as rank,
+                        LAG(prob, 1, 0) OVER (PARTITION BY read_id ORDER BY prob DESC, orig_idx ASC) as second_best_prob,
                         COUNT(*) OVER (PARTITION BY read_id) as total_alignments_for_read,
                         MAX(prob) OVER (PARTITION BY read_id) as max_prob_for_read
                     FROM read_prob
@@ -313,33 +317,37 @@ def implement_selection_mode(
                     OR
                     -- Single-mapping reads
                     (total_alignments_for_read = 1 AND prob >= {adaptive_min_conf * 0.3})
+                ORDER BY read_id, prob DESC, orig_idx ASC  -- Deterministic ordering
             """
         
         con.execute(selection_query)
         
     elif selection_mode == "threshold":
-        # Simple threshold-based filtering with adaptive thresholds
+        # Simple threshold-based filtering with deterministic ordering
         con.execute(f"""
             CREATE TABLE selected_alignments AS
             SELECT orig_idx as selected_rowid, prob as selected_prob, read_id, ref_id
             FROM read_prob
             WHERE prob >= {adaptive_min_conf}
+            ORDER BY read_id, prob DESC, orig_idx ASC
         """)
         
     else:
-        # Use original logic for other selection modes but with adaptive thresholds
+        # Use original logic for other selection modes but with deterministic ordering
         if selection_mode == "weighted":
             con.execute(f"""
                 CREATE TABLE selected_alignments AS
                 WITH weighted_probs AS (
                     SELECT *,
-                        prob * (1.0 + {reference_bias} * RANDOM()) as weighted_prob
+                        prob * (1.0 + {reference_bias} * 
+                                ((read_id * 1009 + ref_id * 2017 + {random_seed}) % 65536) / 65536.0) as weighted_prob
                     FROM read_prob
                     WHERE prob >= {adaptive_min_conf * 0.1}
                 )
                 SELECT orig_idx as selected_rowid, weighted_prob as selected_prob, read_id, ref_id
                 FROM weighted_probs
                 WHERE weighted_prob >= {adaptive_min_conf}
+                ORDER BY read_id, weighted_prob DESC, orig_idx ASC
             """)
             
         elif selection_mode == "proportional":
@@ -354,6 +362,7 @@ def implement_selection_mode(
                 SELECT orig_idx as selected_rowid, norm_prob as selected_prob, read_id, ref_id
                 FROM normalized_probs
                 WHERE norm_prob >= {adaptive_min_conf}
+                ORDER BY read_id, norm_prob DESC, orig_idx ASC
             """)
             
         elif selection_mode == "all":
@@ -363,12 +372,13 @@ def implement_selection_mode(
                 SELECT orig_idx as selected_rowid, prob as selected_prob, read_id, ref_id
                 FROM read_prob
                 WHERE prob >= {adaptive_min_conf * 0.1}
+                ORDER BY read_id, prob DESC, orig_idx ASC
             """)
         
         else:
             raise ValueError(f"Unknown selection mode: {selection_mode}")
     
-    # Apply tie handling (unchanged)
+    # Apply deterministic tie handling
     if handle_ties == "keep_one":
         con.execute("""
             DELETE FROM selected_alignments
@@ -382,6 +392,7 @@ def implement_selection_mode(
                 SELECT MIN(ROWID)
                 FROM selected_alignments
                 GROUP BY read_id, selected_prob
+                HAVING COUNT(*) > 1
             )
         """)
     elif handle_ties == "discard":
